@@ -34,6 +34,13 @@ Ball Pit 류 슈터 + 백팩 히어로 류 가방 로그라이크. 웹(PixiJS v8
 - `node tools/interaction-check.mjs` / `node tools/gap-playtest.mjs` / `node tools/juice-sheet.mjs` — 실제 터치 입력 검사 / st1 틈 쏘기 플레이 / 연출 시트
   (각자 `--port`로 자기 개발 서버를 띄우고 끈다 — 동시에 돌릴 땐 포트를 다르게)
 
+## 배포
+
+- 원격 `origin` = github.com/zerocoke8/ballshooter (공개). `main`에 푸시하면 `.github/workflows/deploy-pages.yml`이
+  빌드해서 GitHub Pages로 자동 배포 → https://zerocoke8.github.io/ballshooter/ (vite `base: './'`라 하위 경로에서 그대로 동작).
+- 보조 원격 `ballpit`(이전 저장소)은 더 이상 쓰지 않는다.
+- 공개 저장소이므로 `.env`·타 게임 이미지(`tools/style/style_ref.png`)는 절대 커밋하지 않는다(.gitignore).
+
 ## 폰에서 성능 보기 (`?perf`)
 
 - PC에서 `npm run dev` → 터미널의 `Network: http://192.168.x.x:5173/` 주소 뒤에 `?perf`를 붙여 같은 와이파이의 폰으로 연다
