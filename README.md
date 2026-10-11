@@ -1,9 +1,9 @@
-# 동물 볼슈터 (ballpit)
+# 동물 볼슈터 (ballshooter)
 
 동물 친구들이 우스꽝스러운 물건을 던져 장난감 군단을 막는 세로형 볼슈터 + 가방 로그라이크 프로토타입.
 PixiJS v8 + TypeScript, 폰 세로 화면 기준.
 
-**▶ 플레이: https://zerocoke8.github.io/ballpit/**
+**▶ 플레이: https://zerocoke8.github.io/ballshooter/**
 
 ## 조작
 
