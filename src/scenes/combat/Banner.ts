@@ -1,9 +1,9 @@
-// 화면 가운데 띠 배너 (스테이지 시작, 보스 등장, 클리어, 패배). 한 번에 하나, update(dt)로 직접 애니메이션.
+// 화면 가운데 띠 배너 (스테이지 시작, 보스 등장, 보스 페이즈 전환, 클리어, 패배). 한 번에 하나, update(dt)로 직접 애니메이션.
 import { Container, Graphics, Text, TextStyle } from 'pixi.js';
 import { DESIGN_W, UI_COLORS } from '../../config';
 import { textStyle } from '../../ui';
 
-export type BannerKind = 'intro' | 'boss' | 'clear' | 'defeat';
+export type BannerKind = 'intro' | 'boss' | 'phase' | 'clear' | 'defeat';
 
 const BAND_H = 170;
 const IN_TIME = 0.18;
@@ -12,12 +12,14 @@ const OUT_TIME = 0.25;
 const BAND_COLOR: Record<BannerKind, number> = {
   intro: 0x1a1226,
   boss: 0x7a0f1e,
+  phase: 0x8a2a0c,
   clear: 0x1f4a2a,
   defeat: 0x2a1020,
 };
 const TITLE_COLOR: Record<BannerKind, number> = {
   intro: UI_COLORS.text,
   boss: 0xffe14a,
+  phase: 0xffb347,
   clear: UI_COLORS.gold,
   defeat: 0xff9aa8,
 };
@@ -75,10 +77,11 @@ export class Banner extends Container {
     const band = this.band;
     band.clear();
     band.rect(0, -BAND_H / 2 - 6, DESIGN_W, BAND_H + 12).fill({ color: 0x000000, alpha: 0.25 });
-    band.rect(0, -BAND_H / 2, DESIGN_W, BAND_H).fill({ color: BAND_COLOR[kind], alpha: 0.86 });
+    // 페이즈 배너는 전투 도중(보스 위)에 뜨므로 조금 더 비치게
+    band.rect(0, -BAND_H / 2, DESIGN_W, BAND_H).fill({ color: BAND_COLOR[kind], alpha: kind === 'phase' ? 0.74 : 0.86 });
     band.rect(0, -BAND_H / 2, DESIGN_W, 5).fill({ color: TITLE_COLOR[kind], alpha: 0.8 });
     band.rect(0, BAND_H / 2 - 5, DESIGN_W, 5).fill({ color: TITLE_COLOR[kind], alpha: 0.8 });
-    if (kind === 'boss') {
+    if (kind === 'boss' || kind === 'phase') {
       // 경고 줄무늬
       for (let x = -40; x < DESIGN_W + 40; x += 56) {
         band.poly([x, -BAND_H / 2, x + 28, -BAND_H / 2, x + 12, -BAND_H / 2 + 18, x - 16, -BAND_H / 2 + 18]);
@@ -150,7 +153,7 @@ export class Banner extends Container {
       this.title.scale.set(s * shrink, (1 + (s - 1) * 0.72) * shrink);
       this.title.rotation = -0.09 * Math.exp(-6 * t) * Math.sin(14 * t);
       this.title.alpha = Math.min(1, t / 0.08) * (1 - out);
-      if (this.kind === 'boss') this.title.alpha *= 0.7 + 0.3 * Math.abs(Math.sin(t * 9));
+      if (this.kind === 'boss' || this.kind === 'phase') this.title.alpha *= 0.7 + 0.3 * Math.abs(Math.sin(t * 9));
     }
     if (this.subtitle) {
       // 오른쪽에서 미끄러져 들어와 살짝 지나쳤다 돌아옴

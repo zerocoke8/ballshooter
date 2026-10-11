@@ -18,6 +18,7 @@ src/
       sim.ts        CombatSim (고정 스텝 전투 시뮬레이션)
   data/             순수 데이터
     items.ts recipes.ts enemies.ts stages.ts characters.ts assets.json index.ts
+    bosses.ts       보스 행동 데이터 (BossDef: 고정 위치·페이즈·행동·졸개 풀)   bossTest.ts  보스 테스트 스테이지 + 캐릭터별 프리셋 가방
     sfx.json        효과음 정의 (ElevenLabs 프롬프트 + 재생 힌트)   sfxMap.ts  SfxId·무기/적/속성 → 효과음 매핑·연출 수치
   audio/            효과음 엔진 (Web Audio API, 라이브러리 없음) — 아래 'audio/' 참고
     index.ts        sfx(재생 창구) · initAudio()   AudioManager.ts   scheduler.ts(재생 판정, 순수)   process.ts(디코드 다듬기, 순수)
@@ -40,12 +41,14 @@ src/
     toastStrings.ts Toast 미리 굽기 목록 (씬과 같은 i18n 포맷터)
   scenes/
     TitleScene.ts CharacterSelectScene.ts StageClearScene.ts ResultScene.ts ShopScene.ts
+    BossResultScene.ts  보스 테스트 결과 (승패·시간·남은 HP·보스 피해·백어택·졸개·페이즈 + 다시 도전 / 캐릭터 변경 / 타이틀로)
     settingsUi.ts   설정 창(타이틀) + 스피커 켜기/끄기 버튼(전투 가방 오버레이 · 상점 상단 바)
     combat/         CombatScene + 렌더러 + HUD + 무기바 + 이펙트 (아래 'combat/ 렌더·연출' 참고)
       CombatScene.ts  FieldView.ts(레이어 순서)  EnemyLayer.ts  ProjectileLayer.ts(투사체·꼬리·적 탄)
       Effects.ts(파티클·번개·피해 숫자)  fxTextures.ts(구운 텍스처·아틀라스·숫자 폰트)  ComboLabel.ts('백어택!')
       PlayerView.ts  AimGuide.ts  TutorialCallout.ts  Banner.ts  BossBar.ts  FastBar.ts(전투용 게이지)
       Hud.ts  WeaponBar.ts  Flyers.ts(동전·아이템 비행)  FrameView.ts(벽·방어선)  BagOverlay.ts  visual.ts(연출 상수)
+      BossFx.ts(보스전: 보스 자세·입 빛·위험 지역 예고)
     bag/            BagView (전투 일시정지·상점 공용)
   game.ts           전역 Game: 런 상태 보관 + 화면 전환
   main.ts           부트스트랩
@@ -164,6 +167,7 @@ interface CombatSimOptions {
   stage: StageDef; stageIndex: number;
   enemies: Record<string, EnemyDef>;
   loadout: WeaponLoadout[]; player: PlayerStats; hp: number; seed: number;
+  bosses?: Record<string, BossDef>;        // stage.boss가 있으면 필수 (없으면 생성자가 throw) — 보통 GAME_DATA.bosses
 }
 class CombatSim {
   constructor(opts: CombatSimOptions)
@@ -171,6 +175,8 @@ class CombatSim {
   readonly enemies: EnemyEntity[]          // 살아있는 적만 (죽은 적은 스텝 끝에 제거). 렌더러는 id로 diff
   readonly projectiles: ProjectileEntity[] // 살아있는 것만
   readonly enemyShots: EnemyShotEntity[]   // 살아있는 것만
+  readonly hazards: HazardEntity[]         // 보스 위험 지역 (예고·발동 중인 것만, 끝난 것은 스텝 끝에 제거). 일반 스테이지는 늘 []
+  readonly boss: BossState | null          // 보스전이면 보스 상태(매 스텝 제자리 갱신 — 같은 객체), 아니면 null
   readonly weapons: WeaponRuntime[]        // loadout 순서
   status: CombatStatus
   lostReason: LostReason | null            // 'hp' | 'breach' | 'contact'
@@ -186,8 +192,8 @@ class CombatSim {
     // maxHp 변화: hp += max(0, 새 maxHp - peakMaxHp); peakMaxHp = max(peakMaxHp, 새 maxHp); hp는 새 maxHp로 clamp.
     //   peakMaxHp = 이번 전투에서 도달한 최대 maxHp(시작값 = 시작 maxHp) → 냄비 뚜껑을 빼고 다시 넣어도 회복되지 않음
   drainEvents(): CombatEvent[]                 // 쌓인 이벤트 반환 후 비움
-  progress(): number                           // killed / total
-  debugKillAll(): void   // 디버그: 남은 적 전부를 정상 처치 경로로 kill('kill' 이벤트들) → 'won'. running이 아니면 무시
+  progress(): number                           // 일반: killed / total. 보스전: 1 - 보스 HP / 최대 HP (처치하면 1)
+  debugKillAll(): void   // 디버그: 남은 적 전부를 정상 처치 경로로 kill('kill' 이벤트들) → 'won'. running이 아니면 무시 (보스전: 보스 처치 → 졸개 함께)
   debugLose(): void      // 디버그: status 'lost', lostReason 'hp', 'lost' 이벤트. running이 아니면 무시
 }
 // 조준 (sim과 전투 씬이 함께 씀)
@@ -259,10 +265,78 @@ chillResistant(def: Pick<EnemyDef, 'w' | 'h' | 'boss'>): boolean
   무적 시간과 무관(이번 스텝에 죽은 적은 이미 alive false라 제외) → hp ≤ 0 이면 `lost('hp')` → 모든 적 처치면 `won`. 판정 후 status 고정.
   (방어선은 스텝 처음, 하강 직후.)
 - 결정성: 모든 랜덤은 seed로 만든 Rng. 같은 seed + 같은 입력 시퀀스 → 같은 결과.
+- 보스전(stage.boss)은 아래 '보스전'. 일반 스테이지는 보스 경로를 하나도 지나가지 않는다(bossRt === null로 갈림) — 보스 테스트를 넣기 전과
+  비트 단위로 같다(st1~st5 × 캐릭터 3 × 시작/스트레스 가방 × 시드 4 × 자동/수동 조준 240판의 상태·이벤트 해시, 밸런스 프로브 출력 전체가 그대로).
 - 구현 메모(할당): 투사체 객체는 발사·분열 모두 같은 필드 순서로 만든다(선택 필드 lastHit/passing/ghost/trapBounces/bossHitAt도 undefined로
   미리) — 모양이 갈라지면 V8이 메가모픽 쓰기로 p.x 갱신마다 숫자 상자를 할당했다(시뮬레이션 할당의 ~95%). 접촉·반사 계산은
   재사용 임시 객체에 쓰는 `circleRectContactInto` / `bounceVelocityInto`(physics.ts와 비트 단위로 같음, tests/sim-alloc.test.ts),
   배열 순회는 인덱스 루프. 결과는 전과 같다(긴 시드 런 22개의 직렬화 해시 비교).
+
+### 보스전 (StageDef.boss — 보스 테스트)
+
+```ts
+type BossActionKind = 'volley' | 'ring' | 'slam' | 'marbles' | 'summon'
+interface BossDef { id; enemy /* EnemyDef id, boss: true, attack 없음 */; anchorCol; anchorY /* 칸 위끝 px */; enterSpeed;
+                    phases: BossPhaseDef[]; actions: BossActionDef[] }
+interface BossPhaseDef { hpFrac /* 이 페이즈 시작 HP 비율, 첫 페이즈 1 */; roar /* 포효(무적) 초 */; gap /* 행동 사이 초 */;
+                         cooldownMul; enterSummon; minions: { enemy; weight }[]; minionCap; creep /* px/s, 0 = 제자리 */ }
+type BossActionDef = { id; windup; cooldown; recover?; weights: number[] /* 페이즈별, 0 = 안 씀 */ } & (
+  | { kind: 'volley'; volley: BossVolleySpec }   // 입에서 플레이어를 노린 부채꼴 × bursts (reaim이 아니면 첫 방향 + k × burstShiftDeg)
+  | { kind: 'ring'; ring: BossRingSpec }         // 아래 arcDeg 부채꼴 count발 - 이어진 gap발(빈틈은 플레이어 쪽 ±gapShiftPx), 웨이브마다 rotateDeg
+  | { kind: 'slam'; slam: BossSlamSpec }         // 플레이어 열(cols 1~2) 위험 지역: 보스 아래 끝 ~ 바닥. warn → active, repeats번
+  | { kind: 'marbles'; marbles: BossMarblesSpec } // 원 위험 지역 count개(stagger 간격): 처음 aimed개는 플레이어 자리, 나머지는 아래쪽 무작위(spacing 이상)
+  | { kind: 'summon'; summon: { count } })        // 지금 페이즈 졸개 풀에서 count마리
+interface HazardEntity { id; kind: 'slam' | 'marble'; shape: 'rect' | 'circle'; x; y; w; h /* 바운딩 박스, 원은 내접 */;
+                         state: 'warn' | 'active' | 'done'; timer /* 지금 상태 남은 초 */; warnTime; activeTime; damage; sprite; hit }
+interface BossState { enemyId; defId; phase; phases; mode: 'enter' | 'roar' | 'idle' | 'windup' | 'act' | 'dead';
+                      action: BossActionKind | null; actionId: string | null; modeTime /* roar·windup 남은 초 */;
+                      invulnerable; minions; minionCap; hpFrac }
+```
+
+- 생성: 보스 = EnemyDef(boss: true) 하나. 충돌 박스 x = anchorCol × CELL + INSET, 칸 아래 끝이 천장(화면 밖)에서 시작해 enterSpeed로
+  고정 위치(칸 위끝 anchorY)까지 내려온다(mode 'enter' — 화면에 들어오면 맞는다). HP = round(hp × stage.hpMul). 냉기 저항(0.8).
+  stage.rows는 비운다(대형이 위에서 내려오면 보스와 겹친다). totalEnemies = 1 + 소환된 졸개 수.
+- 하강(descend): 보스전은 빨리감기 없이 보스가 아닌 적(졸개)만 stage.descentSpeed로 내려온다. 보스는 고정, 지금 페이즈 creep > 0이면
+  포효 중이 아닐 때 creep px/s로 기어 내려온다. 방어선·접촉 판정은 일반 적과 같다(보스 아래 끝이 바닥 = breach, 보스 몸 = contact).
+- 페이즈: 고정 위치 도착 = 페이즈 0 시작. 페이즈 시작 = 진행 중 행동 취소(이미 나간 탄·위험 지역은 그대로) → 포효 roar초(mode 'roar':
+  무적 — 투사체·폭발·연쇄 피해와 상태이상 없음, 화상도 HP를 깎지 않음, 행동 정지, creep 정지) + enterSummon마리 소환 + 'bossPhase'.
+  피해가 다음 페이즈 문턱(maxHp × phases[p+1].hpFrac)을 넘으면 HP는 문턱에서 멈추고(그 'hit' 이벤트의 damage = 실제로 깎인 양)
+  전환이 예약돼 다음 스텝 updateBoss에서 페이즈 전환 — 페이즈를 건너뛰지 않는다. 마지막 페이즈는 문턱 없음(HP 0 → 처치).
+- 스텝 순서: 하강(보스 등장·creep) → 방어선 → 플레이어 → 적(공격·화상) → **보스(updateBoss)** → 무기 → 열 버킷 → 투사체 → 적 탄 →
+  **위험 지역(updateHazards)** → 접촉 / HP / 승리(보스전 = 보스 처치) → 정리 → sim.boss 갱신.
+- 스케줄러(updateBoss): roar → idle(페이즈 gap초 쉼) → 고르기 → windup(예비 동작, 'bossAction') → act(실행) → (자기 위험 지역이 다 끝나고)
+  recover초 → idle. 고르기 = 지금 페이즈 가중치 > 0이고 쿨타임이 찬 행동 중 가중치 랜덤(시드 RNG; 소환은 살아있는 졸개 < 상한일 때만),
+  고르면 쿨타임 = cooldown × 페이즈 cooldownMul. 고를 것이 없으면 다음 스텝에 다시. 보스가 냉기 중이면 gap·쿨타임이 냉기 속도(0.8)로 흐른다
+  (예비 동작·실행 박자는 그대로). 실행 = 펄스(volley 1발 묶음 / ring 웨이브 / slam 하나 / marble 하나 / summon) pulses번:
+  volley bursts × burstInterval, ring waves × waveInterval, slam repeats × (warn + active + repeatInterval), marbles count × stagger.
+- 보스 탄: 입 = (보스 가운데 x, 보스 아래 끝)에서 `enemyShots`에 넣는다(일반 적 탄과 같은 판정: 무적 시간, 'playerHit' source 'shot').
+  피해 = spec.damage × stage.dmgMul. 'enemyShoot' 이벤트에 sprite(보스 탄 그림 — 효과음 고르기용, 일반 적 탄 이벤트에는 없다).
+  ring 빈틈: 행동마다 한 번, 발사 순간 플레이어 x ± 무작위 gapShiftPx를 향한 각도(웨이브 회전의 가운데 기준)에 빈틈 가운데 → 가까운 인덱스.
+- 위험 지역(HazardEntity, sim.hazards): 만들어진 스텝에는 시간이 흐르지 않는다('hazardWarn'부터 발동까지 정확히 warnTime초). 예고가 끝나는
+  스텝에 발동('hazardImpact' — hitPlayer = 그 순간 맞았나) → activeTime초 동안 플레이어 피격 원과 겹치고 무적이 아니면 한 번 피해
+  (damage = spec × stage.dmgMul, 무적 시간 적용, 'playerHit' source 'hazard') → 끝(done, 스텝 끝에 목록에서 빠짐).
+  slam: 플레이어 열 + (cols 2면 플레이어가 칸 왼쪽 절반일 때 왼쪽 이웃, 아니면 오른쪽 이웃 — 필드 안으로 clamp), y = 보스 아래 끝 ~ FIELD_H.
+  marble: 반경 radius 원. 처음 aimed개 = 플레이어 자리(필드·아래쪽 띠로 clamp), 나머지 = x ∈ [r, FIELD_W - r], y ∈ [max(보스 아래 + r,
+  yMinFrac × FIELD_H), FIELD_H - r] 무작위(시드), 아직 안 끝난 구슬과 중심 사이 spacing 이상인 자리를 8번까지 찾고 없으면 건너뜀.
+  단 플레이어가 아래쪽 띠보다 위에서 **보스 옆 통로**(x < 보스 왼끝 또는 > 오른끝)에 있으면 노린 구슬은 그 자리(y는 [r, FIELD_H - r]로만 clamp,
+  x는 원이 보스 몸과 겹치지 않게 통로 쪽으로) — 통로가 내려찍기·팽이 고리·구슬이 모두 닿지 않는 안전 지대가 되지 않게(리뷰에서 추가).
+- 소환(summon): n = min(count, 페이즈 상한 - 살아있는 졸개). 후보 칸 = 보스가 걸친 열(anchorCol ~ +w-1) × 보스 칸 바로 아래 줄
+  (칸 위끝 = 보스 충돌 박스 아래 끝 + INSET), 다른 살아있는 적의 칸과 안 겹치고 필드 안이며 플레이어 피격 원에서 60 px 넘게 떨어진 칸
+  (SUMMON_PLAYER_MARGIN — 눈앞 즉사 방지). 후보를 시드 RNG로 부분 셔플해 앞 n개, 졸개 종류 = 페이즈 풀 가중치. 졸개는 spawnEnemies와
+  같은 규칙(HP × hpMul, 첫 공격 = interval + rng × jitter)으로 sim.enemies 끝에 붙고 'summon'(fromX/fromY = 입, x/y = 칸 중심) 이벤트.
+  칸이 모자라면 덜 소환(보스 아래 줄이 6칸이라 실제로는 상한보다 이것이 먼저 묶는다).
+  **착지 유예**: 새 졸개는 SUMMON_LAND_TIME(config, 0.32초 — 렌더의 입 → 칸 튀어나오기와 같은 값) 동안 `landing` > 0 —
+  그동안은 플레이어 몸에 닿아도 접촉 패배가 아니다(화면에서는 아직 입에서 날아오는 중). 칸의 충돌 박스는 처음부터 있어 공은 맞고,
+  다른 소환이 그 칸을 피한다. 내려앉은 순간 그 자리에 있으면 일반 규칙대로 접촉 패배. (리뷰: 무작위로 걷는 플레이어 600판 중 5%가
+  아직 날아오는 졸개의 보이지 않는 몸에 닿아 졌다 → 0. 내려앉는 칸은 BossFx가 첫 프레임부터 발밑 그림자로 보여 준다)
+- 처치: 보스가 죽으면(kill) 살아있는 졸개를 전부 kill('kill' 이벤트들 — 함께 터짐), 위험 지역은 done, 적 탄은 사라지고 mode 'dead' →
+  스텝 끝에 'won'(보스전 승리 = 보스 처치). 같은 스텝에 플레이어 HP가 0이 되었으면 예전처럼 패배가 먼저.
+- 이벤트(보스전에서만): `bossPhase` { enemyId, phase, roar } — 등장 끝(phase 0)·페이즈 전환, 바로 뒤에 그 포효의 `summon`들 /
+  `bossAction` { enemyId, action, id, windup, x, y(입) } — 예비 동작 시작 / `summon` { enemyId(새 졸개), defId, fromX, fromY(입), x, y(칸 중심) } /
+  `hazardWarn` { hazardId, kind, x, y(중심), warn } / `hazardImpact` { hazardId, kind, x, y, hitPlayer } (맞았으면 바로 뒤 `playerHit` source 'hazard') /
+  `enemyShoot`에 sprite. 보스 처치 = 보스 `kill`(boss true) 뒤에 졸개 `kill`들, 스텝 끝에 `won`.
+- 렌더 참고: 보스 윗면 적중 = 'hit' 이벤트의 y가 보스 충돌 박스 위끝(e.y)과 같은 직접 적중(공 중심이 보스보다 위 — 양옆 통로로 넘어간
+  공의 '백어택'). 폭발·연쇄·화상 hit는 적 가운데 좌표라 섞이지 않는다. 졸개(sim.enemies 중 boss가 아닌 것)는 일반 적과 같이 그린다.
 
 ## logic/run.ts
 
@@ -271,11 +345,15 @@ chillResistant(def: Pick<EnemyDef, 'w' | 'h' | 'boss'>): boolean
 ```ts
 newRun(data, characterId, seed): RunState
   // createBag + 캐릭터 startItems 배치, hp = maxHp, gold 0, stageIndex 0, resumeAt 'combat',
-  // shop = { slots: [null×SHOP_SLOTS], rerollCost: SHOP_REROLL_BASE, healBought: false }
+  // shop = { slots: [null×SHOP_SLOTS], rerollCost: SHOP_REROLL_BASE, healBought: false }. mode 필드는 쓰지 않는다(세이브 모양 그대로)
+newBossTestRun(data, characterId, seed): RunState
+  // 보스 테스트: createBag(preset.cols, preset.rows) + data.bossTest.presets[characterId].items 배치(★·회전 포함, 못 놓으면 throw),
+  // hp = maxHp, 나머지는 newRun과 같고 mode 'bossTest'. 프리셋이 없으면 throw
+isBossTestRun(run): boolean                // run?.mode === 'bossTest'
 runCharacter(data, run): CharacterDef
 runPlayerStats(data, run): PlayerStats
 runLoadout(data, run): WeaponLoadout[]
-currentStage(data, run): StageDef
+currentStage(data, run): StageDef         // 보스 테스트 런은 늘 data.bossTest.stage
 combatSeed(run): number                    // run.seed와 stageIndex로 결정
 rewardKill(data, run, enemyDefId): KillReward
   // g = def.gold × goldMul (소수 가능) → gold = floor(g) + (rng.chance(g - floor(g)) ? 1 : 0) (0도 가능, RNG 매번 1회) 지급, stats.kills++, stats.goldEarned 누적.
@@ -285,14 +363,20 @@ completeStage(data, run, hpAfterCombat): { clearGold: number; healed: number; fi
   // run.hp = hpAfterCombat, clearGold×goldMul 지급, maxHp×STAGE_CLEAR_HEAL_RATIO 회복,
   // stats.stagesCleared++, stageIndex++. 마지막 스테이지가 아니면 rollShop(잠금 유지),
   // rerollCost = SHOP_REROLL_BASE, healBought = false, resumeAt = 'shop'.
-isRunComplete(data, run): boolean          // stageIndex >= stages.length
+  // 보스 테스트 런: run.hp = hpAfterCombat(clamp), stats.stagesCleared++ 만 — { clearGold: 0, healed: 0, finished: true } (골드·회복·상점 없음)
+isRunComplete(data, run): boolean          // stageIndex >= stages.length (보스 테스트: stagesCleared > 0)
 isRunValid(data, run): boolean
-  // 캐릭터·가방/보관함/상점 아이템 id가 data에 있고, 가방 아이템이 범위 안·겹침 없음, stageIndex < stages.length.
+  // 캐릭터·가방/보관함/상점 아이템 id가 data에 있고, 가방 아이템이 범위 안·겹침 없음, 아직 안 끝난 런(isRunComplete false).
+  // 보스 테스트 프리셋 런(6×5 가방)도 통과한다.
   // (bag/stats는 모르는 defId에 throw 하므로, 아이템 id가 바뀐 옛 세이브를 여기서 거른다)
 clampRunHp(data, run): void                // hp > maxHp 이면 maxHp로. 전투 밖에서 가방이 바뀐 뒤(상점 판매·보관함 이동) 호출
-saveRun(run): void ; loadRun(data?: GameData): RunState | null ; clearRun(): void
+saveRun(run): void ; loadRun(data?: GameData): RunState | null ; clearRun(run?: RunState | null): void
   // localStorage(SAVE_KEY). 모든 접근 try/catch. version !== SAVE_VERSION 이거나 모양이 깨졌으면 null.
   // data를 넘기면 isRunValid도 확인해 실패 시 null (게임 코드는 항상 data를 넘긴다).
+  // 보스 테스트 격리: saveRun(보스 테스트 런)·clearRun(보스 테스트 런)은 아무것도 하지 않는다. loadRun은 mode 'bossTest' 세이브를 null로
+  // (지우지도 않음). mode는 없거나 'normal' / 'bossTest'만(그 밖은 깨진 세이브). clearRun()을 인자 없이 부르면 예전처럼 지운다 —
+  // 게임 코드는 지금 런을 넘길 것(보스 테스트를 끝내거나 그만둬도 일반 런 세이브·이어하기가 그대로 남는다).
+  // SAVE_VERSION은 그대로(1): mode는 선택 필드이고 일반 런은 쓰지 않아 예전 세이브와 새 세이브의 모양이 같다.
 ```
 
 ## logic/shop.ts
@@ -324,6 +408,8 @@ buyHeal(data, run): boolean           // maxHp × HEAL_RATIO 회복
 - `stages.ts` → `export const STAGES: StageDef[]`
 - `characters.ts` → `export const CHARACTERS: Record<string, CharacterDef>`
 - `assets.json` → `AssetDef[]` (에셋 키의 단일 출처)
+- `bosses.ts` → `export const BOSSES: Record<string, BossDef>` (GameData.bosses)
+- `bossTest.ts` → `export const BOSS_TEST_STAGE: StageDef; export const BOSS_TEST: BossTestDef` (GameData.bossTest = { stage, presets: 캐릭터 id → { cols, rows, items: StartItem[] } })
 - `index.ts` → `export const GAME_DATA: GameData; export const ASSETS: AssetDef[]; export const ASSET_MAP: Record<string, AssetDef>`
 
 ### 콘텐츠 목록 (id 고정)
@@ -364,9 +450,12 @@ buyHeal(data, run): boolean           // maxHp × HEAL_RATIO 회복
 적: `soldier` 태엽 병정(1×1, 기본), `block` 블록 골렘(1×1, 단단), `dartgun` 다트총 병정(1×1, aimed 다트),
 `robot` 깡통 로봇(1×1, straight 볼트), `jack` 깜짝 상자(1×1, spread 3 스프링), `balloon` 풍선 강아지(1×1, 약함, 드롭↑),
 `teddy` 화난 곰인형(2×2 엘리트, aimed), `boss_robot` 장난감 대왕 로봇(4×3 보스, 톱니 5발 50° 부채꼴). 엘리트·보스는 냉기 저항(`chillResistant`).
-스프라이트 `enemy_<id>`, 적 탄 `shot_dart`, `shot_bolt`, `shot_spring`, `shot_gear`.
+`toybox_king` 장난감 상자 대마왕(6×4 보스, 보스 테스트 전용 — 공격은 BossDef 행동).
+스프라이트 `enemy_<id>`, 적 탄 `shot_dart`, `shot_bolt`, `shot_spring`, `shot_gear`, 보스 행동 탄 `shot_block`(일제 사격)·`shot_top`(팽이 고리)·
+`shot_marble`(구슬 비 — 위험 지역 그림), 내려찍기 위험 지역 그림은 `enemy_jack`. 보스 탄의 발사음은 비슷한 클립을 빌린다(sfxMap ENEMY_SHOT_SFX).
 
 스테이지 5개 (`st1`~`st5`, 배경 `bg_toyroom`). st5 마지막에 boss_robot.
+보스 테스트: 스테이지 `boss_test`(data.stages 밖, rows 없음, boss 'toybox_king'), 보스 `toybox_king`(BOSSES), 프리셋 3개(캐릭터마다 6×5 가방).
 
 ---
 
@@ -595,7 +684,9 @@ window.__sfx = { stats(), clips(), resetStats(), loaded(): Promise<void>, play(i
   chain → elem_zap / explode / split / bounce(벽) → bounce_wall / kill → kill_pop · kill_elite(2×2) · boss_kill (보이는 적만) /
   enemyShoot → 적 탄 그림별 enemy_shoot_*(`ENEMY_SHOT_SFX`) / playerHit → player_hurt / 동전이 HUD에 닿음 → coin(`COIN_STREAK_WINDOW` 안에
   연달아 오면 반음씩, 최대 7) / 드롭 → item_drop(보관함 가득 → coin) / 백어택 콤보 → combo(콤보마다 반음, 최대 10) /
-  인트로 배너 → stage_start / 보스 배너 → boss_appear / 방어선 위험이 새로 시작 → danger(`DANGER_REPEAT` 6초에 한 번) /
+  인트로 배너 → stage_start / 보스 배너 → boss_appear (보스 테스트는 인트로 배너가 보스 배너) / 방어선 위험이 새로 시작 → danger(`DANGER_REPEAT` 6초에 한 번) /
+  보스전: 착지·페이즈 전환(bossPhase) → boss_roar / 소환 묶음 → boss_summon(묶음에 한 번) / 내려찍기 예고(hazardWarn slam) → slam_warn /
+  위험 지역 발동(hazardImpact) → slam_impact · marble_impact / 보스 행동 탄(enemyShoot의 sprite) → `ENEMY_SHOT_SFX`(블록 → 톱니 대포, 팽이 → 스프링) /
   won → stage_clear / lost → defeat / 가방 열기·닫기 → bag_open / bag_close.
 - 가방(`BagView`): 집기 item_pick, 놓기(격자·보관함·자동 배치) item_place, 회전 item_rotate, 안 됨(못 놓음·보관함 가득·회전 불가·빈자리 없음·판매 실패) ui_error,
   ★합성 merge_tier, 레시피 진화 merge_evolve, 판매 ui_sell, 판매 칸 첫 탭(확인 대기) ui_tap, 아이템 선택 탭 작은 ui_tap.
@@ -618,6 +709,9 @@ window.__sfx = { stats(), clips(), resetStats(), loaded(): Promise<void>, play(i
   (서버가 오류 본문에 키를 되돌려 보내도). 만들 클립이 있는데 키가 없으면 API를 부르기 전에 한국어+영어 안내와 함께 종료 코드 1(기존 클립 그대로).
   만들 클립이 없으면(전부 있음) 키 없이도 manifest만 맞추고 0.
 - 키에 `user_read` 권한이 없으면(지금 키가 그렇다) 계정·크레딧 조회 API는 401 — 효과음 생성은 된다. 남은 크레딧은 ElevenLabs 웹에서 본다.
+- **보스 테스트 효과음 (2026-10-12)**: `--only boss_roar,boss_summon,slam_warn,slam_impact,marble_impact --budget 60` → 5클립 4.5초 = **45 크레딧**
+  (누계 554). 볼륨은 단기 음량을 재서 맞춤: boss_roar -16.6(징글), slam_impact -19.5, boss_summon -20.9, slam_warn -21.8, marble_impact -23.7 dBFS
+  (marble_impact·slam_warn은 원본이 작아 volume 1.0).
 - **첫 실제 생성 (2026-10-10)**: 64클립 50.4초 = **504 크레딧** + 무음으로 온 `enemy_shoot_dart_1` 프롬프트를 고쳐 `--only enemy_shoot_dart --force`로
   다시 5 = 합계 **509**. 원본이 아주 작아 디코드 때 21~26 dB 키우는 클립(잡음은 소리보다 34~52 dB 아래라 쓸 만함 — 들어 보고 얇으면 다시 생성,
   0.5초 클립 하나 약 5 크레딧): `enemy_shoot_dart_1`(원본 피크 -29.3 dBFS), `bounce_wall_1`(-28.8), `bounce_wall_2`(-27.5), `combo_1`(-26.8), `hit_toy_3`(-24.5).
@@ -635,11 +729,21 @@ interface Game {
   toTitle(): void; toCharacterSelect(): void;
   startRun(characterId: string): void;   // newRun → saveRun → toCombat
   continueRun(): void;                   // loadRun(data) → resumeAt에 따라 toShop / toCombat (null이면 새 게임 취급)
-  toCombat(): void;                      // resumeAt='combat' 저장 후 전투
+  toCombat(): void;                      // resumeAt='combat' 저장 후 전투 (보스 테스트 런은 저장하지 않음)
   toStageClear(summary: StageSummary): void;
-  toShop(): void;                        // resumeAt='shop' 저장. 상점에서 가방이 바뀔 때마다 clampRunHp
-  toResult(result: RunResult): void;     // clearRun
+  toShop(): void;                        // resumeAt='shop' 저장. 상점에서 가방이 바뀔 때마다 clampRunHp (보스 테스트 런이면 타이틀로)
+  toResult(result: RunResult): void;     // clearRun(g.run) — 보스 테스트 런이면 세이브를 건드리지 않음
+  // ── 보스 테스트 ──
+  toCharacterSelect(mode?: 'normal' | 'bossTest'): void;   // 'bossTest' = 보스 테스트용 캐릭터 선택 (시작 → startBossTest)
+  startBossTest(characterId: string): void;  // newBossTestRun(프리셋 가방) → toCombat. 저장하지 않는다
+  toBossResult(result: BossTestResult): void; // g.run = null → BossResultScene (세이브 건드리지 않음)
+  toTitle(): void;                       // 보스 테스트 런이면 그 런을 버린다 (가방 오버레이 '그만두기')
 }
+interface BossTestResult { won; characterId; lostReason: LostReason | null; time /* sim 초 */; hp; maxHp;
+                           bossDamage /* 최대 - 남은 HP, 이겼으면 최대 */; bossMaxHp; backAttacks /* 보스 윗면 직접 적중 수 */;
+                           minionKills; phase /* 1부터 */; phases }
+// 보스 테스트는 일반 런 세이브를 한 글자도 바꾸지 않는다: 저장·삭제 경로가 isBossTestRun에서 갈리고, logic/run.ts의 saveRun/clearRun/loadRun도
+// 한 번 더 막는다. tools/smoke.mjs·interaction-check.mjs가 보스 테스트 전후 localStorage 세이브 문자열이 같은지, '이어하기'가 상점으로 가는지 확인한다.
 initGame(gameApp: GameApp): Game ; export let game: Game
 
 // bag/BagView.ts — 전투 일시정지 오버레이와 상점이 함께 쓴다
@@ -673,8 +777,11 @@ debugState(): { playerX; playerY; playerVx; playerVy; moveSpeed; targetX; target
                 hp; maxHp; status; lostReason; phase; time; kills; totalEnemies; bagOpen; speed; weaponUids;
                 aimAngle; dragging; pointers; recentShots: { id; weaponUid; x; y; vx; vy; age }[] /* 나이 ≤ 0.12초 */;
                 hits; behindHits; topHits; frontTop; frontCount;
-                combo; bestCombo; fxParticles; trauma; hitStop }   // 연출 측정용: '백어택' 콤보 지금/최고, 살아있는 이펙트 파티클,
+                combo; bestCombo; fxParticles; trauma; hitStop    // 연출 측정용: '백어택' 콤보 지금/최고, 살아있는 이펙트 파티클,
                                                                    // 화면 흔들림 트라우마(0..1), 남은 히트스톱(초)
+                bossTest; boss: { hp; maxHp; phase; phases; mode; action; invulnerable; minions; y; h } | null;
+                hazards: { id; kind; state; x; y; w; h; timer }[]; bossDamage; backAttacks; minionKills }
+                // 보스전(sim.boss) 상태와 보스 테스트 결과용 기록 — 보스전이 아니면 boss null·hazards []
   // 틈 쏘기 통계 (tools/gap-playtest.mjs가 읽음): hits = 이번 전투 hit 이벤트 수(화상·연쇄·폭발 포함).
   // 맨 앞 웨이브 = 가장 아래 살아있는 적의 줄부터 빈 줄 없이 이어진 줄들(화면 밖 줄 포함), frontTop = 그 맨 윗줄의 위 칸 경계
   // (웨이브가 다 들어오기 전엔 음수), frontCount = 그 웨이브의 적 수. behindHits = 적중점이 frontTop + ENEMY_INSET 이상(위),
@@ -702,7 +809,9 @@ debugState(): { playerX; playerY; playerVx; playerVy; moveSpeed; targetX; target
   `PlayerView.faceAim(cos)`: 그림(오른쪽을 봄)을 조준 쪽으로 좌우 뒤집기.
 
 **combat/ 렌더·연출** (필드 좌표 = sim 좌표. 연출은 sim 이벤트를 옮기기만 한다 — 게임 결과와 무관, 연출 RNG는 따로)
-- `FieldView` 레이어(아래 → 위): 바닥(채도 낮춰 한 번 구움) → `trailLayer`(투사체 꼬리) → `enemyLayer` → `projectileLayer` →
+- `FieldView` 레이어(아래 → 위): 바닥(채도 낮춰 한 번 구움) → `hazardLayer`(보스 위험 지역 예고: 빨간 열·그림자·고리) → `trailLayer`(투사체 꼬리) →
+  `enemyLayer` → `projectileLayer` → `fxLayer` → `hazardTopLayer`(떨어지는 깜짝 상자·구슬, 보스 입 빛) → `shotLayer` → `topLayer`. 자세히는:
+  바닥 → 투사체 꼬리 → `enemyLayer` → `projectileLayer` →
   `fxLayer`(타격·폭발·처치 파티클, 번개) → `shotLayer`(적 탄: 꼬리 → 빨간 글로우 → 본체 — 이펙트보다 위라 피할 것이 안 가려짐) →
   `topLayer`(피해 숫자, 골드 팝업, ComboLabel). 플레이어·조준 가이드는 씬의 playerLayer(필드 위).
 - 흔들림: 트라우마(0..1)를 더하고 초당 SHAKE_DECAY 감소, 오프셋 = 트라우마² × SHAKE_MAX_PX(엇갈린 사인 합) — 필드와 playerLayer만.
@@ -732,7 +841,26 @@ muzzle(x, y, angle) ; wallBounce(x, y, fieldW) ; confetti(x, y) ; update(dt) ; p
 hit(x, y) ; end() /* 승패: 페이드 */ ; update(dt) ; readonly current, bestCombo ; static warmupTexts(): Text[]
 // FastBar — ui/ProgressBar와 같은 모양·잔상이지만 다시 그리지 않음(알약 NineSlice 폭만) — 보스 체력·HUD HP/진행 바
 new FastBar(w, h, color, bg?) ; setValue(0..1, animate?) ; update(dt) ; readonly value
-// Banner — 'intro' | 'boss' | 'clear' | 'defeat' 띠 배너 (튀어들어옴·흔들림). static warmupTexts(kind, title, sub): Text[]
+// Banner — 'intro' | 'boss' | 'phase' | 'clear' | 'defeat' 띠 배너 (튀어들어옴·흔들림). static warmupTexts(kind, title, sub): Text[]
+//   'phase' = 보스 페이즈 전환(주황, 경고 줄무늬, 띠가 조금 더 비침) — CombatScene이 보스 몸 위(PHASE_BANNER_Y)에 띄운다
+// BossBar — new BossBar(name, phaseFracs?) : 페이즈 문턱 눈금 + 이름 오른쪽 페이즈 점. setHp ; setPhase(p) ; flash() ; setShield(on /* 포효 무적 */) ; show/hide
+// BossFx — 보스전(stage.boss) 연출. 판정은 sim — sim.boss·sim.hazards와 이벤트를 그림으로 옮기기만 한다
+new BossFx(renderer, fxTextures, effects, enemyLayer, field.hazardLayer, field.hazardTopLayer)
+onAction(kind, windup)          // 'bossAction': 입 빛 색 = 행동 종류(visual.ts BOSS_TELL_COLOR), 예비 동작 길이
+onPhase(phase, roar, bossEntity) // 'bossPhase': 포효 고리(Effects.roar), phase 0이면 착지 출렁 + 먼지(landDust)
+onSummon(x, y)                  // 'summon' 한 마리: 입 벌려 뱉는 팝 + 내려앉을 칸 발밑 그림자(착지 표시) → 내려앉는 순간 착지 먼지 (필드 시계)
+onHazardImpact(hazardId)        // 'hazardImpact': 그 위험 지역 발동 연출(slamImpact / marbleImpact). 그리던 것이 없으면 null
+onBossDead() ; update(dt, sim.boss, bossEntity, sim.hazards) ; destroy()
+//   자세: EnemyLayer.setPose(보스 id, x, y, sx, sy) — 숨쉬기(ActorSprite idle) 위에 예비 동작(젖힘·솟음·떨림·입 벌림)·실행 팝·포효 떨림·착지 출렁.
+//   위험 지역 뷰는 id로 diff — 새로 보이면 스프라이트 몇 개 생성, sim 목록에서 빠지면 HAZARD_FADE_TIME 동안 흐려진 뒤 파괴. 그 밖엔 할당 없음.
+//   내려찍기: 빨간 열(WHITE 스프라이트) + 흐르는 사선 줄무늬(TilingSprite, 구운 32px 타일) + 위에서 차오르는 카운트다운 막 + 양옆 테 + 경고 표지 + 깜짝 상자.
+//   구슬: 그림자(구운 원) + 빨간 고리(fx ring, 정확한 반경) + 예고 후반 자리 위에서 커다랗게 → 작아지며 내려앉는 구슬(MARBLE_*).
+// EnemyLayer (보스전) — setPose(enemyId, x, y, sx, sy): 씬이 덧입히는 자세 / hop(enemyId, fromX, fromY, dur): 소환 졸개가 입에서 칸으로
+//   포물선을 그리며 작게 → 제 크기로 날아가 착지 출렁 (뷰가 아직 없으면 만들 때 적용, 그동안 HP 숫자 숨김)
+// Effects (보스전) — roar(x, y, size) ; landDust(x0, x1, y) ; summonPuff(x, y) ; landPuff(x, y) ; slamImpact(cx, y, w) ; marbleImpact(x, y, r) ;
+//   prewarmBoss() (보스전 인트로 동안 화면 밖에서 한 번씩)
+// Hud — setStageText(label, name) (보스 테스트: '보스 테스트' / 보스 이름) ; setGoldVisible(on) (보스 테스트는 골드 숨김)
+// BagOverlay — opts.onQuit?: () => void 가 있으면 '계속하기' 왼쪽에 '그만두기' (보스 테스트 — 결과 없이 타이틀로)
 // fxTextures.ts — 모듈 캐시(스테이지마다 다시 굽지 않음)
 fxTextures(renderer): FxTextures         // soft · ring · spark · shadow · dot
 fxAtlas(renderer, trailTaper): FxAtlas   // FxFrame → Texture: fx_* PNG + 파편(shot_bolt/spring/gear) + 코드로 그린 soft·ring·star·shard·trail·beam
@@ -741,6 +869,13 @@ enemyOverlayTextures(renderer, key): { white; frost } ; ensureNumberFont() /* NU
 - 미리 그리기(인트로 동안 프레임당 하나): 배너·콤보 글자(같은 TextStyle 인스턴스를 공유해야 텍스처를 같이 씀, 아주 작게 계속 그려 둠 —
   안 그리면 렌더러 GC가 60초 뒤 치움), 적 덮개 실루엣, 투사체·적 탄 텍스처 업로드, 뷰 풀, `Effects.prewarm`(화면 밖에서 연출 한 번씩).
   보스 체력 바도 등장 전까지 바탕 아래에서 그려 둔다.
+- **보스전 흐름**(stage.boss): sim에 `bosses: data.bosses`. 이벤트 → 연출: bossPhase(포효·페이즈 배너·화면 번쩍임 PHASE_FLASH_*·흔들림 TRAUMA_ROAR·BossBar 점/번쩍),
+  bossAction(BossFx 입 빛·자세), summon(EnemyLayer.hop + 묶음당 연기 한 번 + BossFx 착지 그림자·착지 먼지 — 필드 시계라 히트스톱·가방 중엔 같이 멈춤), hazardWarn(slam → slam_warn), hazardImpact(BossFx 발동 연출 + 흔들림 TRAUMA_SLAM/MARBLE),
+  enemyShoot(보스 탄은 sprite로 발사음, 보스 몸 'attack' 팝은 생략 — BossFx 실행 팝이 맡음), hit(보스면 깎인 HP 합, 적중점 y가 보스 위끝이면 백어택 수).
+  보스 체력 바 setShield = sim.boss.invulnerable. 인트로 동안 보스·졸개 덮개 실루엣, 보스 행동 탄·위험 지역 그림, 페이즈 배너 글자, Effects.prewarmBoss를 미리 그린다.
+- **보스 테스트 런**(isBossTestRun): HUD '보스 테스트', 골드 숨김, 조작 말풍선 없음, 인트로 배너 = 보스 배너, 처치 보상(rewardKill) 없음,
+  승리 → '격파!' 배너 → CELEBRATE_TIME + 1.1초 뒤 / 패배 → DEFEAT_TIME 뒤 `game.toBossResult` (completeStage·saveRun·StageClear·상점을 거치지 않는다).
+  가방 오버레이 '그만두기' → `game.toTitle()`.
 - `CombatScene.destroy`는 항상 `{ children: true, context: true }` — pixi v8은 Graphics 컨텍스트(GPU 지오메트리)를 렌더러 GC 때까지 남긴다.
   전투 씬의 Graphics는 컨텍스트를 공유하지 않아 안전하다(`menuFx`는 공유하므로 SceneManager 전체에 걸면 안 됨 — SceneManager는
   대신 `destroyTree`로 Graphics가 소유한 컨텍스트만 지운다, core/ 참고).
@@ -757,7 +892,10 @@ enemyOverlayTextures(renderer, key): { white; frost } ; ensureNumberFont() /* NU
 `scene()`은 현재 씬의 `sceneName`(Scene 기반 클래스의 abstract readonly 필드, 클래스 이름과 같은 문자열로 지정 — 빌드 압축 후에도 유지). 전투 씬은 `winStage/loseStage`를 처리할 수 있어야 한다.
 반환값: `winStage/loseStage/setSpeed` → 현재 씬이 처리했으면 true. `addGold` → 새 골드 또는 null. `addItem` → 추가된 StashItem 또는 null. 이후 현재 씬에 `refresh()`가 있으면 호출.
 
-테스트 도구 (모두 자기 개발 서버를 `--port`로 띄우고 끝나면 끈다): `tools/smoke.mjs`(전체 흐름, 포트 5210), `tools/interaction-check.mjs`(실제 터치 입력 30개 검사 — 조준 10개,
+테스트 도구 (모두 자기 개발 서버를 `--port`로 띄우고 끝나면 끈다): `tools/smoke.mjs`(전체 흐름, 포트 5210 — 상점에서 일반 세이브가 있는 채로 보스 테스트 한 바퀴:
+타이틀 '보스 테스트' → 카드 → '보스전!' → 인트로·착지 → 승리 → 보스 결과 → '다시 도전' → 패배 → 보스 결과 → '타이틀로' → 세이브 문자열이 그대로인지 + '이어하기' → 상점),
+`tools/interaction-check.mjs`(실제 터치 입력 38개 검사 — 보스 테스트 8개: 프리셋 가방으로 시작, 전투 중 가방 → '그만두기' → 타이틀(세이브 그대로), 승리·다시 도전(같은 캐릭터)·패배·
+캐릭터 변경·뒤로, 세이브 문자열 그대로 + '이어하기' → 상점 / 조준 10개,
 이동 감각 4개(휙 끈 뒤 뒤처져 걷기, 속도 상한·놓은 자리에 정확히 서기, 필드 위쪽까지 갔다 오기), 마지막에 다음 전투에서 적에게 걸어 들어가 접촉 패배 포함, 포트 5211),
 `tools/gap-playtest.mjs`(실제 터치로 st1을 끝까지 — 조준 가이드로 틈을 노리는 사람 흉내(옆으로 옮길 땐 손가락을 둔 채 캐릭터가 걸어가 설 때까지 기다림), debugState의 hits/behindHits/topHits와
 웨이브 뒤로 들어간 공 연속 스크린샷 → `tools/.out/gap/`, 포트 5212), `tools/juice-sheet.mjs`(연출 리뷰 — 장면 8개

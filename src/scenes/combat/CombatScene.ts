@@ -1,15 +1,17 @@
 // 전투 씬: CombatSim(고정 스텝) 구동 + 렌더러들 + 입력 + 흐름(인트로 → 전투 → 클리어/패배) + 가방 오버레이.
 // 게임 규칙은 전부 sim/run 로직에 있고, 여기서는 이벤트를 연출로 옮기기만 한다.
+// 보스전(stage.boss): 보스 연출은 BossFx(자세·입 빛·위험 지역 예고), 페이즈 배너·번쩍임은 여기.
+// 보스 테스트 런(isBossTestRun): 보상·스테이지 클리어·저장 없이 끝나면 보스 결과 화면(game.toBossResult)으로.
 import {
   Container,
   Graphics,
   Point,
   Rectangle,
   Sprite,
+  Texture,
   type DestroyOptions,
   type FederatedPointerEvent,
   type Text,
-  type Texture,
 } from 'pixi.js';
 import { sfx } from '../../audio';
 import {
@@ -52,6 +54,7 @@ import {
   combatSeed,
   completeStage,
   currentStage,
+  isBossTestRun,
   rewardKill,
   runCharacter,
   runLoadout,
@@ -59,6 +62,7 @@ import {
   saveRun,
 } from '../../logic/run';
 import type {
+  BossDef,
   CombatEvent,
   CombatInput,
   CombatStatus,
@@ -74,8 +78,9 @@ import { tex } from '../../render/assets';
 import { Toast } from '../../ui';
 import { AimGuide } from './AimGuide';
 import { BagOverlay } from './BagOverlay';
-import { Banner } from './Banner';
+import { Banner, type BannerKind } from './Banner';
 import { BossBar } from './BossBar';
+import { BossFx } from './BossFx';
 import { ComboLabel } from './ComboLabel';
 import { Effects } from './Effects';
 import { EnemyLayer, type HitInfo } from './EnemyLayer';
@@ -103,6 +108,11 @@ import {
   INTRO_TIME,
   KEY_MOVE_LEAD,
   MAX_STEPS_PER_FRAME,
+  PHASE_BANNER_TIME,
+  PHASE_BANNER_Y,
+  PHASE_FLASH_ALPHA,
+  PHASE_FLASH_TIME,
+  SUMMON_HOP_TIME,
   SHAKE_DECAY,
   SHAKE_MAX_PX,
   TOP_PAD_MAX,
@@ -111,10 +121,14 @@ import {
   TRAUMA_BOSS_ARRIVE,
   TRAUMA_BOSS_KILL,
   TRAUMA_DEFEAT,
+  TRAUMA_BOSS_LAND,
   TRAUMA_ELITE_KILL,
   TRAUMA_EXPLODE_MAX,
+  TRAUMA_MARBLE,
   TRAUMA_PER_EXPLODE_PX,
   TRAUMA_PLAYER_HIT,
+  TRAUMA_ROAR,
+  TRAUMA_SLAM,
   VIGNETTE_TIME,
   WALL_TOP_H,
 } from './visual';
@@ -153,6 +167,10 @@ const WARM_TEXT_SCALE = 0.01;
 /** 인트로 동안 미리 만들어 두는 투사체 / 적 탄 뷰 수 (스트레스 빌드의 평소 동시 투사체 수 정도) */
 const PREWARM_PROJ_VIEWS = 32;
 const PREWARM_SHOT_VIEWS = 12;
+/** 배너 기본 높이 (필드 높이 비율) */
+const BANNER_FIELD_Y = 0.36;
+/** 보스 테스트 승리: 보스 연쇄 폭발을 다 보고 결과로 (CELEBRATE_TIME에 더함) */
+const BOSS_TEST_CELEBRATE_EXTRA = 1.1;
 
 export class CombatScene extends Scene {
   readonly sceneName = 'CombatScene';
@@ -196,6 +214,16 @@ export class CombatScene extends Scene {
   private tutorial: TutorialCallout | null = null;
   private readonly bossBar: BossBar | null = null;
   private readonly boss: EnemyEntity | null = null;
+  /** 보스전 데이터·연출 (stage.boss가 있을 때만) */
+  private readonly bossDef: BossDef | null = null;
+  private readonly bossFx: BossFx | null = null;
+  /** 보스 테스트 런: 보상·저장 없음, 끝나면 보스 결과 화면 */
+  private readonly bossTest: boolean = false;
+  /** 페이즈 전환 화면 번쩍임 (배너 아래) */
+  private readonly flash = new Sprite(Texture.WHITE);
+  private flashT = 0;
+  /** 같은 묶음의 소환 연기는 한 번만 (sfx 시계 기준 마지막 연기 시각) */
+  private lastSummonPuff = -Infinity;
 
   // ── 상태 ──
   private phase: CombatPhase = 'intro';
@@ -239,6 +267,10 @@ export class CombatScene extends Scene {
   /** 이벤트 묶음 안에서 직전 폭발 중심 / 직전 연쇄 (휘말린 적 hit의 밀림 방향·종류 판정) */
   private readonly blast = { active: false, x: 0, y: 0, chainX: NaN, chainY: NaN, chainFromX: 0, chainFromY: 0 };
   private bossAnnounced = false;
+  /** 배너 기본 위치(화면 y) — 페이즈 배너만 보스 몸 위로 올린다 */
+  private bannerY = 0;
+  /** 인트로에서 이미 보스 배너·소리를 냈다 (보스 테스트) — 보스가 보일 때 바만 띄운다 */
+  private bossAnnouncedIntro = false;
   private newItemAlert = false;
 
   // ── 효과음 (sfxMap.ts 수치) ──
@@ -262,6 +294,10 @@ export class CombatScene extends Scene {
   private behindHits = 0;
   private topHits = 0;
   private kills = 0;
+  /** 보스 테스트 결과용: 보스에게 실제로 깎은 HP 합, 보스 윗면 직접 적중(백어택), 처치한 졸개 */
+  private bossDamage = 0;
+  private bossTopHits = 0;
+  private minionKills = 0;
   private goldEarned = 0;
   private readonly drops: { defId: string; tier: Tier }[] = [];
 
@@ -283,10 +319,13 @@ export class CombatScene extends Scene {
     this.data = data;
     this.run = run;
     this.stage = stage;
+    this.bossTest = isBossTestRun(run);
+    this.bossDef = stage.boss ? (data.bosses[stage.boss] ?? null) : null;
     this.sim = new CombatSim({
       stage,
       stageIndex: run.stageIndex,
       enemies: data.enemies,
+      bosses: data.bosses,
       loadout,
       player: runPlayerStats(data, run),
       hp: run.hp,
@@ -301,6 +340,9 @@ export class CombatScene extends Scene {
     this.field.topLayer.addChild(this.combo);
     this.enemies = new EnemyLayer(data.enemies, renderer, this.fx);
     this.field.enemyLayer.addChild(this.enemies);
+    if (this.bossDef) {
+      this.bossFx = new BossFx(renderer, fx, this.fx, this.enemies, this.field.hazardLayer, this.field.hazardTopLayer);
+    }
     this.projectiles = new ProjectileLayer(
       this.field.projectileLayer,
       this.field.trailLayer,
@@ -315,7 +357,7 @@ export class CombatScene extends Scene {
     this.aimGuide = new AimGuide(fx);
     this.guideRadius = guideRadius(loadout);
     this.playerLayer.addChild(this.aimGuide, this.player);
-    if (run.stageIndex === 0) {
+    if (run.stageIndex === 0 && !this.bossTest) {
       this.tutorial = new TutorialCallout(T.combat.aimTutorial);
       this.playerLayer.addChild(this.tutorial);
     }
@@ -325,7 +367,7 @@ export class CombatScene extends Scene {
     const boss = this.sim.enemies.find((e) => e.boss) ?? null;
     if (boss) {
       this.boss = boss;
-      this.bossBar = new BossBar(data.enemies[boss.defId]?.name ?? '');
+      this.bossBar = new BossBar(data.enemies[boss.defId]?.name ?? '', this.bossDef ? this.bossDef.phases.map((p) => p.hpFrac) : []);
       // 등장 전까지는 미리 그리기 층(바탕 아래, 안 보임)에서 계속 그려 둔다 — 처음 보일 때 이름 글자·게이지를 만드느라
       // 끊기지 않게 (측정: 첫 표시 프레임 렌더 12.5 ms @ CPU 4배 감속). 숨겨 두면 렌더러 GC(60초 미사용)가 도로 치운다
       this.bossBar.visible = true;
@@ -333,7 +375,11 @@ export class CombatScene extends Scene {
     }
 
     this.hud = new Hud(fx.soft, () => this.toggleBag());
-    this.hud.setStage(run.stageIndex + 1, stage.name);
+    if (this.bossTest) {
+      // 보스 테스트: 스테이지 번호 대신 모드 이름, 골드는 쓰지 않으므로 숨김
+      this.hud.setStageText(T.combat.bossTest, stage.name);
+      this.hud.setGoldVisible(false);
+    } else this.hud.setStage(run.stageIndex + 1, stage.name);
     this.hud.setStash(run.bag.stash.length);
     this.hud.setGold(run.gold);
     this.hud.setHp(this.sim.player.hp, this.sim.player.maxHp);
@@ -356,6 +402,9 @@ export class CombatScene extends Scene {
 
     this.vignette.eventMode = 'none';
     this.vignette.alpha = 0;
+    this.flash.eventMode = 'none';
+    this.flash.alpha = 0;
+    this.flash.visible = false;
     this.toastLayer.eventMode = 'none';
 
     this.addChild(
@@ -367,6 +416,7 @@ export class CombatScene extends Scene {
       this.overlayLayer,
       this.hud,
       this.flyers,
+      this.flash,
       this.banner,
       this.vignette,
       this.toastLayer,
@@ -387,7 +437,10 @@ export class CombatScene extends Scene {
       this.warmQueue.push(() => Banner.warmupTexts(kind, title, sub));
     };
     if (boss) warm('boss', T.combat.bossIncoming, data.enemies[boss.defId]?.name ?? null);
-    warm('clear', T.combat.cleared, null);
+    if (this.bossDef) {
+      for (let p = 1; p < this.bossDef.phases.length; p++) warm('phase', T.combat.phase(p + 1), phaseSub(p));
+    }
+    warm('clear', this.bossTest ? T.combat.bossDefeated : T.combat.cleared, null);
     warm('defeat', T.combat.defeat, T.combat.breach);
     warm('defeat', T.combat.defeat, T.combat.knockedOut);
     warm('defeat', T.combat.defeat, T.combat.crushed);
@@ -410,6 +463,24 @@ export class CombatScene extends Scene {
         }
       }
     }
+    // 보스전: 보스·졸개 그림, 졸개 탄과 보스 행동 탄·위험 지역 그림 (stage.rows가 비어 있어 위에서 못 모은다)
+    if (this.bossDef) {
+      const bd = this.bossDef;
+      const addEnemy = (id: string): void => {
+        const def = data.enemies[id];
+        if (!def) return;
+        keys.add(def.sprite);
+        if (def.attack) shotKeys.add(def.attack.sprite);
+      };
+      addEnemy(bd.enemy);
+      for (const ph of bd.phases) for (const m of ph.minions) addEnemy(m.enemy);
+      for (const a of bd.actions) {
+        if (a.kind === 'volley') shotKeys.add(a.volley.sprite);
+        else if (a.kind === 'ring') shotKeys.add(a.ring.sprite);
+        else if (a.kind === 'slam') shotKeys.add(a.slam.sprite);
+        else if (a.kind === 'marbles') shotKeys.add(a.marbles.sprite);
+      }
+    }
     for (const key of keys) {
       this.warmQueue.push(() => {
         this.enemies.prepare(key);
@@ -430,6 +501,7 @@ export class CombatScene extends Scene {
     });
     this.warmQueue.push(() => {
       this.fx.prewarm();
+      if (this.bossDef) this.fx.prewarmBoss();
       return [];
     });
   }
@@ -446,8 +518,15 @@ export class CombatScene extends Scene {
     document.addEventListener('visibilitychange', this.onVisibility);
     const kb = (this.keyboard = new Keyboard());
     for (const code of ['KeyB', 'Escape', 'Tab']) kb.onPress(code, () => this.toggleBag());
-    this.banner.show('intro', T.combat.stage(this.run.stageIndex + 1), this.stage.name, INTRO_TIME + 0.15);
-    sfx.play('stage_start');
+    if (this.bossTest) {
+      // 보스 테스트: 인트로부터 보스 배너 (보스는 인트로가 끝나면 위에서 내려온다)
+      this.bossAnnouncedIntro = true;
+      this.showBanner('boss', T.combat.bossIncoming, this.stage.name, INTRO_TIME + 0.9);
+      sfx.play('boss_appear');
+    } else {
+      this.showBanner('intro', T.combat.stage(this.run.stageIndex + 1), this.stage.name, INTRO_TIME + 0.15);
+      sfx.play('stage_start');
+    }
   }
 
   override onExit(): void {
@@ -465,6 +544,7 @@ export class CombatScene extends Scene {
     this.timers.length = 0;
     this.warmQueue.length = 0;
     this.overlay = null;
+    this.bossFx?.destroy();
   }
 
   /**
@@ -499,8 +579,11 @@ export class CombatScene extends Scene {
     this.weaponBar.setHeight(barH);
     this.hud.position.set(0, this.hudY);
     this.hud.setTopExtend(this.hudY);
-    this.banner.position.set(0, this.fieldY + FIELD_H * 0.36);
+    this.bannerY = this.fieldY + FIELD_H * BANNER_FIELD_Y;
+    this.banner.position.set(0, this.bannerY);
     this.drawVignette(vp);
+    this.flash.width = vp.width;
+    this.flash.height = vp.height;
     this.overlay?.layout(vp, this.fieldY);
   }
 
@@ -543,6 +626,7 @@ export class CombatScene extends Scene {
     this.flyers.update(dt);
     this.banner.update(dt);
     this.updateVignette(dt);
+    this.updateFlash(dt);
   }
 
   // ── 디버그 (window.__game.debug) ────────────────────────────
@@ -616,6 +700,26 @@ export class CombatScene extends Scene {
     fxParticles: number;
     trauma: number;
     hitStop: number;
+    /** 보스 테스트 런인가 / 보스전 상태 (보스전이 아니면 null) */
+    bossTest: boolean;
+    boss: {
+      hp: number;
+      maxHp: number;
+      phase: number;
+      phases: number;
+      mode: string;
+      action: string | null;
+      invulnerable: boolean;
+      minions: number;
+      y: number;
+      h: number;
+    } | null;
+    /** 보스 위험 지역 (예고·발동 중) */
+    hazards: { id: number; kind: string; state: string; x: number; y: number; w: number; h: number; timer: number }[];
+    /** 보스 테스트 결과용 기록: 보스에게 깎은 HP(이벤트 합), 보스 윗면 적중(백어택), 처치한 졸개 */
+    bossDamage: number;
+    backAttacks: number;
+    minionKills: number;
   } | null {
     if (!this.ready) return null;
     const sim = this.sim;
@@ -657,6 +761,26 @@ export class CombatScene extends Scene {
       fxParticles: this.fx.particleCount,
       trauma: this.trauma,
       hitStop: this.hitStop,
+      bossTest: this.bossTest,
+      boss:
+        sim.boss && this.boss
+          ? {
+              hp: this.boss.hp,
+              maxHp: this.boss.maxHp,
+              phase: sim.boss.phase,
+              phases: sim.boss.phases,
+              mode: sim.boss.mode,
+              action: sim.boss.action,
+              invulnerable: sim.boss.invulnerable,
+              minions: sim.boss.minions,
+              y: this.boss.y,
+              h: this.boss.h,
+            }
+          : null,
+      hazards: sim.hazards.map((h) => ({ id: h.id, kind: h.kind, state: h.state, x: h.x, y: h.y, w: h.w, h: h.h, timer: h.timer })),
+      bossDamage: this.bossDamage,
+      backAttacks: this.bossTopHits,
+      minionKills: this.minionKills,
     };
   }
 
@@ -705,6 +829,12 @@ export class CombatScene extends Scene {
           break;
         case 'hit': {
           this.hitCount++;
+          const boss = this.boss;
+          if (boss && ev.enemyId === boss.id) {
+            this.bossDamage += ev.damage;
+            // 보스 윗면 직접 적중 = 적중점이 충돌 박스 위끝 (공 중심이 보스보다 위 — 양옆 통로로 넘어간 공)
+            if (Math.abs(ev.y - boss.y) < 0.01) this.bossTopHits++;
+          }
           if (front === undefined) front = frontWave(this.sim.enemies);
           let behind = false;
           if (front) {
@@ -755,10 +885,39 @@ export class CombatScene extends Scene {
           blast.active = false;
           break;
         case 'enemyShoot':
-          this.enemyShotSfx(ev.enemyId, ev.x);
-          this.enemies.onAttack(ev.enemyId);
+          this.enemyShotSfx(ev.enemyId, ev.x, ev.sprite);
+          // 보스전(BossDef) 보스의 행동 탄은 BossFx 자세(실행 팝)가 맡는다 — 발마다 몸 전체가 튀지 않게 (st5 보스 로봇은 예전처럼)
+          if (!(this.bossFx && ev.enemyId === this.boss?.id)) this.enemies.onAttack(ev.enemyId);
           blast.active = false;
           break;
+        case 'bossPhase':
+          this.onBossPhase(ev.phase, ev.roar);
+          blast.active = false;
+          break;
+        case 'bossAction':
+          this.bossFx?.onAction(ev.action, ev.windup);
+          blast.active = false;
+          break;
+        case 'summon':
+          this.onSummon(ev);
+          blast.active = false;
+          break;
+        case 'hazardWarn':
+          if (ev.kind === 'slam') sfx.playAt('slam_warn', panAt(ev.x));
+          blast.active = false;
+          break;
+        case 'hazardImpact': {
+          const v = this.bossFx?.onHazardImpact(ev.hazardId);
+          if (ev.kind === 'slam') {
+            sfx.playAt('slam_impact', panAt(ev.x));
+            this.addTrauma(TRAUMA_SLAM);
+          } else {
+            sfx.playAt('marble_impact', panAt(ev.x));
+            if (v) this.addTrauma(TRAUMA_MARBLE);
+          }
+          blast.active = false;
+          break;
+        }
         case 'playerHit':
           sfx.playAt('player_hurt', panAt(ev.x));
           this.player.onHit();
@@ -879,8 +1038,17 @@ export class CombatScene extends Scene {
         this.hitStop = Math.max(this.hitStop, HITSTOP_ELITE);
       }
     }
-    if (ev.boss) this.bossBar?.hide();
+    if (ev.boss) {
+      this.bossBar?.hide();
+      this.bossFx?.onBossDead();
+      if (this.bossDef) this.flashT = PHASE_FLASH_TIME;
+    } else if (this.bossDef) this.minionKills++;
 
+    // 보스 테스트: 골드·드롭 없음 (런은 저장도 안 하고 버린다)
+    if (this.bossTest) {
+      this.kills++;
+      return;
+    }
     const reward = rewardKill(this.data, this.run, ev.defId);
     this.kills++;
     this.goldEarned += reward.gold;
@@ -918,9 +1086,10 @@ export class CombatScene extends Scene {
     this.tutorial?.dismiss();
     this.combo.end();
     sfx.play('stage_clear');
-    this.banner.show('clear', T.combat.cleared, null, CELEBRATE_TIME + 0.6);
+    const celebrate = CELEBRATE_TIME + (this.bossTest ? BOSS_TEST_CELEBRATE_EXTRA : 0);
+    this.showBanner('clear', this.bossTest ? T.combat.bossDefeated : T.combat.cleared, null, celebrate + 0.6);
     for (let i = 0; i < 5; i++) this.fx.confetti(FIELD_W * (0.15 + i * 0.175), FIELD_H * (0.3 + (i % 2) * 0.12));
-    this.after(CELEBRATE_TIME, () => this.finishStage());
+    this.after(celebrate, () => (this.bossTest ? this.finishBossTest(true) : this.finishStage()));
   }
 
   private finishStage(): void {
@@ -939,6 +1108,77 @@ export class CombatScene extends Scene {
       healed: res.healed,
       finished: res.finished,
     });
+  }
+
+  /** 보스 테스트 끝: 보상·스테이지 진행·저장 없이 보스 결과 화면으로 (일반 런 세이브는 건드리지 않는다) */
+  private finishBossTest(won: boolean): void {
+    if (this.leaving || this.exited) return;
+    this.leaving = true;
+    const sim = this.sim;
+    const boss = this.boss;
+    const bs = sim.boss;
+    const bossMaxHp = boss?.maxHp ?? 0;
+    // 보스 HP는 회복되지 않으므로 '깎은 양' = 최대 - 남은 HP (이겼으면 전부)
+    const bossDamage = won ? bossMaxHp : Math.max(0, Math.round(bossMaxHp - Math.max(0, boss?.hp ?? bossMaxHp)));
+    game.toBossResult({
+      won,
+      characterId: this.run.characterId,
+      lostReason: won ? null : sim.lostReason,
+      time: sim.time,
+      hp: Math.max(0, Math.ceil(sim.player.hp)),
+      maxHp: sim.player.maxHp,
+      bossDamage,
+      bossMaxHp,
+      backAttacks: this.bossTopHits,
+      minionKills: this.minionKills,
+      phase: (bs?.phase ?? 0) + 1,
+      phases: bs?.phases ?? 1,
+    });
+  }
+
+  /** 보스 테스트를 중간에 그만둠 (가방 오버레이의 '그만두기') — 결과 없이 타이틀로. 일반 런 세이브는 그대로 */
+  private quitBossTest(): void {
+    if (!this.bossTest || this.leaving || this.exited) return;
+    this.leaving = true;
+    game.toTitle();
+  }
+
+  /** 'bossPhase': 등장 착지(phase 0) 또는 페이즈 전환 — 포효(무적) 연출 */
+  private onBossPhase(phase: number, roar: number): void {
+    const boss = this.boss;
+    this.bossFx?.onPhase(phase, roar, boss && boss.alive ? boss : null);
+    this.bossBar?.setPhase(phase);
+    sfx.play('boss_roar');
+    if (phase === 0) {
+      // 고정 위치에 쿵 내려앉으며 포효
+      this.addTrauma(TRAUMA_BOSS_LAND);
+      return;
+    }
+    // 페이즈 전환: 화면 번쩍 + 크게 흔들림 + 배너(보스 몸 위 — 아래쪽 탄을 가리지 않게)
+    this.addTrauma(TRAUMA_ROAR);
+    this.flashT = PHASE_FLASH_TIME;
+    this.bossBar?.flash();
+    this.showBanner('phase', T.combat.phase(phase + 1), phaseSub(phase), PHASE_BANNER_TIME, PHASE_BANNER_Y);
+  }
+
+  /**
+   * 'summon': 졸개가 입에서 튀어나와 칸으로 (묶음마다 연기·소리 한 번). 착지 표시·착지 먼지는 BossFx —
+   * 필드 시계로 흘러서 히트스톱·가방 오버레이 동안 멈춘 졸개보다 먼저 먼지가 나지 않는다
+   */
+  private onSummon(ev: Extract<CombatEvent, { type: 'summon' }>): void {
+    this.enemies.hop(ev.enemyId, ev.fromX, ev.fromY, SUMMON_HOP_TIME);
+    this.bossFx?.onSummon(ev.x, ev.y);
+    if (this.sfxClock - this.lastSummonPuff > 0.2) {
+      this.lastSummonPuff = this.sfxClock;
+      this.fx.summonPuff(ev.fromX, ev.fromY);
+      sfx.playAt('boss_summon', panAt(ev.fromX));
+    }
+  }
+
+  /** 배너 표시. fieldY를 주면 그 필드 높이에, 아니면 기본 위치 */
+  private showBanner(kind: BannerKind, title: string, sub: string | null, duration: number, fieldY?: number): void {
+    this.banner.position.y = fieldY === undefined ? this.bannerY : this.fieldY + fieldY;
+    this.banner.show(kind, title, sub, duration);
   }
 
   private onLost(reason: LostReason): void {
@@ -961,8 +1201,12 @@ export class CombatScene extends Scene {
     this.addTrauma(TRAUMA_DEFEAT);
     this.vignetteT = VIGNETTE_TIME * 2;
     const sub = reason === 'breach' ? T.combat.breach : reason === 'contact' ? T.combat.crushed : T.combat.knockedOut;
-    this.banner.show('defeat', T.combat.defeat, sub, DEFEAT_TIME + 0.6);
+    this.showBanner('defeat', T.combat.defeat, sub, DEFEAT_TIME + 0.6);
     this.after(DEFEAT_TIME, () => {
+      if (this.bossTest) {
+        this.finishBossTest(false);
+        return;
+      }
       if (this.leaving || this.exited) return;
       this.leaving = true;
       const run = this.run;
@@ -1006,13 +1250,19 @@ export class CombatScene extends Scene {
         this.bossBar.show();
         // 보스 체력 바(필드 위쪽)가 피해 숫자를 가리지 않게
         this.fx.setNumberTop(BOSS_NUMBER_MIN_Y);
-        this.banner.show('boss', T.combat.bossIncoming, this.data.enemies[boss.defId]?.name ?? null, 1.8);
-        sfx.play('boss_appear');
-        this.addTrauma(TRAUMA_BOSS_ARRIVE);
+        // 보스 테스트는 인트로에서 이미 보스 배너·소리를 냈다
+        if (!this.bossAnnouncedIntro) {
+          this.showBanner('boss', T.combat.bossIncoming, this.data.enemies[boss.defId]?.name ?? null, 1.8);
+          sfx.play('boss_appear');
+          this.addTrauma(TRAUMA_BOSS_ARRIVE);
+        }
       }
       if (this.bossAnnounced && boss.alive) this.bossBar.setHp(boss.hp, boss.maxHp);
+      const bs = this.sim.boss;
+      if (bs) this.bossBar.setShield(bs.invulnerable && boss.alive);
       this.bossBar.update(dt);
     }
+    this.bossFx?.update(dt, this.sim.boss, this.boss, this.sim.hazards);
     this.combo.update(dt);
   }
 
@@ -1030,6 +1280,17 @@ export class CombatScene extends Scene {
         alpha: 0.42 * (1 - i / bands) ** 2.2,
       });
     }
+  }
+
+  /** 페이즈 전환·보스 처치 화면 번쩍임 (배너 아래) */
+  private updateFlash(dt: number): void {
+    if (this.flashT <= 0) {
+      if (this.flash.visible) this.flash.visible = false;
+      return;
+    }
+    this.flashT = Math.max(0, this.flashT - dt);
+    this.flash.visible = true;
+    this.flash.alpha = PHASE_FLASH_ALPHA * (this.flashT / PHASE_FLASH_TIME);
   }
 
   private updateVignette(dt: number): void {
@@ -1279,6 +1540,7 @@ export class CombatScene extends Scene {
       onClose: () => {
         this.pendingClose = true;
       },
+      onQuit: this.bossTest ? () => this.quitBossTest() : undefined,
     });
     this.overlayLayer.addChild(this.overlay);
     if (this.vp) this.overlay.layout(this.vp, this.fieldY);
@@ -1330,8 +1592,13 @@ export class CombatScene extends Scene {
     for (const l of loadout) this.fireSfx.set(l.uid, weaponFireSfx(l.defId));
   }
 
-  /** 적 공격 탄 그림에 맞는 발사음 */
-  private enemyShotSfx(enemyId: number, x: number): void {
+  /** 적 공격 탄 그림에 맞는 발사음. 보스 행동 탄은 이벤트의 sprite로 (보스는 EnemyDef.attack이 없다) */
+  private enemyShotSfx(enemyId: number, x: number, sprite?: string): void {
+    if (sprite) {
+      const id = ENEMY_SHOT_SFX[sprite];
+      if (id) sfx.playAt(id, panAt(x));
+      return;
+    }
     const list = this.sim.enemies;
     for (let i = 0; i < list.length; i++) {
       if (list[i].id !== enemyId) continue;
@@ -1388,6 +1655,13 @@ export class CombatScene extends Scene {
       tm.fn();
     }
   }
+}
+
+/** 페이즈 배너 부제 (페이즈 인덱스 1..), 문구가 모자라면 마지막 것 */
+function phaseSub(phase: number): string | null {
+  const list = T.combat.phaseSub;
+  if (list.length === 0) return null;
+  return list[Math.min(phase, list.length - 1)] || null;
 }
 
 /** 필드 x → 은은한 좌우 위치 (-COMBAT_PAN..COMBAT_PAN) */

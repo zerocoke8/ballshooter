@@ -101,5 +101,16 @@
   { "id": "danger", "category": "jingle", "duration": 0.8, "influence": 0.55, "variants": 1, "volume": 0.41, "maxVoices": 1, "minInterval": 1.5, "pitchVar": 0.0,
     "prompt": "Soft cartoon warning beep-beep alarm, short" },
   { "id": "victory_run", "category": "jingle", "duration": 3.5, "influence": 0.5, "variants": 1, "volume": 0.75, "maxVoices": 1, "minInterval": 1.0, "pitchVar": 0.0,
-    "prompt": "Triumphant cheerful celebration fanfare with toy instruments and confetti pops, casual mobile game" }
+    "prompt": "Triumphant cheerful celebration fanfare with toy instruments and confetti pops, casual mobile game" },
+
+  { "id": "boss_roar", "category": "jingle", "duration": 1.5, "influence": 0.5, "variants": 1, "volume": 0.62, "maxVoices": 1, "minInterval": 0.8, "pitchVar": 0.0,
+    "prompt": "Big cartoon toy chest monster roaring angrily, wooden lid rattling and clattering, playful but menacing, casual game boss" },
+  { "id": "boss_summon", "category": "enemy", "duration": 1.0, "influence": 0.55, "variants": 1, "volume": 0.5, "maxVoices": 1, "minInterval": 0.4, "pitchVar": 0.04,
+    "prompt": "Wooden toy chest lid creaking open and spitting out several small toys with quick springy pops, cartoon" },
+  { "id": "slam_warn", "category": "enemy", "duration": 0.7, "influence": 0.6, "variants": 1, "volume": 1.0, "maxVoices": 2, "minInterval": 0.25, "pitchVar": 0.03,
+    "prompt": "Jack-in-the-box crank winding up fast with tense ratcheting clicks, cartoon warning, short" },
+  { "id": "slam_impact", "category": "hit", "duration": 0.8, "influence": 0.55, "variants": 1, "volume": 0.42, "maxVoices": 2, "minInterval": 0.12, "pitchVar": 0.05,
+    "prompt": "Heavy cartoon jack-in-the-box slamming down on a wooden floor, deep boomy thud with a springy boing" },
+  { "id": "marble_impact", "category": "hit", "duration": 0.5, "influence": 0.6, "variants": 1, "volume": 1.0, "maxVoices": 3, "minInterval": 0.06, "pitchVar": 0.1,
+    "prompt": "Big glass marble dropping onto a wooden floor with a hard clack and a tiny bounce, short" }
 ]

@@ -1,4 +1,5 @@
 // 전투 화면 렌더 전용 상수 (연출/레이아웃). 게임 규칙 수치는 config.ts / data / logic에 있다.
+import { SUMMON_LAND_TIME } from '../../config';
 
 // ── 레이아웃 ─────────────────────────────────────────────────
 /** 긴 화면에서 남는 높이 중 위쪽 여백으로 주는 비율과 상한 (나머지는 하단 바) */
@@ -76,6 +77,10 @@ export const SPRITE_FACING: Readonly<Record<string, number | null>> = {
   shot_dart: Math.PI / 2,
   shot_bolt: Math.PI / 2,
   shot_spring: null,
+  // 보스 행동 탄: 얼굴이 있는 장난감 블록·팽이 — 비행 방향으로 돌리면 얼굴이 옆으로 눕는다
+  shot_block: null,
+  shot_top: null,
+  shot_marble: null,
 };
 /** 적 탄 중 회전하는 것 */
 export const SPINNING_SHOTS: ReadonlySet<string> = new Set(['shot_gear']);
@@ -191,6 +196,11 @@ export const ENEMY_POP_TIME = 0.085;
 export const ENEMY_POP_SCALE = 1.3;
 /** 냉기 덮개(얼음 실루엣) 알파, 화상 덮개(주황) 알파 */
 export const FROST_OVERLAY_ALPHA = 0.82;
+/**
+ * 보스의 냉기 덮개 알파. 보스는 화면의 큰 부분이라 0.82면 얼음 실루엣이 그림(얼굴·입 속 장난감)을 거의 다 덮었다 —
+ * 얼음 무기 빌드에선 보스전 내내 창백한 덩어리로 보여서 낮춘다 (냉기 저항 보스라는 느낌과도 맞음)
+ */
+export const BOSS_FROST_OVERLAY_ALPHA = 0.5;
 export const BURN_OVERLAY_ALPHA = 0.24;
 export const BURN_OVERLAY_COLOR = 0xff9b3d;
 /** 상태이상 파티클 간격(초): 불꽃이 피어오름 / 얼음 조각이 반짝 */
@@ -232,6 +242,57 @@ export const COMBO_REFRESH = 0.09;
  */
 export const COMBO_COLOR = 0xff9ad5;
 export const COMBO_HOT_COLOR = 0xff5cb8;
+
+// ── 보스전 연출 (BossFx — 장난감 상자 대마왕) ─────────────────
+/** 행동 예비 동작 때 입에서 피어나는 빛 색 (행동 종류별 — 무엇이 올지 미리 읽히게) */
+export const BOSS_TELL_COLOR = {
+  volley: 0xffa040,
+  ring: 0x8fd8ff,
+  slam: 0xff4040,
+  marbles: 0xb7a6ff,
+  summon: 0x9cff8a,
+} as const;
+export const BOSS_ROAR_COLOR = 0xff5a3a;
+/** 입 빛 크기(px): 예비 동작 시작 → 끝, 실행 순간 번쩍임 */
+export const BOSS_GLOW_MIN = 70;
+export const BOSS_GLOW_MAX = 210;
+export const BOSS_GLOW_FLASH_TIME = 0.28;
+/** 자세가 목표로 따라가는 속도(1/초), 실행 순간 '팝' 감쇠(1/초), 내려앉기 출렁 시간 */
+export const BOSS_POSE_RATE = 14;
+export const BOSS_PUNCH_DECAY = 7;
+export const BOSS_LAND_TIME = 0.4;
+/** 위험 지역 예고: 빨간 열(내려찍기) */
+export const HAZARD_RED = 0xff2a2a;
+export const HAZARD_FILL_ALPHA = 0.12;
+export const HAZARD_FILL_ALPHA_END = 0.26;
+export const HAZARD_STRIPE_ALPHA = 0.22;
+export const HAZARD_STRIPE_SPEED = 90;
+/** 내려찍는 깜짝 상자 그림 폭(px, 열 폭의 비율 상한)과 떨어지는 시간(초) */
+export const SLAM_JACK_W = 100;
+export const SLAM_DROP_TIME = 0.06;
+/**
+ * 구슬: 예고 진행 이 비율부터 보인다 / 처음 높이(자리 위 px)·처음 크기 배수(+이만큼, 가까이 있는 느낌) / 그림 크기(반경 대비).
+ * 위에서 내려다본 낙하 — 자리 근처에서 커다랗게 나타나 작아지며 내려앉는다(필드를 가로질러 날아오면 적 탄처럼 읽혔다)
+ */
+export const MARBLE_SHOW_AT = 0.5;
+export const MARBLE_DROP_H = 110;
+export const MARBLE_DROP_SCALE = 0.75;
+export const MARBLE_SIZE = 0.9;
+/** 위험 지역이 끝난 뒤(또는 보스가 죽어 취소된 뒤) 사라지는 시간 */
+export const HAZARD_FADE_TIME = 0.28;
+/** 소환 졸개가 입에서 칸으로 날아가는 시간 — sim이 그동안 졸개 몸을 '아직 없음'(접촉 즉사 없음)으로 다루는 시간과 같아야 한다 */
+export const SUMMON_HOP_TIME = SUMMON_LAND_TIME;
+/** 흔들림: 내려찍기 충격, 구슬 하나, 포효(페이즈 전환), 등장 착지 */
+export const TRAUMA_SLAM = 0.42;
+export const TRAUMA_MARBLE = 0.16;
+export const TRAUMA_ROAR = 0.6;
+export const TRAUMA_BOSS_LAND = 0.5;
+/** 페이즈 전환 화면 번쩍임 시간·최대 알파 */
+export const PHASE_FLASH_TIME = 0.4;
+export const PHASE_FLASH_ALPHA = 0.55;
+/** 페이즈 배너 표시 시간, 필드 위 y(보스 몸 위 — 아래쪽 탄을 가리지 않게) */
+export const PHASE_BANNER_TIME = 1.5;
+export const PHASE_BANNER_Y = 230;
 
 // ── 흐름 ─────────────────────────────────────────────────────
 export const INTRO_TIME = 1.2;

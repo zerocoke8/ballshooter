@@ -30,8 +30,14 @@ import {
   PROJECTILE_MAX_AGE,
   SPAWN_GAP,
   SPLIT_CHILD_MAX_AGE,
+  SUMMON_LAND_TIME,
 } from '../../config';
 import type {
+  BossActionDef,
+  BossDef,
+  BossMode,
+  BossShotSpec,
+  BossState,
   CombatEvent,
   CombatInput,
   CombatStatus,
@@ -40,6 +46,8 @@ import type {
   EnemyDef,
   EnemyEntity,
   EnemyShotEntity,
+  HazardEntity,
+  HazardKind,
   LostReason,
   PlayerEntity,
   PlayerStats,
@@ -60,6 +68,8 @@ export interface CombatSimOptions {
   player: PlayerStats;
   hp: number;
   seed: number;
+  /** 보스 행동 데이터 (보통 GAME_DATA.bosses). stage.boss가 있으면 필수, 없으면 쓰지 않는다 */
+  bosses?: Record<string, BossDef>;
 }
 
 // ── 시뮬레이션 내부 상수 (밸런스 수치는 config.ts) ──────────────
@@ -86,6 +96,12 @@ const BURST_INTERVAL = 0.07;
 const TIME_EPS = 1e-6;
 const DEG = Math.PI / 180;
 const AIM_MIN = AIM_MIN_DEG * DEG;
+/** 졸개를 소환할 칸은 플레이어 피격 원에서 이만큼(px) 넘게 떨어져야 한다 (눈앞에 생겨 부딪히는 즉사 방지) */
+const SUMMON_PLAYER_MARGIN = 60;
+/** 구슬 비: 다른 구슬과 간격을 지키는 자리를 찾는 시도 횟수 */
+const MARBLE_TRIES = 8;
+/** 칸 겹침 판정 여유(px) — 맞닿은 칸은 겹치지 않은 것으로 */
+const CELL_EPS = 0.5;
 
 /** 연사 대기열: 첫 발 이후 남은 발들 */
 interface PendingBurst {
@@ -115,6 +131,11 @@ interface Enemy extends EnemyEntity {
   /** 아직 이벤트로 보내지 않은 화상 피해 */
   burnAcc: number;
   burnTick: number;
+  /**
+   * 보스가 소환한 졸개가 칸에 내려앉기까지 남은 시간(초, SUMMON_LAND_TIME부터). 0보다 크면 플레이어 몸에 닿아도 즉사가 아니다
+   * (화면에서는 아직 입에서 날아오는 중). 다른 적은 늘 0
+   */
+  landing: number;
 }
 
 interface Projectile extends ProjectileEntity {
@@ -133,6 +154,47 @@ interface Projectile extends ProjectileEntity {
   trapBounces?: number;
   /** 이 투사체가 마지막으로 보스를 직접 때린 시각 (보스 연타 감쇠 — BOSS_REHIT_WINDOW) */
   bossHitAt?: number;
+}
+
+/** 위험 지역 + 만든 행동 번호 (행동은 자기 위험 지역이 다 끝나야 끝난다) */
+interface Hazard extends HazardEntity {
+  owner: number;
+  /** 이번 스텝에 생김 — 예고 시간은 다음 스텝부터 흐른다 (예고 이벤트부터 발동까지 정확히 warn초) */
+  fresh: boolean;
+}
+
+/** 보스전 진행 상태 (sim 내부). 공개용 요약은 BossState(sim.boss) */
+interface BossRuntime {
+  def: BossDef;
+  e: Enemy;
+  /** 고정 위치의 충돌 박스 y */
+  anchorY: number;
+  phase: number;
+  mode: BossMode;
+  /** roar·windup에 남은 시간 */
+  modeTime: number;
+  /** 다음 행동까지 쉬는 시간 (idle) */
+  gap: number;
+  /** 행동별 남은 쿨타임 (def.actions 순서) */
+  cds: number[];
+  act: BossActionDef | null;
+  /** 행동 번호 (고를 때마다 +1) — 위험 지역 주인 표시 */
+  actSeq: number;
+  /** 실행 중: 남은 펄스(발사·위험 지역·소환 한 번) 수 / 다음 펄스까지 / 지금 펄스 번호 */
+  pulsesLeft: number;
+  pulseTimer: number;
+  pulse: number;
+  /** 펄스를 다 쓴 뒤 끝날 때까지 남은 recover 시간 */
+  tail: number;
+  /** 팽이 고리: 이번 행동의 빈틈 시작 인덱스 / 회전 방향(±1) */
+  ringGap: number;
+  ringDir: number;
+  /** 일제 사격: 첫 발의 조준 방향 (다시 노리지 않는 연속 사격의 기준) */
+  volleyBase: number;
+  /** 다음 페이즈 문턱 HP (마지막 페이즈면 0) — 넘는 피해는 여기서 멈춘다 */
+  floor: number;
+  /** 문턱에 닿음 → 다음 updateBoss에서 페이즈 전환 */
+  phasePending: boolean;
 }
 
 /** 접촉 기록 (스텝마다 새로 만들지 않고 CombatSim이 풀로 재사용 — 매 서브스텝 할당을 없앤다) */
@@ -157,12 +219,17 @@ function byDistanceThenId(a: ChainPick, b: ChainPick): number {
 export class CombatSim {
   private readonly es: Enemy[] = [];
   private readonly ps: Projectile[] = [];
+  private readonly hz: Hazard[] = [];
 
   readonly player: PlayerEntity;
   /** 살아있는 적만 (죽은 적은 스텝 끝에 제거) */
   readonly enemies: EnemyEntity[] = this.es;
   readonly projectiles: ProjectileEntity[] = this.ps;
   readonly enemyShots: EnemyShotEntity[] = [];
+  /** 보스 위험 지역 (예고·발동 중인 것만 — 끝난 것은 스텝 끝에 제거). 일반 스테이지는 늘 비어 있다 */
+  readonly hazards: HazardEntity[] = this.hz;
+  /** 보스전이면 보스 상태(매 스텝 제자리 갱신), 아니면 null */
+  readonly boss: BossState | null = null;
   /** loadout 순서 */
   readonly weapons: WeaponRuntime[] = [];
   status: CombatStatus = 'running';
@@ -173,6 +240,12 @@ export class CombatSim {
 
   private readonly stage: StageDef;
   private readonly rng: Rng;
+  /** 적 정의 (보스전의 졸개 소환용) */
+  private readonly enemyDefs: Record<string, EnemyDef>;
+  /** 보스전 진행 상태 (일반 스테이지는 null — 모든 보스 경로가 이것으로 갈린다) */
+  private readonly bossRt: BossRuntime | null = null;
+  /** 졸개 소환 후보 칸 (재사용) */
+  private readonly summonCols: number[] = [];
   private stats: PlayerStats;
   private loadout = new Map<number, WeaponLoadout>();
   /** 전투 중 가방에서 뺀 무기: uid → 다시 쏠 수 있는 시각 */
@@ -209,6 +282,7 @@ export class CombatSim {
     this.stats = opts.player;
     this.peakMaxHp = opts.player.maxHp;
     this.rng = new Rng(opts.seed);
+    this.enemyDefs = opts.enemies;
     for (let c = 0; c < FIELD_COLS; c++) this.columns.push([]);
     this.player = {
       x: FIELD_W / 2,
@@ -221,6 +295,24 @@ export class CombatSim {
       invuln: 0,
     };
     this.spawnEnemies(opts.enemies);
+    if (opts.stage.boss !== undefined) {
+      this.bossRt = this.spawnBoss(opts.stage.boss, opts);
+      const rt = this.bossRt;
+      this.boss = {
+        enemyId: rt.e.id,
+        defId: rt.def.id,
+        phase: 0,
+        phases: rt.def.phases.length,
+        mode: rt.mode,
+        action: null,
+        actionId: null,
+        modeTime: 0,
+        invulnerable: false,
+        minions: 0,
+        minionCap: rt.def.phases[0].minionCap,
+        hpFrac: 1,
+      };
+    }
     for (const l of opts.loadout) {
       this.loadout.set(l.uid, l);
       this.weapons.push({ uid: l.uid, timer: Math.min(l.cooldown, NEW_WEAPON_MAX_DELAY), cooldown: l.cooldown });
@@ -233,19 +325,24 @@ export class CombatSim {
     this.descend(dt);
     if (this.checkBreach()) {
       this.compact();
+      if (this.bossRt !== null) this.syncBossState();
       return;
     }
     this.updatePlayer(dt, input);
     this.updateEnemies(dt);
+    // 보스 행동 (보스전만): 페이즈 전환·스케줄러·발사·위험 지역·소환 — 새 졸개는 이번 스텝 조준·충돌부터 들어간다
+    if (this.bossRt !== null) this.updateBoss(dt);
     this.fireWeapons(dt, inputAim(input));
     this.rebuildColumns();
     this.updateProjectiles(dt);
     this.updateEnemyShots(dt);
+    if (this.hz.length > 0) this.updateHazards(dt);
     // 적 몸에 닿으면 즉시 패배 (이번 스텝에 죽은 적은 빼고 — 마지막 적을 잡으며 닿으면 승리)
     if (this.touchesEnemy()) this.lose('contact');
     else if (this.player.hp <= 0) this.lose('hp');
-    else if (this.killedEnemies >= this.totalEnemies) this.win();
+    else if (this.cleared()) this.win();
     this.compact();
+    if (this.bossRt !== null) this.syncBossState();
   }
 
   setLoadout(loadout: WeaponLoadout[], player: PlayerStats): void {
@@ -283,12 +380,13 @@ export class CombatSim {
     this.stats = player;
   }
 
-  /** 디버그: 남은 적을 전부 정상 처치 경로로 죽인다 ('kill' 이벤트들 + 'won') */
+  /** 디버그: 남은 적을 전부 정상 처치 경로로 죽인다 ('kill' 이벤트들 + 'won'). 보스전이면 보스 처치 → 졸개가 함께 터짐 */
   debugKillAll(): void {
     if (this.status !== 'running') return;
     for (const e of this.es) this.kill(e);
-    if (this.killedEnemies >= this.totalEnemies) this.win();
+    if (this.cleared()) this.win();
     this.compact();
+    if (this.bossRt !== null) this.syncBossState();
   }
 
   /** 디버그: 즉시 패배 (사유 'hp', 'lost' 이벤트) */
@@ -302,8 +400,18 @@ export class CombatSim {
     return out;
   }
 
+  /** 일반 스테이지 = 처치 수 / 전체, 보스전 = 보스에게 준 피해 비율(1 - 보스 HP / 최대 HP, 처치하면 1) */
   progress(): number {
+    if (this.bossRt !== null) {
+      const b = this.bossRt.e;
+      return b.alive ? 1 - Math.max(0, b.hp) / b.maxHp : 1;
+    }
     return this.totalEnemies > 0 ? this.killedEnemies / this.totalEnemies : 1;
+  }
+
+  /** 승리 조건: 일반 스테이지 = 모든 적 처치, 보스전 = 보스 처치 */
+  private cleared(): boolean {
+    return this.bossRt !== null ? !this.bossRt.e.alive : this.killedEnemies >= this.totalEnemies;
   }
 
   // ── 초기화 ──────────────────────────────────────────────────
@@ -345,6 +453,7 @@ export class CombatSim {
           stamp: 0,
           burnAcc: 0,
           burnTick: 0,
+          landing: 0,
         };
         this.es.push(e);
         this.byId.set(e.id, e);
@@ -358,6 +467,10 @@ export class CombatSim {
   // 배열 순회는 for...of 대신 인덱스 루프 (반복자 객체 할당 없음, 길이는 매번 다시 읽어 for...of와 같은 순서·범위)
 
   private descend(dt: number): void {
+    if (this.bossRt !== null) {
+      this.descendBossStage(dt);
+      return;
+    }
     const es = this.es;
     let visible = false;
     for (let i = 0; i < es.length; i++) {
@@ -403,12 +516,17 @@ export class CombatSim {
       const e = es[i];
       if (!e.alive) continue;
       if (e.flash > 0) e.flash = tickDown(e.flash, dt);
+      if (e.landing > 0) e.landing = tickDown(e.landing, dt);
       if (e.chillTime > 0) e.chillTime = tickDown(e.chillTime, dt);
 
       if (e.burnTime > 0) {
-        const d = e.burnDps * Math.min(dt, e.burnTime);
+        let d = e.burnDps * Math.min(dt, e.burnTime);
+        // 보스: 포효 중 무적, 페이즈 문턱에서 멈춤 (일반 적은 그대로)
+        const bossHit = this.bossRt !== null && e === this.bossRt.e;
+        if (bossHit) d = this.bossCap(d);
         e.burnTime -= dt;
         e.hp -= d;
+        if (bossHit && this.bossRt!.phasePending) e.hp = this.bossRt!.floor;
         e.burnAcc += d;
         e.burnTick -= dt;
         const ended = e.burnTime <= TIME_EPS;
@@ -955,8 +1073,15 @@ export class CombatSim {
     element: Element | null,
   ): void {
     if (!e.alive) return;
-    const dealt = base * (e.chillTime > 0 ? CHILL_DAMAGE_TAKEN_MUL : 1);
-    e.hp -= dealt;
+    let dealt = base * (e.chillTime > 0 ? CHILL_DAMAGE_TAKEN_MUL : 1);
+    const rt = this.bossRt;
+    if (rt !== null && e === rt.e) {
+      // 보스: 포효 중 무적(피해·상태이상 없음), 페이즈 문턱을 넘는 피해는 문턱에서 멈춘다 (다음 updateBoss에서 전환)
+      dealt = this.bossCap(dealt);
+      if (!(dealt > 0)) return;
+      e.hp -= dealt;
+      if (rt.phasePending) e.hp = rt.floor;
+    } else e.hp -= dealt;
     e.flash = HIT_FLASH_TIME;
     for (let i = 0; i < elements.length; i++) {
       const el = elements[i];
@@ -1039,6 +1164,7 @@ export class CombatSim {
     e.hp = 0;
     this.killedEnemies++;
     this.emit({ type: 'kill', enemyId: e.id, defId: e.defId, x: e.x + e.w / 2, y: e.y + e.h / 2, boss: e.boss });
+    if (this.bossRt !== null && e === this.bossRt.e) this.bossDefeated();
   }
 
   // ── 적 탄 / 접촉 (적 몸에 닿으면 즉시 패배 — step의 touchesEnemy) ──────────────
@@ -1070,16 +1196,654 @@ export class CombatSim {
     const es = this.es;
     for (let i = 0; i < es.length; i++) {
       const e = es[i];
-      if (e.alive && overlapsRect(pl.x, pl.y, pl.hitRadius, e)) return true;
+      // 소환 중(입에서 날아오는 중)인 졸개는 아직 몸이 없다 — 내려앉은 뒤부터 (Enemy.landing)
+      if (e.alive && e.landing <= 0 && overlapsRect(pl.x, pl.y, pl.hitRadius, e)) return true;
     }
     return false;
   }
 
-  private hurtPlayer(damage: number, source: 'shot', x: number, y: number): void {
+  private hurtPlayer(damage: number, source: 'shot' | 'hazard', x: number, y: number): void {
     const pl = this.player;
     pl.hp -= damage;
     pl.invuln = PLAYER_INVULN_TIME;
     this.emit({ type: 'playerHit', damage: Math.round(damage), x, y, source });
+  }
+
+  // ── 보스전 (stage.boss가 있을 때만 — 일반 스테이지는 이 아래를 하나도 지나가지 않는다) ──────────
+  // 보스: 고정 위치(BossDef.anchorCol/anchorY)로 내려와(enter) 포효(roar, 무적) → 쉬기(idle, 페이즈 gap) → 행동 고르기(시드 RNG, 가중치·쿨타임)
+  // → 예비 동작(windup) → 실행(act: 펄스 = 발사·위험 지역·소환 한 번씩) → 자기 위험 지역이 끝나고 recover → 다시 idle.
+  // HP가 다음 페이즈 문턱에 닿으면 그 피해는 문턱에서 멈추고 다음 updateBoss에서 페이즈 전환(행동 취소 + 포효 + 소환).
+  // 졸개는 보스 바로 아래 줄 칸에 생겨 스테이지 하강 속도로 내려온다(일반 적과 같은 규칙: 공격·방어선·접촉). 보스가 죽으면 졸개가 함께 터진다.
+
+  private spawnBoss(bossId: string, opts: CombatSimOptions): BossRuntime {
+    const def = opts.bosses?.[bossId];
+    if (!def) throw new Error(`CombatSim: stage '${this.stage.id}': no boss def '${bossId}' (pass opts.bosses)`);
+    const edef = opts.enemies[def.enemy];
+    if (!edef) throw new Error(`CombatSim: boss '${bossId}': no enemy '${def.enemy}'`);
+    if (def.phases.length === 0) throw new Error(`CombatSim: boss '${bossId}' has no phases`);
+    const hp = Math.max(1, Math.round(edef.hp * this.stage.hpMul));
+    const e: Enemy = {
+      id: this.nextId++,
+      defId: edef.id,
+      x: def.anchorCol * CELL + ENEMY_INSET,
+      // 화면 바로 위(칸 아래 끝 = 천장)에서 시작해 고정 위치까지 내려온다
+      y: -edef.h * CELL + ENEMY_INSET,
+      w: edef.w * CELL - 2 * ENEMY_INSET,
+      h: edef.h * CELL - 2 * ENEMY_INSET,
+      hp,
+      maxHp: hp,
+      alive: true,
+      boss: true,
+      burnDps: 0,
+      burnTime: 0,
+      chillTime: 0,
+      attackTimer: 0,
+      flash: 0,
+      def: edef,
+      chillAttackRate: CHILL_ATTACK_RATE_RESIST,
+      stamp: 0,
+      burnAcc: 0,
+      burnTick: 0,
+      landing: 0,
+    };
+    this.es.push(e);
+    this.byId.set(e.id, e);
+    this.totalEnemies++;
+    return {
+      def,
+      e,
+      anchorY: def.anchorY + ENEMY_INSET,
+      phase: 0,
+      mode: 'enter',
+      modeTime: 0,
+      gap: 0,
+      cds: def.actions.map(() => 0),
+      act: null,
+      actSeq: 0,
+      pulsesLeft: 0,
+      pulseTimer: 0,
+      pulse: 0,
+      tail: 0,
+      ringGap: -1,
+      ringDir: 1,
+      volleyBase: Math.PI / 2,
+      floor: def.phases.length > 1 ? hp * def.phases[1].hpFrac : 0,
+      phasePending: false,
+    };
+  }
+
+  /** 보스전 하강: 졸개는 스테이지 하강 속도(빨리감기 없음 — 보스가 늘 화면에 있다), 보스는 등장 → 고정, creep 페이즈만 기어 내려옴 */
+  private descendBossStage(dt: number): void {
+    const rt = this.bossRt!;
+    const b = rt.e;
+    const es = this.es;
+    const dy = this.stage.descentSpeed * dt;
+    for (let i = 0; i < es.length; i++) if (es[i] !== b) es[i].y += dy;
+    if (!b.alive) return;
+    if (rt.mode === 'enter') {
+      if (rt.def.enterSpeed > 0) b.y += rt.def.enterSpeed * dt;
+      if (b.y >= rt.anchorY || !(rt.def.enterSpeed > 0)) {
+        b.y = rt.anchorY;
+        this.startPhase(0);
+      }
+      return;
+    }
+    const creep = rt.def.phases[rt.phase].creep;
+    if (creep > 0 && rt.mode !== 'roar' && rt.mode !== 'dead') b.y += creep * dt;
+  }
+
+  /** 페이즈 p 시작: 진행 중이던 행동 취소(이미 나간 탄·위험 지역은 그대로) → 포효(무적·행동 정지) + 소환 */
+  private startPhase(p: number): void {
+    const rt = this.bossRt!;
+    const phases = rt.def.phases;
+    const ph = phases[p];
+    rt.phase = p;
+    rt.phasePending = false;
+    rt.floor = p + 1 < phases.length ? rt.e.maxHp * phases[p + 1].hpFrac : 0;
+    rt.act = null;
+    rt.pulsesLeft = 0;
+    rt.tail = 0;
+    rt.mode = 'roar';
+    rt.modeTime = ph.roar;
+    rt.gap = ph.gap;
+    this.emit({ type: 'bossPhase', enemyId: rt.e.id, phase: p, roar: ph.roar });
+    if (ph.enterSummon > 0) this.summon(ph.enterSummon);
+  }
+
+  /**
+   * 보스가 받을 피해 d를 자른다: 포효 중(또는 페이즈 전환 대기 중) 0, 다음 페이즈 문턱을 넘으면 문턱까지만(전환 예약).
+   * 보스(this.bossRt.e)에만 부른다.
+   */
+  private bossCap(d: number): number {
+    const rt = this.bossRt!;
+    if (rt.mode === 'roar' || rt.phasePending) return 0;
+    if (rt.floor > 0) {
+      const room = rt.e.hp - rt.floor;
+      if (d >= room) {
+        rt.phasePending = true;
+        return room > 0 ? room : 0;
+      }
+    }
+    return d;
+  }
+
+  private updateBoss(dt: number): void {
+    const rt = this.bossRt!;
+    if (!rt.e.alive || rt.mode === 'enter' || rt.mode === 'dead') return;
+    if (rt.phasePending && rt.phase + 1 < rt.def.phases.length) this.startPhase(rt.phase + 1);
+    // 냉기: 보스(냉기 저항)는 행동 사이 쉬는 시간·쿨타임이 CHILL_ATTACK_RATE_RESIST 속도로 흐른다.
+    // 예비 동작·실행 박자는 그대로 — 예고한 시간이 늘 정확하게
+    const slow = rt.e.chillTime > 0 ? dt * rt.e.chillAttackRate : dt;
+    const cds = rt.cds;
+    for (let i = 0; i < cds.length; i++) if (cds[i] > 0) cds[i] = tickDown(cds[i], slow);
+    switch (rt.mode) {
+      case 'roar':
+        rt.modeTime = tickDown(rt.modeTime, dt);
+        if (rt.modeTime <= 0) rt.mode = 'idle';
+        return;
+      case 'idle':
+        if (rt.gap > 0) rt.gap = tickDown(rt.gap, slow);
+        if (rt.gap <= 0) this.chooseAction();
+        return;
+      case 'windup':
+        rt.modeTime = tickDown(rt.modeTime, dt);
+        if (rt.modeTime > 0) return;
+        this.beginAct();
+        this.runAct(0);
+        return;
+      case 'act':
+        this.runAct(dt);
+        return;
+    }
+  }
+
+  /** 지금 페이즈 가중치로 쿨타임이 찬 행동 하나 (소환은 졸개가 상한보다 적을 때만). 없으면 다음 스텝에 다시 */
+  private chooseAction(): void {
+    const rt = this.bossRt!;
+    const acts = rt.def.actions;
+    const ph = rt.def.phases[rt.phase];
+    const canSummon = this.minionsAlive() < ph.minionCap;
+    let total = 0;
+    for (let i = 0; i < acts.length; i++) total += this.actionWeight(i, canSummon);
+    if (!(total > 0)) return;
+    let r = this.rng.next() * total;
+    let pick = -1;
+    for (let i = 0; i < acts.length; i++) {
+      const w = this.actionWeight(i, canSummon);
+      if (w <= 0) continue;
+      pick = i;
+      r -= w;
+      if (r < 0) break;
+    }
+    const a = acts[pick];
+    rt.act = a;
+    rt.actSeq++;
+    rt.mode = 'windup';
+    rt.modeTime = a.windup;
+    rt.cds[pick] = a.cooldown * ph.cooldownMul;
+    const b = rt.e;
+    this.emit({ type: 'bossAction', enemyId: b.id, action: a.kind, id: a.id, windup: a.windup, x: b.x + b.w / 2, y: b.y + b.h });
+  }
+
+  private actionWeight(i: number, canSummon: boolean): number {
+    const rt = this.bossRt!;
+    const a = rt.def.actions[i];
+    if (rt.cds[i] > 0 || (a.kind === 'summon' && !canSummon)) return 0;
+    const w = a.weights[rt.phase] ?? 0;
+    return w > 0 ? w : 0;
+  }
+
+  private beginAct(): void {
+    const rt = this.bossRt!;
+    const a = rt.act!;
+    rt.mode = 'act';
+    rt.pulse = 0;
+    rt.pulseTimer = 0;
+    rt.tail = 0;
+    switch (a.kind) {
+      case 'volley':
+        rt.pulsesLeft = Math.max(1, Math.floor(a.volley.bursts));
+        break;
+      case 'ring':
+        rt.pulsesLeft = Math.max(1, Math.floor(a.ring.waves));
+        this.chooseRingGap(a.ring);
+        break;
+      case 'slam':
+        rt.pulsesLeft = Math.max(1, Math.floor(a.slam.repeats));
+        break;
+      case 'marbles':
+        rt.pulsesLeft = Math.max(0, Math.floor(a.marbles.count));
+        break;
+      case 'summon':
+        rt.pulsesLeft = 1;
+        break;
+    }
+  }
+
+  /** 펄스 사이 간격(초). 내려찍기는 앞 위험 지역이 끝난 뒤 repeatInterval 뒤 (한 번에 하나) */
+  private pulseInterval(a: BossActionDef): number {
+    switch (a.kind) {
+      case 'volley':
+        return a.volley.burstInterval;
+      case 'ring':
+        return a.ring.waveInterval;
+      case 'slam':
+        return a.slam.warn + a.slam.active + a.slam.repeatInterval;
+      case 'marbles':
+        return a.marbles.stagger;
+      case 'summon':
+        return 0;
+    }
+  }
+
+  /** 실행 중: 펄스를 박자대로 → 다 쓰면 이 행동의 위험 지역이 끝나길 기다리고 → recover → idle(페이즈 gap) */
+  private runAct(dt: number): void {
+    const rt = this.bossRt!;
+    const a = rt.act!;
+    if (rt.pulsesLeft > 0) {
+      rt.pulseTimer -= dt;
+      while (rt.pulsesLeft > 0 && rt.pulseTimer <= TIME_EPS) {
+        this.actPulse(a, rt.pulse);
+        rt.pulse++;
+        rt.pulsesLeft--;
+        rt.pulseTimer += this.pulseInterval(a);
+      }
+      if (rt.pulsesLeft === 0) rt.tail = a.recover ?? 0;
+      return;
+    }
+    const hz = this.hz;
+    for (let i = 0; i < hz.length; i++) if (hz[i].owner === rt.actSeq && hz[i].state !== 'done') return;
+    if (rt.tail > 0) {
+      rt.tail = tickDown(rt.tail, dt);
+      if (rt.tail > 0) return;
+    }
+    rt.act = null;
+    rt.mode = 'idle';
+    rt.gap = rt.def.phases[rt.phase].gap;
+  }
+
+  private actPulse(a: BossActionDef, k: number): void {
+    switch (a.kind) {
+      case 'volley':
+        this.bossVolley(a.volley, k);
+        return;
+      case 'ring':
+        this.bossRing(a.ring, k);
+        return;
+      case 'slam':
+        this.bossSlam(a.slam.cols, a.slam.warn, a.slam.active, a.slam.damage, a.slam.sprite);
+        return;
+      case 'marbles':
+        this.bossMarble(a.marbles, k);
+        return;
+      case 'summon':
+        this.summon(a.summon.count);
+        return;
+    }
+  }
+
+  private bossShot(ox: number, oy: number, a: number, spec: BossShotSpec): void {
+    this.enemyShots.push({
+      id: this.nextId++,
+      x: ox,
+      y: oy,
+      vx: Math.cos(a) * spec.speed,
+      vy: Math.sin(a) * spec.speed,
+      radius: spec.radius,
+      damage: spec.damage * this.stage.dmgMul,
+      sprite: spec.sprite,
+      alive: true,
+    });
+  }
+
+  /** 블록 일제 사격 k번째: 입에서 지금 플레이어를 노린 부채꼴 (다시 노리지 않으면 첫 발 방향 + k × burstShiftDeg) */
+  private bossVolley(spec: BossShotSpec & { count: number; spreadDeg: number; reaim: boolean; burstShiftDeg: number }, k: number): void {
+    const rt = this.bossRt!;
+    const b = rt.e;
+    const ox = b.x + b.w / 2;
+    const oy = b.y + b.h;
+    let base: number;
+    if (k === 0 || spec.reaim) {
+      base = Math.atan2(this.player.y - oy, this.player.x - ox);
+      rt.volleyBase = base;
+    } else base = rt.volleyBase + k * spec.burstShiftDeg * DEG;
+    const n = Math.max(1, Math.floor(spec.count));
+    const spread = spec.spreadDeg * DEG;
+    for (let k = 0; k < n; k++) this.bossShot(ox, oy, fanAngle(base, spread, k, n), spec);
+    this.emit({ type: 'enemyShoot', enemyId: b.id, x: ox, y: oy, sprite: spec.sprite });
+  }
+
+  /**
+   * 팽이 고리의 빈틈 자리(행동마다 한 번): 플레이어 쪽(가로 ±gapShiftPx 무작위)을 향한 각도에 빈틈 가운데가 오게 —
+   * 웨이브마다 돌아가므로 가운데 웨이브 기준. 회전 방향도 여기서 정한다.
+   */
+  private chooseRingGap(spec: { count: number; arcDeg: number; gap: number; gapShiftPx: number; waves: number; rotateDeg: number }): void {
+    const rt = this.bossRt!;
+    const b = rt.e;
+    const n = Math.max(1, Math.floor(spec.count));
+    const gap = ringGapSize(spec.gap, n);
+    rt.ringDir = this.rng.next() < 0.5 ? -1 : 1;
+    if (gap === 0) {
+      rt.ringGap = -1;
+      return;
+    }
+    const pl = this.player;
+    const ox = b.x + b.w / 2;
+    const oy = b.y + b.h;
+    const tx = pl.x + this.rng.range(-spec.gapShiftPx, spec.gapShiftPx);
+    // 플레이어가 입보다 위에 있으면(양옆 통로) 그쪽 끝으로 — 각도는 아래 반원 안에서 잰다
+    const dy = Math.max(1, pl.y - oy);
+    const turns = (Math.max(1, Math.floor(spec.waves)) - 1) / 2;
+    const want = Math.atan2(dy, tx - ox) - rt.ringDir * spec.rotateDeg * DEG * turns;
+    const arc = spec.arcDeg * DEG;
+    const step = n > 1 ? arc / (n - 1) : 0;
+    let g0 = step > 0 ? Math.round((want - (Math.PI / 2 - arc / 2)) / step - (gap - 1) / 2) : 0;
+    if (g0 < 0) g0 = 0;
+    else if (g0 > n - gap) g0 = n - gap;
+    rt.ringGap = g0;
+  }
+
+  /** 팽이 고리 웨이브 k: 아래쪽 arcDeg 부채꼴에 count발 (빈틈 gap발 빼고), 웨이브마다 rotateDeg씩 회전 */
+  private bossRing(spec: BossShotSpec & { count: number; arcDeg: number; gap: number; rotateDeg: number }, k: number): void {
+    const rt = this.bossRt!;
+    const b = rt.e;
+    const ox = b.x + b.w / 2;
+    const oy = b.y + b.h;
+    const n = Math.max(1, Math.floor(spec.count));
+    const gap = ringGapSize(spec.gap, n);
+    const arc = spec.arcDeg * DEG;
+    const base = Math.PI / 2 + rt.ringDir * spec.rotateDeg * DEG * k;
+    for (let j = 0; j < n; j++) {
+      if (rt.ringGap >= 0 && j >= rt.ringGap && j < rt.ringGap + gap) continue;
+      this.bossShot(ox, oy, fanAngle(base, arc, j, n), spec);
+    }
+    this.emit({ type: 'enemyShoot', enemyId: b.id, x: ox, y: oy, sprite: spec.sprite });
+  }
+
+  /** 내려찍기: 지금 플레이어가 있는 열(2열이면 가까운 이웃 열까지)에 보스 아래 끝부터 바닥까지 */
+  private bossSlam(colsIn: number, warn: number, active: number, damage: number, sprite: string): void {
+    const b = this.bossRt!.e;
+    const pl = this.player;
+    const cols = colsIn >= 2 ? 2 : 1;
+    const pc = colOf(pl.x);
+    let c0 = pc;
+    // 2열: 플레이어가 칸의 왼쪽 절반이면 왼쪽 이웃까지 — 플레이어가 폭 가운데쯤에 놓여 어느 쪽으로든 한 칸 + 몸 반지름 안에 빠져나간다
+    if (cols === 2 && pl.x - pc * CELL < CELL / 2) c0 = pc - 1;
+    if (c0 < 0) c0 = 0;
+    else if (c0 > FIELD_COLS - cols) c0 = FIELD_COLS - cols;
+    const top = b.y + b.h;
+    if (top >= FIELD_H) return;
+    this.addHazard('slam', 'rect', c0 * CELL, top, cols * CELL, FIELD_H - top, warn, active, damage, sprite);
+  }
+
+  /** 구슬 하나: 처음 aimed개는 플레이어 자리, 나머지는 아래쪽 무작위(다른 구슬과 spacing 이상 — 자리가 없으면 건너뜀) */
+  private bossMarble(
+    spec: { aimed: number; radius: number; warn: number; active: number; damage: number; spacing: number; yMinFrac: number; sprite: string },
+    k: number,
+  ): void {
+    const b = this.bossRt!.e;
+    const pl = this.player;
+    const r = spec.radius;
+    const yMax = FIELD_H - r;
+    let yMin = Math.max(b.y + b.h + r, spec.yMinFrac * FIELD_H);
+    if (yMin > yMax) yMin = yMax;
+    let cx = clamp(pl.x, r, FIELD_W - r);
+    let cy = clamp(pl.y, yMin, yMax);
+    if (k < spec.aimed && pl.y < yMin && (pl.x < b.x || pl.x > b.x + b.w)) {
+      // 보스 옆 통로(아래쪽 띠보다 위)에 숨은 플레이어: 통로 위는 하늘이 뚫려 있다 — 노린 구슬은 그 자리에 (보스 몸과 겹치지 않게 통로 쪽으로).
+      // 없으면 통로가 내려찍기·팽이 고리·구슬이 하나도 닿지 않는 안전 지대였다(일제 사격·졸개 탄만 닿음).
+      // 예고는 그대로 — 통로를 따라 (반경 + 몸 반경) 위아래로 비키면 된다
+      cy = clamp(pl.y, r, yMax);
+      cx = pl.x < b.x ? Math.min(cx, b.x - r) : Math.max(cx, b.x + b.w + r);
+    } else if (k >= spec.aimed) {
+      let ok = false;
+      for (let t = 0; t < MARBLE_TRIES && !ok; t++) {
+        cx = this.rng.range(r, FIELD_W - r);
+        cy = this.rng.range(yMin, yMax);
+        ok = this.marbleClear(cx, cy, spec.spacing);
+      }
+      if (!ok) return;
+    }
+    this.addHazard('marble', 'circle', cx - r, cy - r, 2 * r, 2 * r, spec.warn, spec.active, spec.damage, spec.sprite);
+  }
+
+  /** (cx, cy)가 아직 안 끝난 다른 구슬 중심들과 spacing 이상 떨어졌나 */
+  private marbleClear(cx: number, cy: number, spacing: number): boolean {
+    const hz = this.hz;
+    for (let i = 0; i < hz.length; i++) {
+      const h = hz[i];
+      if (h.kind !== 'marble' || h.state === 'done') continue;
+      const dx = h.x + h.w / 2 - cx;
+      const dy = h.y + h.h / 2 - cy;
+      if (dx * dx + dy * dy < spacing * spacing) return false;
+    }
+    return true;
+  }
+
+  private addHazard(
+    kind: HazardKind,
+    shape: 'rect' | 'circle',
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    warn: number,
+    active: number,
+    damage: number,
+    sprite: string,
+  ): void {
+    const hz: Hazard = {
+      id: this.nextId++,
+      kind,
+      shape,
+      x,
+      y,
+      w,
+      h,
+      state: 'warn',
+      timer: warn,
+      warnTime: warn,
+      activeTime: active,
+      damage: damage * this.stage.dmgMul,
+      sprite,
+      hit: false,
+      owner: this.bossRt!.actSeq,
+      fresh: true,
+    };
+    this.hz.push(hz);
+    this.emit({ type: 'hazardWarn', hazardId: hz.id, kind, x: x + w / 2, y: y + h / 2, warn });
+  }
+
+  /** 위험 지역: 예고 시간이 끝나면 발동(이 스텝부터 activeTime 동안 판정), 발동 중 겹치면 한 번 피해(무적 시간 적용) */
+  private updateHazards(dt: number): void {
+    const hz = this.hz;
+    for (let i = 0; i < hz.length; i++) {
+      const h = hz[i];
+      if (h.state === 'done') continue;
+      if (h.fresh) {
+        h.fresh = false;
+        continue;
+      }
+      if (h.state === 'warn') {
+        h.timer = tickDown(h.timer, dt);
+        if (h.timer > 0) continue;
+        h.state = 'active';
+        h.timer = h.activeTime;
+        const hit = this.hazardHitsPlayer(h);
+        this.emit({ type: 'hazardImpact', hazardId: h.id, kind: h.kind, x: h.x + h.w / 2, y: h.y + h.h / 2, hitPlayer: hit });
+        if (hit) this.hazardHurt(h);
+        continue;
+      }
+      h.timer = tickDown(h.timer, dt);
+      if (h.timer <= 0) {
+        h.state = 'done';
+        continue;
+      }
+      if (this.hazardHitsPlayer(h)) this.hazardHurt(h);
+    }
+  }
+
+  private hazardHitsPlayer(h: Hazard): boolean {
+    const pl = this.player;
+    if (h.hit || !(h.damage > 0) || pl.invuln > 0) return false;
+    if (h.shape === 'circle') {
+      const rr = h.w / 2 + pl.hitRadius;
+      const dx = pl.x - (h.x + h.w / 2);
+      const dy = pl.y - (h.y + h.h / 2);
+      return dx * dx + dy * dy < rr * rr;
+    }
+    return overlapsRect(pl.x, pl.y, pl.hitRadius, h);
+  }
+
+  private hazardHurt(h: Hazard): void {
+    h.hit = true;
+    this.hurtPlayer(h.damage, 'hazard', this.player.x, this.player.y);
+  }
+
+  private minionsAlive(): number {
+    const b = this.bossRt!.e;
+    const es = this.es;
+    let n = 0;
+    for (let i = 0; i < es.length; i++) if (es[i].alive && es[i] !== b) n++;
+    return n;
+  }
+
+  /**
+   * 졸개 count마리 (지금 페이즈 상한 안에서): 보스 바로 아래 줄, 보스가 걸친 열 중 비어 있는 칸(다른 적과 안 겹침, 필드 안,
+   * 플레이어 피격 원에서 SUMMON_PLAYER_MARGIN 넘게)을 시드 RNG로 골라 지금 페이즈 풀의 가중치로 뽑는다. 칸이 모자라면 덜 소환.
+   */
+  private summon(count: number): void {
+    const rt = this.bossRt!;
+    const b = rt.e;
+    const ph = rt.def.phases[rt.phase];
+    let n = Math.min(Math.floor(count), ph.minionCap - this.minionsAlive());
+    if (n <= 0 || ph.minions.length === 0) return;
+    const top = b.y + b.h + ENEMY_INSET;
+    const cols = this.summonCols;
+    cols.length = 0;
+    const c0 = Math.max(0, rt.def.anchorCol);
+    const c1 = Math.min(FIELD_COLS - 1, rt.def.anchorCol + b.def.w - 1);
+    for (let c = c0; c <= c1; c++) if (this.summonCellFree(c * CELL, top)) cols.push(c);
+    if (n > cols.length) n = cols.length;
+    const ox = b.x + b.w / 2;
+    const oy = b.y + b.h;
+    for (let i = 0; i < n; i++) {
+      // 남은 후보 중 하나 (부분 셔플)
+      const j = this.rng.int(i, cols.length - 1);
+      const c = cols[j];
+      cols[j] = cols[i];
+      cols[i] = c;
+      const defId = this.pickMinion(ph.minions);
+      const def = this.enemyDefs[defId];
+      if (!def) throw new Error(`CombatSim: boss '${rt.def.id}': no minion enemy '${defId}'`);
+      this.spawnMinion(def, c, top, ox, oy);
+    }
+  }
+
+  /** 칸 (x, top, CELL×CELL)에 졸개를 놓을 수 있나 */
+  private summonCellFree(x: number, top: number): boolean {
+    if (top < 0 || top + CELL > FIELD_H || x < 0 || x + CELL > FIELD_W) return false;
+    const es = this.es;
+    for (let i = 0; i < es.length; i++) {
+      const e = es[i];
+      if (!e.alive) continue;
+      // 칸 영역끼리 (충돌 박스 + 사방 INSET). 맞닿은 칸은 겹치지 않은 것으로
+      if (
+        x < e.x + e.w + ENEMY_INSET - CELL_EPS &&
+        x + CELL > e.x - ENEMY_INSET + CELL_EPS &&
+        top < e.y + e.h + ENEMY_INSET - CELL_EPS &&
+        top + CELL > e.y - ENEMY_INSET + CELL_EPS
+      ) {
+        return false;
+      }
+    }
+    const pl = this.player;
+    const qx = clamp(pl.x, x + ENEMY_INSET, x + CELL - ENEMY_INSET);
+    const qy = clamp(pl.y, top + ENEMY_INSET, top + CELL - ENEMY_INSET);
+    const rr = pl.hitRadius + SUMMON_PLAYER_MARGIN;
+    const dx = pl.x - qx;
+    const dy = pl.y - qy;
+    return dx * dx + dy * dy >= rr * rr;
+  }
+
+  private pickMinion(pool: readonly { enemy: string; weight: number }[]): string {
+    let total = 0;
+    for (let i = 0; i < pool.length; i++) if (pool[i].weight > 0) total += pool[i].weight;
+    let r = this.rng.next() * total;
+    let pick = pool[0].enemy;
+    for (let i = 0; i < pool.length; i++) {
+      const m = pool[i];
+      if (!(m.weight > 0)) continue;
+      pick = m.enemy;
+      r -= m.weight;
+      if (r < 0) break;
+    }
+    return pick;
+  }
+
+  /** 졸개 하나 (spawnEnemies와 같은 규칙: HP × hpMul, 첫 공격 = interval + rng × jitter) */
+  private spawnMinion(def: EnemyDef, c: number, top: number, fromX: number, fromY: number): void {
+    const hp = Math.max(1, Math.round(def.hp * this.stage.hpMul));
+    const atk = def.attack;
+    const e: Enemy = {
+      id: this.nextId++,
+      defId: def.id,
+      x: c * CELL + ENEMY_INSET,
+      y: top + ENEMY_INSET,
+      w: def.w * CELL - 2 * ENEMY_INSET,
+      h: def.h * CELL - 2 * ENEMY_INSET,
+      hp,
+      maxHp: hp,
+      alive: true,
+      boss: def.boss === true,
+      burnDps: 0,
+      burnTime: 0,
+      chillTime: 0,
+      attackTimer: atk ? atk.interval + this.rng.next() * atk.jitter : 0,
+      flash: 0,
+      def,
+      chillAttackRate: chillResistant(def) ? CHILL_ATTACK_RATE_RESIST : CHILL_ATTACK_RATE,
+      stamp: 0,
+      burnAcc: 0,
+      burnTick: 0,
+      // 입에서 칸까지 날아가는 동안은 몸에 닿아도 즉사가 아니다 (touchesEnemy)
+      landing: SUMMON_LAND_TIME,
+    };
+    this.es.push(e);
+    this.byId.set(e.id, e);
+    this.totalEnemies++;
+    this.emit({ type: 'summon', enemyId: e.id, defId: def.id, fromX, fromY, x: e.x + e.w / 2, y: e.y + e.h / 2 });
+  }
+
+  /** 보스 처치: 졸개가 전부 함께 터지고('kill' 이벤트들) 남은 위험 지역·적 탄은 사라진다 → 스텝 끝에 승리 */
+  private bossDefeated(): void {
+    const rt = this.bossRt!;
+    rt.mode = 'dead';
+    rt.act = null;
+    rt.pulsesLeft = 0;
+    const es = this.es;
+    for (let i = 0; i < es.length; i++) if (es[i] !== rt.e) this.kill(es[i]);
+    const hz = this.hz;
+    for (let i = 0; i < hz.length; i++) hz[i].state = 'done';
+    const shots = this.enemyShots;
+    for (let i = 0; i < shots.length; i++) shots[i].alive = false;
+  }
+
+  /** 공개 요약(sim.boss) 갱신 — 제자리, 할당 없음 */
+  private syncBossState(): void {
+    const rt = this.bossRt!;
+    const s = this.boss!;
+    const b = rt.e;
+    const acting = (rt.mode === 'windup' || rt.mode === 'act') && rt.act !== null;
+    s.phase = rt.phase;
+    s.mode = rt.mode;
+    s.action = acting ? rt.act!.kind : null;
+    s.actionId = acting ? rt.act!.id : null;
+    s.modeTime = rt.mode === 'roar' || rt.mode === 'windup' ? rt.modeTime : 0;
+    s.invulnerable = rt.mode === 'roar';
+    s.minions = this.minionsAlive();
+    s.minionCap = rt.def.phases[rt.phase].minionCap;
+    s.hpFrac = b.alive ? Math.max(0, b.hp) / b.maxHp : 0;
   }
 
   // ── 종료 / 정리 ─────────────────────────────────────────────
@@ -1100,6 +1864,12 @@ export class CombatSim {
   private compact(): void {
     retainAlive(this.ps);
     retainAlive(this.enemyShots);
+    if (this.hz.length > 0) {
+      const hz = this.hz;
+      let k = 0;
+      for (let i = 0; i < hz.length; i++) if (hz[i].state !== 'done') hz[k++] = hz[i];
+      hz.length = k;
+    }
     const es = this.es;
     let w = 0;
     for (let i = 0; i < es.length; i++) {
@@ -1317,6 +2087,12 @@ function colOf(x: number): number {
   return c < 0 ? 0 : c >= FIELD_COLS ? FIELD_COLS - 1 : c;
 }
 
+/** 팽이 고리 빈틈 발 수: 0 ~ count-1 (정수) */
+function ringGapSize(gap: number, n: number): number {
+  const g = Math.floor(gap);
+  return g < 0 ? 0 : g > n - 1 ? n - 1 : g;
+}
+
 /** n발을 spread(라디안) 부채꼴로 고르게. n=1이면 base */
 function fanAngle(base: number, spread: number, k: number, n: number): number {
   return n > 1 ? base - spread / 2 + (spread * k) / (n - 1) : base;
@@ -1420,7 +2196,7 @@ function centerInside(p: ProjectileEntity, e: EnemyEntity): boolean {
   return p.x >= e.x && p.x <= e.x + e.w && p.y >= e.y && p.y <= e.y + e.h;
 }
 
-function overlapsRect(cx: number, cy: number, r: number, e: EnemyEntity): boolean {
+function overlapsRect(cx: number, cy: number, r: number, e: { x: number; y: number; w: number; h: number }): boolean {
   const dx = cx - clamp(cx, e.x, e.x + e.w);
   const dy = cy - clamp(cy, e.y, e.y + e.h);
   return dx * dx + dy * dy < r * r;

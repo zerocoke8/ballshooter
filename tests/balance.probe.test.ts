@@ -21,6 +21,10 @@
 // PROBE_DODGE=static(회피 AI의 예전 자리 고르기) / PROBE_DODGE=human(반응 0.25초·0.2초마다만 목표를 다시 정하는 사람 흉내 —
 // 이동 속도를 바꿔 비교할 때. PROBE_HUMAN_REACT·PROBE_HUMAN_REPLAN) — 아래 '간단한 AI' 참고
 // 이동은 sim이 정한다(목표로 걷기: 가속·최고 속도·도착 감속 — AI는 목표만 준다). 적 몸에 닿으면 즉시 패배(LOST(contact)).
+// 보스 테스트(네 번째 테스트, -t "boss test"): 캐릭터별 프리셋 가방으로 보스전 — 승률·시간·잃은 HP·도달 페이즈·보스 DPS·보스 윗면 적중(백어택)·
+// 졸개 평균/최대·위험 지역/적 탄 맞은 수 + 이상적인 회피(반응 0 / 0.25초, 앞 2.2초)의 공정성. PROBE_BOSS_IDEAL_SEEDS(기본 4)·
+// PROBE_BOSS_IDEAL_HORIZON(기본 2.2). 회피 AI·이상적인 회피는 보스 위험 지역(예고·발동 중)도 피한다(일반 스테이지는 위험 지역이 없어 그대로).
+// PROBE_DUMP_NOSAFE=1: 이상적인 회피가 '안 맞는 자리가 없던' 순간의 장면을 판마다 한 번 찍는다.
 import { describe, expect, it } from 'vitest';
 import {
   BAG_EXPAND_COSTS,
@@ -53,7 +57,7 @@ import {
 import { stepPlayerMotion, type Mover } from '../src/logic/combat/movement';
 import { CombatSim, FIRE_OFFSET_Y, traceAim, type AimTrace } from '../src/logic/combat/sim';
 import { Rng } from '../src/logic/rng';
-import { newRun, rewardKill, runLoadout, runPlayerStats } from '../src/logic/run';
+import { newBossTestRun, newRun, rewardKill, runLoadout, runPlayerStats } from '../src/logic/run';
 import { itemPrice } from '../src/logic/stats';
 import type {
   BagItem,
@@ -492,6 +496,22 @@ function bodyBlocks(sim: CombatSim, y: number): { lo: number; hi: number; wall: 
     if (bottom + desc * BODY_LOOKAHEAD < top) continue;
     out.push({ lo: e.x - PLAYER_HIT_RADIUS - BODY_MARGIN, hi: e.x + e.w + PLAYER_HIT_RADIUS + BODY_MARGIN, wall: bottom >= top });
   }
+  // 보스 위험 지역(예고·발동 중 — 내려찍기 열, 구슬 그림자)도 그 높이에서 막힌 구간으로 (지나가는 것은 괜찮다 — 벽 아님).
+  // 일반 스테이지는 hazards가 늘 비어 있어 그대로
+  for (const h of sim.hazards) {
+    if (h.state === 'done') continue;
+    const reach = PLAYER_HIT_RADIUS + BODY_MARGIN;
+    if (h.shape === 'rect') {
+      if (y + reach <= h.y || y - reach >= h.y + h.h) continue;
+      out.push({ lo: h.x - reach, hi: h.x + h.w + reach, wall: false });
+    } else {
+      const r = h.w / 2 + reach;
+      const dy = y - (h.y + h.h / 2);
+      if (Math.abs(dy) >= r) continue;
+      const half = Math.sqrt(r * r - dy * dy);
+      out.push({ lo: h.x + h.w / 2 - half, hi: h.x + h.w / 2 + half, wall: false });
+    }
+  }
   return out;
 }
 
@@ -744,6 +764,23 @@ interface Outcome {
   /** 최대치였던 순간의 구성 (무기별 수, 시각) */
   peakMix: string;
   ms: number;
+  /** 보스전(보스 테스트): 위험 지역에 맞은 수·피해, 적 탄에 맞은 수, 살아있는 졸개 평균/최대, 도달한 페이즈(0부터), 소환된 졸개 수,
+   *  보스 윗면 직접 적중 수(공이 보스보다 위 — 양옆 통로로 넘어간 공의 '백어택') */
+  hazardHits: number;
+  hazardTaken: number;
+  shotHits: number;
+  minionAvg: number;
+  minionPeak: number;
+  phaseMax: number;
+  summoned: number;
+  bossTopHits: number;
+  /**
+   * 보스전: 플레이어 투사체 직접 적중 중 졸개가 받은 수(보스 대신 맞아 준 '방패' 몫), 보스가 살아 있는 동안 처치한 졸개 수,
+   * 살아있는 졸개 아래 끝이 가장 깊이 내려온 위치(필드 높이 비율 — 1 = 방어선)
+   */
+  minionDirectHits: number;
+  minionKills: number;
+  minionDeepest: number;
 }
 
 /** '반사 횟수 상한을 두면?' 계측용 가정 상한 (maxBounces 0 무기의 기본 상한 후보) */
@@ -778,21 +815,35 @@ function assertFiniteState(sim: CombatSim): void {
   }
 }
 
-function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai): Outcome {
+/** stage를 주면 그 스테이지(보스 테스트 등 data.stages 밖)로, 아니면 data.stages[stageIndex] */
+function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, stage: StageDef = data.stages[stageIndex]): Outcome {
   // 보상은 복사본 런에 받는다 (빌드 런은 다른 시뮬에서도 쓴다)
   const run = structuredClone(source);
   // 처치 골드(소수 부분 확률)·드롭 굴림이 판마다 같은 운이 되지 않게 보상 RNG를 시드로 바꾼다
   run.rngState = (Math.imul(seed ^ 0x5bd1e995, 0x9e3779b1) ^ source.rngState) >>> 0;
   const player = runPlayerStats(data, run);
   const sim = new CombatSim({
-    stage: data.stages[stageIndex],
+    stage,
     stageIndex,
     enemies: data.enemies,
+    bosses: data.bosses,
     loadout: runLoadout(data, run),
     player,
     hp: run.hp,
     seed,
   });
+  // 보스전 계측 (보스 테스트 표): 위험 지역·적 탄 맞은 수, 살아있는 졸개, 도달한 페이즈, 소환 수
+  let hazardHits = 0;
+  let hazardTaken = 0;
+  let shotHits = 0;
+  let minionSum = 0;
+  let minionPeak = 0;
+  let phaseMax = 0;
+  let summoned = 0;
+  let bossTopHits = 0;
+  let minionDirectHits = 0;
+  let minionKills = 0;
+  let minionDeepest = 0;
 
   let taken = 0;
   let dealt = 0;
@@ -836,10 +887,14 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai): O
     const before = e.hp;
     const chilled = e.chillTime > 0;
     origHit.call(sim, p, e, hx, hy);
+    if (sim.boss && !e.boss) minionDirectHits++;
     if (e.boss) {
       const d = before - Math.max(0, e.hp);
       const w = defByUid.get(p.weaponUid) ?? '?';
-      if (p.y < e.y) bossAboveDamage += d;
+      if (p.y < e.y) {
+        bossAboveDamage += d;
+        bossTopHits++;
+      }
       if (w === 'w_sock_gatling') bossGatlingDamage += d;
       bossByWeapon[w] = (bossByWeapon[w] ?? 0) + d;
       if (chilled) bossChillBonus += d * (1 - 1 / CHILL_DAMAGE_TAKEN_MUL);
@@ -878,6 +933,11 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai): O
             }
           }
         }
+        if (ev.source === 'hazard') {
+          key = 'hazard';
+          hazardHits++;
+          hazardTaken += ev.damage;
+        } else shotHits++;
         takenBy[key] = (takenBy[key] ?? 0) + ev.damage;
         if (bossSeen === null) takenBeforeBoss += ev.damage;
         if (key.startsWith('gear')) gearHits++;
@@ -888,7 +948,13 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai): O
       else if (ev.type === 'kill') {
         if (rewardKill(data, run, ev.defId).drop) drops++;
         if (ev.boss) bossEnd = sim.time;
-      }
+        else if (sim.boss && sim.boss.mode !== 'dead') minionKills++;
+      } else if (ev.type === 'summon') summoned++;
+      else if (ev.type === 'bossPhase') phaseMax = Math.max(phaseMax, ev.phase);
+    }
+    if (sim.boss) {
+      minionSum += sim.boss.minions;
+      minionPeak = Math.max(minionPeak, sim.boss.minions);
     }
     for (const p of prevLive) if (!p.alive) deaths[deathCause(p)]++;
     prevLive = sim.projectiles.slice();
@@ -907,6 +973,7 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai): O
     }
     for (const e of sim.enemies) {
       deepest = Math.max(deepest, e.y + e.h);
+      if (sim.boss && !e.boss && e.alive) minionDeepest = Math.max(minionDeepest, e.y + e.h);
       if (e.boss && bossSeen === null && e.y + e.h > 0) bossSeen = sim.time;
       if (e.boss) {
         bossRef = e;
@@ -965,6 +1032,17 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai): O
     projSecByWeapon,
     peakMix,
     ms: performance.now() - started,
+    hazardHits,
+    hazardTaken,
+    shotHits,
+    minionAvg: steps > 0 ? minionSum / steps : 0,
+    minionPeak,
+    phaseMax,
+    summoned,
+    bossTopHits,
+    minionDirectHits,
+    minionKills,
+    minionDeepest: minionDeepest / FIELD_H,
   };
 }
 
@@ -1026,6 +1104,16 @@ const SWEEP_SEEDS_ALL = env.PROBE_SEED_LIST
   ? env.PROBE_SEED_LIST.split(',').map(Number)
   : [11, 2024, 7, 99, 314, 4242, 5150, 8080];
 const SWEEP_SEEDS = SWEEP_SEEDS_ALL.slice(0, Math.max(1, Number(env.PROBE_SEEDS) || SWEEP_SEEDS_ALL.length));
+/**
+ * 보스 테스트 표의 시드: 앞 PROBE_BOSS_SEEDS개(기본 12). 앞 8개는 승률 스윕과 같고, 24개 뒤로는 정해진 식으로 이어 만든다
+ * (승률은 시드 하나에 크게 흔들려 — 판 하나 = 12시드에서 8%p — 조정 비교는 PROBE_BOSS_SEEDS=96 정도로)
+ */
+function bossSeedList(n: number): number[] {
+  const base = [11, 2024, 7, 99, 314, 4242, 5150, 8080, 13, 777, 1999, 31337, 42, 123, 2718, 9001, 65, 404, 5555, 8888, 21, 1234, 3141, 6006];
+  const out = base.slice(0, n);
+  for (let k = base.length; out.length < n; k++) out.push((Math.imul(k + 1, 0x9e3779b1) >>> 0) % 1_000_003);
+  return out;
+}
 const SWEEP_STAGES: number[] | null = env.PROBE_STAGES ? env.PROBE_STAGES.split(',').map(Number) : null;
 const SWEEP_COL_FILTER: string[] | null = env.PROBE_COLS ? env.PROBE_COLS.split(',') : null;
 
@@ -1149,6 +1237,8 @@ function takenShares(os: Outcome[]): string {
 const IDEAL_HORIZON = 1.4;
 const IDEAL_MARGIN = 6;
 const IDEAL_REACT = Number(env.PROBE_IDEAL_REACT ?? 0);
+/** 보스 테스트 이상적인 회피의 앞 내다보기: 쏘는 졸개의 탄이 이 시간(초)에 가는 거리 안(총구 앞)에는 되도록 서지 않는다 */
+const ANTICIPATE_TIME = 0.6;
 /** 이상적인 회피가 쓰는 바닥 띠의 위끝 (예전 이동 구역 FIELD_H - 260). 더 위로는 가지 않아도 늘 안전한 자리가 있는지 본다 */
 const IDEAL_BAND_TOP = FIELD_H - 260;
 const IDEAL_CANDIDATES: [number, number][] = [];
@@ -1157,8 +1247,22 @@ for (let row = 0; row < 5; row++) {
   for (let x = X_MIN; x <= X_MAX + 0.01; x += 16) IDEAL_CANDIDATES.push([Math.min(x, X_MAX), cy]);
 }
 
-function idealDodger(moveSpeed: number, descentSpeed: number): { ai: Ai; noSafeTimes: number[]; episodes: () => number } {
-  const steps = Math.round(IDEAL_HORIZON / SIM_DT);
+/** react: 생긴 지 이만큼(초) 안 된 탄·위험 지역은 못 본다 (기본 PROBE_IDEAL_REACT) */
+function idealDodger(
+  moveSpeed: number,
+  descentSpeed: number,
+  react = IDEAL_REACT,
+  horizon = IDEAL_HORIZON,
+  /**
+   * 보스 테스트: 쏘는 졸개 앞(로봇 바로 아래 열, 다트총·깜짝 상자 총구 둘레 — 탄이 ANTICIPATE_TIME초에 가는 거리)을 피해 서려 한다.
+   * 사람은 졸개 그림을 보고 그 앞에 서지 않는데, 이미 나간 탄만 보는 회피는 쏘기 직전의 졸개 바로 밑에 서 있다가 반응 시간 안에 맞았다.
+   * 늘 지키는 규칙은 아니다 — 안전한 자리가 그 안밖에 없으면 그리로 간다(점수만 깎음)
+   */
+  anticipate = false,
+): { ai: Ai; noSafeTimes: number[]; episodes: () => number } {
+  const steps = Math.round(horizon / SIM_DT);
+  /** anticipate: 쏘는 졸개 앞 [0, x0, y0, x1, y1](로봇 열) 또는 [1, 총구 x, 총구 y, 반경, 0] */
+  let keepOut: number[][] = [];
   /** 경로 예측용 (sim의 플레이어와 같은 이동 함수) */
   const ghost: Mover = { x: 0, y: 0, vx: 0, vy: 0 };
   const seenAt = new Map<number, number>();
@@ -1167,9 +1271,11 @@ function idealDodger(moveSpeed: number, descentSpeed: number): { ai: Ai; noSafeT
   let wasNoSafe = false;
   let tx = FIELD_W / 2;
   let ty = HOME_Y;
-  // 이번 스텝의 위협: 탄 [x, y, vx, vy, 닿는 거리], 적 몸 [x, y, w, h]
+  // 이번 스텝의 위협: 탄 [x, y, vx, vy, 닿는 거리], 적 몸 [x, y, w, h],
+  // 보스 위험 지역 [원이면 1, x, y, w, h, 발동 시작, 발동 끝(초, 지금부터)] — 일반 스테이지는 늘 비어 있다
   let shots: number[][] = [];
   let bodies: number[][] = [];
+  let hazards: number[][] = [];
   let desc = 0;
   let invuln = 0;
   let px0 = 0;
@@ -1192,6 +1298,17 @@ function idealDodger(moveSpeed: number, descentSpeed: number): { ai: Ai; noSafeT
       if (t >= invuln - 1e-9) {
         for (const [x, y, vx, vy, rr] of shots) {
           const c = Math.hypot(x + vx * t - px, y + vy * t - py) - rr;
+          if (c < best) {
+            best = c;
+            if (best < 0) return best;
+          }
+        }
+        for (const [circle, x, y, w, h, t0, t1] of hazards) {
+          if (t < t0 - 1e-9 || t > t1 + 1e-9) continue;
+          const d = circle
+            ? Math.hypot(px - (x + w / 2), py - (y + h / 2)) - w / 2
+            : Math.hypot(px - Math.max(x, Math.min(px, x + w)), py - Math.max(y, Math.min(py, y + h)));
+          const c = d - (PLAYER_HIT_RADIUS + IDEAL_MARGIN);
           if (c < best) {
             best = c;
             if (best < 0) return best;
@@ -1220,24 +1337,52 @@ function idealDodger(moveSpeed: number, descentSpeed: number): { ai: Ai; noSafeT
     for (const s of sim.enemyShots) {
       if (!s.alive) continue;
       if (!seenAt.has(s.id)) seenAt.set(s.id, sim.time);
-      if (sim.time - seenAt.get(s.id)! < IDEAL_REACT - 1e-9) continue;
+      if (sim.time - seenAt.get(s.id)! < react - 1e-9) continue;
       const rr = s.radius + pl.hitRadius + IDEAL_MARGIN;
-      if (Math.max(s.y, s.y + s.vy * IDEAL_HORIZON) < IDEAL_BAND_TOP - rr - 10) continue;
+      if (Math.max(s.y, s.y + s.vy * horizon) < IDEAL_BAND_TOP - rr - 10) continue;
       shots.push([s.x, s.y, s.vx, s.vy, rr]);
+    }
+    hazards = [];
+    for (const h of sim.hazards) {
+      if (h.state === 'done') continue;
+      if (!seenAt.has(h.id)) seenAt.set(h.id, sim.time);
+      if (sim.time - seenAt.get(h.id)! < react - 1e-9) continue;
+      const t0 = h.state === 'warn' ? h.timer : 0;
+      hazards.push([h.shape === 'circle' ? 1 : 0, h.x, h.y, h.w, h.h, t0, t0 + (h.state === 'warn' ? h.activeTime : h.timer)]);
     }
     const visible = sim.enemies.some((e) => e.alive && e.y + e.h > 0);
     desc = descentSpeed * (visible ? 1 : 6);
     bodies = sim.enemies
-      .filter((e) => e.alive && e.y + e.h + desc * IDEAL_HORIZON >= IDEAL_BAND_TOP - 40)
+      .filter((e) => e.alive && e.y + e.h + desc * horizon >= IDEAL_BAND_TOP - 40)
       .map((e) => [e.x, e.y, e.w, e.h]);
     const homeX = FIELD_W / 2;
+    if (anticipate) {
+      keepOut = [];
+      for (const e of sim.enemies) {
+        const atk = e.alive && !e.boss ? data.enemies[e.defId]?.attack : undefined;
+        if (!atk) continue;
+        const reach = atk.projSpeed * ANTICIPATE_TIME;
+        if (atk.kind === 'straight') {
+          const pad = atk.radius + PLAYER_HIT_RADIUS + IDEAL_MARGIN;
+          keepOut.push([0, e.x + e.w / 2 - pad, e.y + e.h, e.x + e.w / 2 + pad, e.y + e.h + reach]);
+        } else keepOut.push([1, e.x + e.w / 2, e.y + e.h, reach, 0]);
+      }
+    }
+    // 앞을 내다본 '쏘는 졸개 앞' 자리 (anticipate일 때만 — 아니면 늘 false)
+    const exposed = (x: number, y: number): boolean => {
+      for (const [circle, a, b, c, d] of keepOut) {
+        if (circle ? Math.hypot(x - a, y - b) < c : x > a && x < c && y > b && y < d) return true;
+      }
+      return false;
+    };
+    // 안전한 자리 1000+, 그중 쏘는 졸개 앞은 500 깎는다(안전한 다른 자리가 없을 때만 고름). 안 안전하면 여유(음수) 그대로
     const score = (c: number, x: number, y: number): number =>
-      c >= 0 ? 1000 + Math.min(c, 40) - 0.02 * Math.hypot(x - homeX, y - HOME_Y) : c;
+      c >= 0 ? 1000 + Math.min(c, 40) - 0.02 * Math.hypot(x - homeX, y - HOME_Y) - (exposed(x, y) ? 500 : 0) : c;
     let noSafe = false;
-    if (clearance(homeX, HOME_Y) >= 12) {
+    if (clearance(homeX, HOME_Y) >= 12 && !exposed(homeX, HOME_Y)) {
       tx = homeX;
       ty = HOME_Y;
-    } else if (clearance(tx, ty) < 12) {
+    } else if (clearance(tx, ty) < 12 || exposed(tx, ty)) {
       let best = score(clearance(pl.x, pl.y), pl.x, pl.y);
       tx = pl.x;
       ty = pl.y;
@@ -1249,7 +1394,8 @@ function idealDodger(moveSpeed: number, descentSpeed: number): { ai: Ai; noSafeT
           ty = cy;
         }
       }
-      noSafe = best < 1000;
+      // 쏘는 졸개 앞 감점은 빼고 잰다 (anticipate가 아니면 예전과 같은 판정)
+      noSafe = best + (exposed(tx, ty) ? 500 : 0) < 1000;
     }
     if (noSafe) {
       noSafeTimes.push(sim.time);
@@ -1276,16 +1422,33 @@ interface IdealOutcome {
   /** 3초 안에 잃은 HP의 최댓값 (최대 HP 대비)과 그 순간의 출처·시각·가장 깊은 적 */
   worst3: number;
   worst3Desc: string;
+  /** 처음 '안 맞는 자리가 없던' 순간(초) — 없으면 null */
+  noSafeAt: number | null;
 }
 
-function simulateIdeal(source: RunState, stageIndex: number, seed: number, aim: 'auto' | 'manual', nochill: boolean, probeMove: boolean): IdealOutcome {
+function simulateIdeal(
+  source: RunState,
+  stageIndex: number,
+  seed: number,
+  aim: 'auto' | 'manual',
+  nochill: boolean,
+  probeMove: boolean,
+  stage: StageDef = data.stages[stageIndex],
+  react = IDEAL_REACT,
+  horizon = IDEAL_HORIZON,
+  /** 이동 속도 상한 (px/s) — 보스 테스트의 공정성 기준 '걸어서 420 px/s'로 신발·패시브 없이 재 볼 때 */
+  speedCap = Infinity,
+  /** idealDodger의 anticipate (보스 테스트) */
+  anticipate = false,
+): IdealOutcome {
   const run = structuredClone(source);
-  const player = runPlayerStats(data, run);
+  const stats = runPlayerStats(data, run);
+  const player = speedCap < stats.moveSpeed ? { ...stats, moveSpeed: speedCap } : stats;
   const loadout = runLoadout(data, run);
-  const stage = data.stages[stageIndex];
-  const sim = new CombatSim({ stage, stageIndex, enemies: data.enemies, loadout, player, hp: run.hp, seed });
-  const ideal = idealDodger(player.moveSpeed, stage.descentSpeed);
+  const sim = new CombatSim({ stage, stageIndex, enemies: data.enemies, bosses: data.bosses, loadout, player, hp: run.hp, seed });
+  const ideal = idealDodger(player.moveSpeed, stage.descentSpeed, react, horizon, anticipate);
   const aimAi = aim === 'manual' ? manualAi(seed, guideRadius(loadout)) : null;
+  let dumped = false;
   const hits: { t: number; d: number; src: string; deep: number }[] = [];
   let deepest = 0;
   let bossSeen: number | null = null;
@@ -1297,6 +1460,19 @@ function simulateIdeal(source: RunState, stageIndex: number, seed: number, aim: 
   for (let i = 0; i < maxSteps && sim.status === 'running'; i++) {
     if (nochill) for (const e of sim.enemies) e.chillTime = 0;
     const planned = ideal.ai(sim);
+    // PROBE_DUMP_NOSAFE=1: 판마다 처음 '안 맞는 자리가 없던' 순간의 장면(플레이어·적 탄·위험 지역·적)을 찍는다 — 무엇이 겹쳤는지 볼 때
+    if (env.PROBE_DUMP_NOSAFE && !dumped && ideal.noSafeTimes.length > 0 && ideal.noSafeTimes[ideal.noSafeTimes.length - 1] === sim.time) {
+      dumped = true;
+      const pl = sim.player;
+      const lines = [
+        `[noSafe] ${stage.id} seed ${seed} t ${sim.time.toFixed(2)}s player (${pl.x.toFixed(0)}, ${pl.y.toFixed(0)}) v (${pl.vx.toFixed(0)}, ${pl.vy.toFixed(0)})` +
+          (sim.boss ? ` boss phase ${sim.boss.phase} ${sim.boss.mode} ${sim.boss.actionId ?? ''}` : ''),
+        ...sim.enemyShots.map((s) => `  shot ${s.sprite} (${s.x.toFixed(0)}, ${s.y.toFixed(0)}) v (${s.vx.toFixed(0)}, ${s.vy.toFixed(0)}) r ${s.radius}`),
+        ...sim.hazards.map((h) => `  hazard ${h.kind} ${h.state} ${h.timer.toFixed(2)}s (${h.x.toFixed(0)}, ${h.y.toFixed(0)}) ${h.w.toFixed(0)}×${h.h.toFixed(0)}`),
+        ...sim.enemies.map((e) => `  enemy ${e.defId} (${e.x.toFixed(0)}, ${e.y.toFixed(0)}) ${e.w}×${e.h}`),
+      ];
+      console.log(lines.join('\n'));
+    }
     const move = probeMove ? aiInput(sim) : planned;
     sim.step(SIM_DT, aimAi ? { ...move, aimAngle: aimAi(sim).aimAngle } : move);
     const before = prevShots;
@@ -1314,18 +1490,21 @@ function simulateIdeal(source: RunState, stageIndex: number, seed: number, aim: 
       let src = '?';
       shotHits++;
       let best = Infinity;
-      for (const sh of before) {
-        const d = Math.hypot(sh.x - sim.player.x, sh.y - sim.player.y);
-        if (!sh.alive && d < best) {
-          best = d;
-          src = `${sh.sprite.replace(/^shot_/, '')}/${sh.radius}`;
+      if (ev.source === 'hazard') src = 'hazard';
+      else {
+        for (const sh of before) {
+          const d = Math.hypot(sh.x - sim.player.x, sh.y - sim.player.y);
+          if (!sh.alive && d < best) {
+            best = d;
+            src = `${sh.sprite.replace(/^shot_/, '')}/${sh.radius}`;
+          }
         }
       }
       hits.push({ t: sim.time, d: ev.damage, src, deep: deepNow / FIELD_H });
     }
   }
   let unavoidable = 0;
-  for (const h of hits) if (ideal.noSafeTimes.some((t) => t <= h.t + 1e-9 && t > h.t - IDEAL_HORIZON - 1e-9)) unavoidable++;
+  for (const h of hits) if (ideal.noSafeTimes.some((t) => t <= h.t + 1e-9 && t > h.t - horizon - 1e-9)) unavoidable++;
   let worst = 0;
   let worstDesc = '';
   for (let a = 0; a < hits.length; a++) {
@@ -1353,6 +1532,7 @@ function simulateIdeal(source: RunState, stageIndex: number, seed: number, aim: 
     avoidable: hits.length - unavoidable,
     worst3: worst / sim.player.maxHp,
     worst3Desc: worstDesc,
+    noSafeAt: ideal.noSafeTimes.length > 0 ? ideal.noSafeTimes[0] : null,
   };
 }
 
@@ -1800,4 +1980,180 @@ describe('balance probe', () => {
       }
     }
   }, 3_600_000);
+  // ── 보스 테스트 (타이틀 '보스 테스트' → 캐릭터별 프리셋 가방으로 '장난감 상자 대마왕' 한 판) ──
+  // 캐릭터 × 시드 × 자동·수동 조준 × 회피·가만히, 그리고 이상적인 회피(앞 2.2초 예측)로 '피할 수 없는 공격'이 있는지.
+  // 시드: bossSeedList — 앞 PROBE_BOSS_SEEDS개(기본 12), PROBE_SEED_LIST를 주면 그 목록. 이상적인 회피는 그 앞 PROBE_BOSS_IDEAL_SEEDS개
+  // (기본 6 — 4설정 × 3캐릭터 = 72판, 약 20초. 조정을 끝낼 땐 PROBE_BOSS_SEEDS=24 PROBE_BOSS_IDEAL_SEEDS=24로 288판 전부 확인).
+  // PROBE_CHARS·PROBE_PATCH(enemies·items·characters) 적용. 조정 목표는 docs/DESIGN.md '보스 테스트 모드 — 조정'.
+  // 보기: npx vitest run tests/balance.probe.test.ts -t "boss test" --silent=false
+  // 이상적인 회피(4설정 모두)는 피할 수 없는 피해·접촉 패배가 0이어야 한다 — 늘 단언한다(결정적).
+  // 보스 이상적인 회피는 쏘는 졸개 앞에 되도록 서지 않는다(idealDodger anticipate — 사람은 졸개를 보고 피한다)
+  it('boss test: preset builds vs the boss (characters × seeds, auto/manual aim × dodge/still, ideal dodger fairness)', () => {
+    const stage = data.bossTest.stage;
+    const bossDef = data.bosses[stage.boss!];
+    const nBossSeeds = Math.max(1, Number(env.PROBE_BOSS_SEEDS) || 12);
+    const BOSS_SEEDS = env.PROBE_SEED_LIST ? SWEEP_SEEDS_ALL.slice(0, nBossSeeds) : bossSeedList(nBossSeeds);
+    const rows: string[][] = [];
+    const buildLines: string[] = [];
+    const all: Outcome[] = [];
+    const summary: string[] = [];
+    let ms = 0;
+    const cols: { label: string; aim: 'auto' | 'manual'; still: boolean }[] = [
+      { label: 'auto dodge', aim: 'auto', still: false },
+      { label: 'manual dodge', aim: 'manual', still: false },
+      { label: 'auto still', aim: 'auto', still: true },
+      { label: 'manual still', aim: 'manual', still: true },
+    ];
+    const avg = (xs: number[]): number => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN);
+    const lossText = (outs: Outcome[]): string =>
+      ['LOST(hp)', 'LOST(breach)', 'LOST(contact)', 'TIMEOUT']
+        .map((k) => [k.replace(/^LOST\((.*)\)$/, '$1'), outs.filter((o) => o.status === k).length] as const)
+        .filter(([, n]) => n > 0)
+        .map(([k, n]) => `${k} ${n}`)
+        .join(', ');
+    for (const c of CHARACTERS) {
+      const run = newBossTestRun(data, c, 7);
+      const ps = runPlayerStats(data, run);
+      buildLines.push(
+        `  ${c.padEnd(8)} maxHp ${ps.maxHp} regen ${ps.regenPerSec}/s speed ${Math.round(ps.moveSpeed)} sheet dps ${Math.round(sheetDps(runLoadout(data, run)))} ${describeRun(run)}`,
+      );
+      const byCol: Record<string, Outcome[]> = {};
+      for (const col of cols) {
+        const outs: Outcome[] = [];
+        for (const seed of BOSS_SEEDS) {
+          const o = simulate(run, 0, seed, aiFor(col, run, seed), stage);
+          outs.push(o);
+          ms += o.ms;
+        }
+        byCol[col.label] = outs;
+        all.push(...outs);
+        const won = outs.filter((o) => o.won);
+        const phases = bossDef.phases.map((_, i) => outs.filter((o) => o.phaseMax === i).length);
+        const bossDmg = outs.reduce((a, o) => a + o.bossDamage, 0);
+        const direct = outs.reduce((a, o) => a + o.directHits, 0);
+        rows.push([
+          c,
+          col.label,
+          `${pct(won.length / outs.length)} (${won.length}/${outs.length})`,
+          won.length ? spread(won.map((o) => o.time), 1, 's') : '-',
+          won.length ? `${spread(won.map(hpLost))} · ${pct(median(won.map((o) => o.hpLeft / o.maxHp)))}` : '-',
+          phases.map((n, i) => `p${i + 1}:${n}`).join(' '),
+          String(Math.round(median(outs.map((o) => o.bossDamage / Math.max(1e-9, o.bossTime ?? o.time))))),
+          `${avg(outs.map((o) => o.bossTopHits)).toFixed(0)} · ${pct(outs.reduce((a, o) => a + o.bossAboveDamage, 0) / Math.max(1, bossDmg))}`,
+          `${avg(outs.map((o) => o.minionAvg)).toFixed(1)} / ${Math.max(...outs.map((o) => o.minionPeak))} · ` +
+            `${avg(outs.map((o) => o.summoned)).toFixed(0)} / ${avg(outs.map((o) => o.minionKills)).toFixed(0)} · ` +
+            `${pct(outs.reduce((a, o) => a + o.minionDirectHits, 0) / Math.max(1, direct))} · ${pct(median(outs.map((o) => o.minionDeepest)))}`,
+          `${avg(outs.map((o) => o.hazardHits)).toFixed(2)} / ${avg(outs.map((o) => o.shotHits)).toFixed(2)}`,
+          takenShares(outs),
+          lossText(outs) || '-',
+        ]);
+      }
+      const rate = (labels: string[]): string => {
+        const os = labels.flatMap((l) => byCol[l]);
+        return `${pct(os.filter((o) => o.won).length / os.length)}`;
+      };
+      const md = byCol['manual dodge'];
+      summary.push(
+        `  ${c.padEnd(8)} manual dodge win ${rate(['manual dodge'])} (${lossText(md) || 'no losses'}), ` +
+          `won fight ${md.some((o) => o.won) ? median(md.filter((o) => o.won).map((o) => o.time)).toFixed(0) : '-'}s · ` +
+          `auto dodge win ${rate(['auto dodge'])} · still win ${rate(['auto still', 'manual still'])}`,
+      );
+    }
+    const dodgeLosses = all.filter((o, i) => !o.won && Math.floor(i / BOSS_SEEDS.length) % cols.length < 2);
+    const breachShare = dodgeLosses.length ? dodgeLosses.filter((o) => o.status === 'LOST(breach)').length / dodgeLosses.length : 0;
+
+    // 공정성: 이상적인 회피(앞 BOSS_IDEAL_HORIZON초 예측, 바닥 띠)로 '안 맞는 자리가 하나도 없던' 순간이 있는가.
+    // 반응 0 + 자동 조준(기준선) / 반응 0.25초 + 수동 조준(냉기 있음·없음, 이동 속도 상한 420 px/s — 신발·패시브 없이 걸어서)
+    const BOSS_IDEAL_SEEDS = BOSS_SEEDS.slice(0, Math.max(1, Number(env.PROBE_BOSS_IDEAL_SEEDS) || 6));
+    // 보스 탄은 느리고 멀리서 온다(입 → 바닥 약 2초) — 앞을 1.4초만 보면 빈틈·부채꼴 밖으로 갈 시간을 늦게 알아챈다. 기본 2.2초 (PROBE_BOSS_IDEAL_HORIZON)
+    const BOSS_IDEAL_HORIZON = Number(env.PROBE_BOSS_IDEAL_HORIZON ?? 2.2);
+    const idealConfigs: { label: string; react: number; aim: 'auto' | 'manual'; nochill: boolean; cap: number }[] = [
+      { label: 'react 0 auto', react: 0, aim: 'auto', nochill: false, cap: Infinity },
+      { label: 'react 0.25 manual', react: 0.25, aim: 'manual', nochill: false, cap: Infinity },
+      { label: 'react 0.25 manual nochill', react: 0.25, aim: 'manual', nochill: true, cap: Infinity },
+      { label: 'react 0.25 manual 420px/s', react: 0.25, aim: 'manual', nochill: false, cap: 420 },
+    ];
+    const idealRows: string[][] = [];
+    const idealAll: IdealOutcome[] = [];
+    for (const ic of idealConfigs) {
+      const outs: IdealOutcome[] = [];
+      const perChar: string[] = [];
+      /** '안 맞는 자리가 없던' 판: 캐릭터 시드@처음 시각 */
+      const noSafeRuns: string[] = [];
+      for (const c of CHARACTERS) {
+        const run = newBossTestRun(data, c, 7);
+        const mine = BOSS_IDEAL_SEEDS.map((seed) =>
+          simulateIdeal(run, 0, seed, ic.aim, ic.nochill, false, stage, ic.react, BOSS_IDEAL_HORIZON, ic.cap, true),
+        );
+        perChar.push(`${mine.filter((o) => o.won).length}/${mine.length}`);
+        mine.forEach((o, i) => {
+          if (o.noSafeAt !== null) noSafeRuns.push(`${c} s${BOSS_IDEAL_SEEDS[i]}@${o.noSafeAt.toFixed(1)}s`);
+        });
+        outs.push(...mine);
+      }
+      idealAll.push(...outs);
+      const won = outs.filter((o) => o.won);
+      const worst = outs.reduce((a, b) => (b.worst3 > a.worst3 ? b : a));
+      const sum = (f: (o: IdealOutcome) => number): number => outs.reduce((a, o) => a + f(o), 0);
+      const lossKinds = outs.filter((o) => !o.won).map((o) => o.status);
+      idealRows.push([
+        ic.label,
+        `${pct(won.length / outs.length)} (${perChar.join(' ')})`,
+        won.length
+          ? `${pct(median(won.map((o) => o.lostFrac)))} (max ${pct(Math.max(...won.map((o) => o.lostFrac)))}) / ${median(won.map((o) => o.bossTime ?? 0)).toFixed(0)}s`
+          : '-',
+        `${(sum((o) => o.shotHits) / outs.length).toFixed(2)} / ${(sum((o) => o.contactHits) / outs.length).toFixed(2)}`,
+        `${sum((o) => o.noSafeEpisodes)} · ${sum((o) => o.unavoidable)} / ${sum((o) => o.avoidable)}` +
+          (noSafeRuns.length ? ` (${noSafeRuns.join(' ')})` : ''),
+        `${pct(worst.worst3)}${worst.worst3 > 0 ? ` (${worst.worst3Desc})` : ''}`,
+        [...new Set(lossKinds)].map((k) => `${k} ${lossKinds.filter((x) => x === k).length}`).join(', ') || '-',
+      ]);
+    }
+
+    const be = data.enemies[bossDef.enemy];
+    console.log(
+      `\n[boss test] ${stage.id} '${stage.name}' — boss ${bossDef.id} (${be.hp} hp × ${stage.hpMul} = ${Math.round(be.hp * stage.hpMul)}),` +
+        ` phases at ${bossDef.phases.map((p) => pct(p.hpFrac)).join(' / ')}, minion descent ${stage.descentSpeed} px/s, hp ×${stage.hpMul} dmg ×${stage.dmgMul};` +
+        ` ${BOSS_SEEDS.length} seeds per row, full HP, preset bags:\n${buildLines.join('\n')}` +
+        `\n  time = median (min–max) over won runs; hp lost · left = HP lost (gross, of max — regen not subtracted) median (min–max) · HP left median, won runs;` +
+        ` phases = runs whose last phase was pN (p1 = first)` +
+        `\n  boss dps = median boss damage per second on screen; top hits · share = direct hits on the boss top face (ball above the boss — the` +
+        ` side-lane 'back attack') per run · their share of boss damage` +
+        `\n  minions = avg alive / peak · summoned / killed per run · share of player direct hits taken by minions (shield) · median deepest minion bottom (100% = breach)` +
+        `\n  hits/run = hazard (slam / marble) / enemy shot hits; still = stand at bottom-center (no dodging)\n` +
+        table(
+          [
+            'char',
+            'config',
+            'win',
+            'time',
+            'hp lost · left',
+            'phases',
+            'boss dps',
+            'top hits · share',
+            'minions avg/peak · summoned/killed · shield · deep',
+            'hits/run hazard / shot',
+            'damage taken from',
+            'losses',
+          ],
+          rows,
+        ) +
+        `\n${summary.join('\n')}` +
+        `\n  breach share of dodge losses (auto + manual dodge): ${pct(breachShare)} (${dodgeLosses.length} losses)` +
+        `\n\n[boss test] ideal dodger (${BOSS_IDEAL_SEEDS.length} seeds × ${CHARACTERS.length} characters, look-ahead ${BOSS_IDEAL_HORIZON}s,` +
+        ` sees shots and hazards after the reaction time; nochill = chill wiped every step; 420px/s = move speed capped at 420)\n` +
+        table(['config', 'win', 'hp lost (max) / boss fight', 'hits/run / contact loss', 'noSafe · unavoidable / avoidable', 'worst 3 s', 'losses'], idealRows) +
+        `\n  ${all.length} sims + ${idealAll.length} ideal, ${Math.round(ms)} ms\n`,
+    );
+    for (const o of all) {
+      expect(o.status).not.toBe('TIMEOUT');
+      expect(Number.isFinite(o.taken) && Number.isFinite(o.hpLeft)).toBe(true);
+    }
+    // 이상적인 회피는 피할 수 없는 피해(맞기 직전 앞 예측 시간 안에 '안 맞는 자리가 없던' 순간)·접촉 패배가 없어야 한다.
+    // noSafe 순간 자체(맞지 않음)는 표에만 — 장면은 PROBE_DUMP_NOSAFE=1로 본다
+    for (const o of idealAll) {
+      expect(o.unavoidable).toBe(0);
+      expect(o.contactHits).toBe(0);
+    }
+  }, 600_000);
 });

@@ -151,6 +151,21 @@ const ENEMY_LIST: EnemyDef[] = [
       radius: 18,
     },
   },
+  {
+    // 보스 테스트 전용 보스 (src/data/bosses.ts 'toybox_king'). 공격은 EnemyDef.attack이 아니라 BossDef의 행동 스케줄러가 한다.
+    // 6×4칸 — 고정 위치(1~6열, 위끝 y 84)에서 양옆 1열과 천장 사이 틈으로 공이 돌아 올라가 윗면을 친다(백어택).
+    // 체력은 스테이지 hpMul이 곱해진다(보스 테스트 ×17 = 28,900 — hpMul은 졸개 체력에 맞춘 값이라 보스는 이 hp로 맞춘다).
+    // 3200 × 6 = 19,200이던 첫 값은 40~70초에 쓰러졌다 → 졸개 방패와 함께 약 1분 40초~2분 (프로브 수동 조준 중앙값 100~127초). 보상 없음(테스트 모드).
+    id: 'toybox_king',
+    name: '장난감 상자 대마왕',
+    sprite: 'enemy_toybox_king',
+    w: 6,
+    h: 4,
+    hp: 1700,
+    gold: 0,
+    dropChance: 0,
+    boss: true,
+  },
 ];
 
 export const ENEMIES: Record<string, EnemyDef> = Object.fromEntries(ENEMY_LIST.map((d) => [d.id, d]));

@@ -7,8 +7,11 @@
 //                  처음 불러온 코드 그대로 끝까지 검사한다)
 //
 // 흐름: 타이틀 → (탭) 새 게임 → 캐릭터 선택 → (탭) 카드 + 시작! → 전투(1초·6초 스크린샷, 터치 드래그 이동)
-//       → 가방(B) → 닫기(B) → debug.winStage() → 스테이지 클리어 → (탭) 상점으로 → 상점 → toCombat
-//       → debug.loseStage() → 결과 → (탭) 타이틀로 → 스트레스(setSpeed(3), 20초 방치)
+//       → 가방(B) → 닫기(B) → debug.winStage() → 스테이지 클리어 → (탭) 상점으로 → 상점
+//       → 보스 테스트(일반 세이브가 있는 채로): 타이틀 → (탭) 보스 테스트 → (탭) 카드 + 보스전! → 보스전(인트로·착지 후)
+//         → debug.winStage() → 보스 결과(승) → (탭) 다시 도전 → 같은 캐릭터로 보스전 → debug.loseStage() → 보스 결과(패)
+//         → (탭) 타이틀로 → 일반 세이브가 한 글자도 안 바뀌었는지 + (탭) 이어하기 → 상점
+//       → toCombat → debug.loseStage() → 결과 → (탭) 타이틀로 → 스트레스(setSpeed(3), 20초 방치)
 // 스크린샷: tools/.out/smoke/NN-name.png. stdout 마지막에 JSON 요약.
 // 실패(exit 1): 콘솔 에러, 페이지 에러, 단계별 기대 씬(scene())과 다름, 필요한 디버그 훅 없음.
 // 개발 서버는 끝날 때(실패 포함) 항상 종료한다.
@@ -45,6 +48,7 @@ const summary = {
   ignoredErrors: [],
   failures: [],
   playerMove: null,
+  boss: null,
   stress: null,
   durationMs: 0,
 };
@@ -249,6 +253,100 @@ async function playerX() {
   });
 }
 
+const SAVE_KEY = 'ballshooter.run';
+
+async function savedRun() {
+  return page.evaluate((k) => localStorage.getItem(k), SAVE_KEY);
+}
+
+/** 보스 테스트 흐름 (실제 탭). 들어가기 전 일반 세이브 → 끝난 뒤 같은 문자열이어야 한다 */
+async function bossTestPath(T, chars) {
+  const saveBefore = await savedRun();
+  if (!saveBefore) fail('[boss] expected a normal run save before the boss test');
+  const rec = { character: null, landed: false, fight: null, win: null, lose: null, saveUnchanged: null, continueScene: null };
+  summary.boss = rec;
+
+  await page.evaluate(() => window.__game.game.toTitle());
+  await step('title-boss-button', 'TitleScene', { settleMs: 2600 });
+  await tapText(T.menu.bossTest, 'title boss test');
+  await step('boss-select', 'CharacterSelectScene', { settleMs: 1200 });
+  const mode = await page.evaluate(() => window.__game.game.scenes.current?.mode ?? null);
+  if (mode !== 'bossTest') fail(`[boss] character select mode expected bossTest but got ${mode}`);
+  const pick = chars[1] ?? chars[0];
+  rec.character = pick.id;
+  await tapText(pick.name, `boss character ${pick.id}`);
+  await sleep(600);
+  await tapText(T.menu.bossTestStart, 'boss start');
+
+  await waitScene('CombatScene', 10000);
+  const run1 = await page.evaluate(() => {
+    const r = window.__game.game.run;
+    return r ? { mode: r.mode ?? null, characterId: r.characterId } : null;
+  });
+  if (run1?.mode !== 'bossTest' || run1.characterId !== pick.id) fail(`[boss] expected a bossTest run as ${pick.id}, got ${JSON.stringify(run1)}`);
+  await sleep(800);
+  await step('boss-intro', 'CombatScene');
+  try {
+    await page.waitForFunction(
+      () => {
+        const st = window.__game.game.scenes.current?.debugState?.();
+        return !!st?.boss && st.boss.mode !== 'enter';
+      },
+      null,
+      { timeout: 12000, polling: 50 },
+    );
+    rec.landed = true;
+  } catch {
+    fail('[boss] the boss never reached its anchor (mode stayed enter)');
+  }
+  await sleep(2600);
+  await step('boss-fight', 'CombatScene');
+  const fight = await page.evaluate(() => {
+    const st = window.__game.game.scenes.current?.debugState?.();
+    return st ? { bossTest: st.bossTest, boss: st.boss, hazards: st.hazards.length, time: st.time, hp: st.hp, status: st.status } : null;
+  });
+  rec.fight = fight;
+  if (!fight?.bossTest || !fight.boss) fail(`[boss] combat debugState has no boss test / boss: ${JSON.stringify(fight)}`);
+  if ((await savedRun()) !== saveBefore) fail('[boss] the normal save changed while the boss test was running');
+
+  // 승리 → 보스 결과
+  const won = await page.evaluate(() => window.__game.debug.winStage());
+  if (!won) fail('[boss] winStage() not handled in the boss fight');
+  await step('boss-result-win', 'BossResultScene', { timeoutMs: 12000, settleMs: 3200 });
+  rec.win = await page.evaluate(() => window.__game.game.scenes.current?.result ?? null);
+  if (!rec.win?.won || rec.win.characterId !== pick.id) fail(`[boss] win result expected won=true as ${pick.id}: ${JSON.stringify(rec.win)}`);
+  if (rec.win && rec.win.bossDamage !== rec.win.bossMaxHp) fail(`[boss] win result should show the full boss HP as damage: ${JSON.stringify(rec.win)}`);
+
+  // 다시 도전 → 같은 캐릭터 → 패배 → 보스 결과
+  await tapText(T.menu.bossRetry, 'boss retry');
+  await waitScene('CombatScene', 10000);
+  const run2 = await page.evaluate(() => {
+    const r = window.__game.game.run;
+    return r ? { mode: r.mode ?? null, characterId: r.characterId } : null;
+  });
+  if (run2?.mode !== 'bossTest' || run2.characterId !== pick.id) fail(`[boss] retry should restart the boss test as ${pick.id}, got ${JSON.stringify(run2)}`);
+  await sleep(1800);
+  const lost = await page.evaluate(() => window.__game.debug.loseStage());
+  if (!lost) fail('[boss] loseStage() not handled in the boss fight');
+  await step('boss-result-lose', 'BossResultScene', { timeoutMs: 12000, settleMs: 2800 });
+  rec.lose = await page.evaluate(() => window.__game.game.scenes.current?.result ?? null);
+  if (!rec.lose || rec.lose.won !== false) fail(`[boss] lose result expected won=false: ${JSON.stringify(rec.lose)}`);
+
+  // 타이틀 → 일반 세이브 그대로 + 이어하기
+  await tapText(T.menu.toTitle, 'boss result to title');
+  await step('title-after-boss', 'TitleScene', { settleMs: 2600 });
+  const saveAfter = await savedRun();
+  rec.saveUnchanged = saveAfter === saveBefore;
+  if (!rec.saveUnchanged) fail('[boss] the normal run save changed across the boss test');
+  const hasSave = await page.evaluate(() => window.__game.game.hasSave());
+  if (!hasSave) fail('[boss] hasSave() false after the boss test — continue would be lost');
+  await tapText(T.menu.continueRun, 'continue after boss test');
+  await step('continue-after-boss', 'ShopScene', { settleMs: 1200 });
+  rec.continueScene = await scene();
+  const runMode = await page.evaluate(() => window.__game.game.run?.mode ?? 'normal');
+  if (runMode !== 'normal') fail(`[boss] continued run should be the normal run, got mode ${runMode}`);
+}
+
 async function run() {
   if (existsSync(OUT_DIR)) {
     for (const f of readdirSync(OUT_DIR)) if (f.endsWith('.png')) rmSync(path.join(OUT_DIR, f));
@@ -289,7 +387,19 @@ async function run() {
   // UI 문자열은 앱과 같은 모듈에서 읽는다 (하드코딩 없이)
   const T = await page.evaluate(async () => {
     const { menu } = (await import('/src/i18n/ko/index.ts')).T;
-    return { menu: { newRun: menu.newRun, startRun: menu.startRun, toShop: menu.toShop, viewEnding: menu.viewEnding, toTitle: menu.toTitle } };
+    return {
+      menu: {
+        newRun: menu.newRun,
+        continueRun: menu.continueRun,
+        startRun: menu.startRun,
+        toShop: menu.toShop,
+        viewEnding: menu.viewEnding,
+        toTitle: menu.toTitle,
+        bossTest: menu.bossTest,
+        bossTestStart: menu.bossTestStart,
+        bossRetry: menu.bossRetry,
+      },
+    };
   });
   const chars = await page.evaluate(() =>
     Object.values(window.__game.game.data.characters).map((c) => ({ id: c.id, name: c.name })),
@@ -355,6 +465,10 @@ async function run() {
   });
   await sleep(400);
   await step('shop-after-debug-items', 'ShopScene');
+
+  // 6b) 보스 테스트 — 일반 런 세이브(상점)가 있는 채로 한 바퀴. 세이브는 절대 바뀌지 않아야 하고 '이어하기'가 그대로 돼야 한다
+  await bossTestPath(T, chars);
+
   await page.evaluate(() => window.__game.game.toCombat());
   await step('combat-2', 'CombatScene', { settleMs: 1200 });
 

@@ -1,4 +1,6 @@
 // 캐릭터 선택: 초상화 카드 3장 + 선택한 캐릭터 상세(소개·패시브·스탯·시작 아이템·팁) + 시작/뒤로.
+// 보스 테스트 모드(mode 'bossTest'): 제목이 바뀌고, 스탯은 프리셋 가방 기준, 시작 아이템 대신 프리셋 가방 미리보기,
+// 시작 → game.startBossTest (저장하지 않는 보스전 한 판).
 import { Container, Graphics, Rectangle, Sprite, Text } from 'pixi.js';
 import { sfx } from '../audio';
 import { UI_COLORS } from '../config';
@@ -8,11 +10,12 @@ import { Scene } from '../core/scene';
 import { killTweensOf, tween } from '../core/tween';
 import { game } from '../game';
 import { T } from '../i18n/ko';
-import { newRun, runPlayerStats } from '../logic/run';
+import { newBossTestRun, newRun, runPlayerStats } from '../logic/run';
 import { tex } from '../render/assets';
 import { shade } from '../render/color';
-import type { CharacterDef, GameData, Tier } from '../types';
+import type { BossTestPreset, CharacterDef, GameData, Tier } from '../types';
 import { Button, OUTLINE_COLOR, Panel, ProgressBar, textStyle } from '../ui';
+import { ItemView } from './bag/itemSprite';
 import { centeredButton, coverSprite, itemChip } from './menuFx';
 
 const CARD_W = 204;
@@ -36,6 +39,13 @@ const BTN_H = 112;
 const START_W = 400;
 const BACK_W = 200;
 const START_COLOR = 0x4cc96b;
+/** 보스 테스트: 시작 버튼 색, 제목 색, 프리셋 가방 미리보기 칸 크기 */
+const BOSS_START_COLOR = 0xd9534f;
+const BOSS_HEADER_COLOR = 0xffb3c1;
+const PRESET_CELL = 46;
+const PRESET_GAP = 22;
+
+export type CharacterSelectMode = 'normal' | 'bossTest';
 
 interface Card {
   holder: Container;
@@ -74,9 +84,10 @@ function teaserFor(c: CharacterDef, data: GameData): string | null {
   return null;
 }
 
-function statsFor(data: GameData, id: string): CharStats {
-  // 표시용으로만 만드는 임시 런 (저장하지 않음)
-  const p = runPlayerStats(data, newRun(data, id, 0));
+function statsFor(data: GameData, id: string, mode: CharacterSelectMode): CharStats {
+  // 표시용으로만 만드는 임시 런 (저장하지 않음). 보스 테스트는 프리셋 가방(장비 포함) 기준
+  const run = mode === 'bossTest' ? newBossTestRun(data, id, 0) : newRun(data, id, 0);
+  const p = runPlayerStats(data, run);
   return { maxHp: p.maxHp, moveSpeed: Math.round(p.moveSpeed) };
 }
 
@@ -87,6 +98,8 @@ export class CharacterSelectScene extends Scene {
   private readonly bg = new Sprite(tex('bg_title'));
   private readonly dim = new Graphics();
   private readonly header: Text;
+  /** 보스 테스트 모드의 제목 아래 한 줄 (일반 모드는 null) */
+  private readonly subHeader: Text | null = null;
   private readonly cards: Card[] = [];
   private readonly cardRow = new Container();
   private readonly panel: Panel;
@@ -101,18 +114,28 @@ export class CharacterSelectScene extends Scene {
   private leaving = false;
   private panelH = 0;
 
-  constructor() {
+  constructor(readonly mode: CharacterSelectMode = 'normal') {
     super();
     const data = game.data;
-    this.chars = Object.values(data.characters);
-    const stats = this.chars.map((c) => statsFor(data, c.id));
+    const boss = mode === 'bossTest';
+    // 보스 테스트는 프리셋이 있는 캐릭터만
+    this.chars = Object.values(data.characters).filter((c) => !boss || !!data.bossTest.presets[c.id]);
+    const stats = this.chars.map((c) => statsFor(data, c.id, mode));
     const maxHp = Math.max(1, ...stats.map((s) => s.maxHp));
     const maxSpeed = Math.max(1, ...stats.map((s) => s.moveSpeed));
 
     this.dim.eventMode = 'none';
-    this.header = new Text({ text: T.menu.selectCharacter, style: textStyle('title', { fontSize: 64 }) });
+    this.header = new Text({
+      text: boss ? T.menu.bossTestHeader : T.menu.selectCharacter,
+      style: textStyle('title', boss ? { fontSize: 60, fill: BOSS_HEADER_COLOR } : { fontSize: 64 }),
+    });
     this.header.anchor.set(0.5, 0);
     this.addChild(this.bg, this.dim, this.header, this.cardRow);
+    if (boss) {
+      this.subHeader = new Text({ text: T.menu.bossTestSub, style: textStyle('body', { fontSize: 26, fill: UI_COLORS.textDim }) });
+      this.subHeader.anchor.set(0.5, 0);
+      this.addChild(this.subHeader);
+    }
 
     this.chars.forEach((c, i) => this.cards.push(this.buildCard(c, i)));
 
@@ -135,10 +158,10 @@ export class CharacterSelectScene extends Scene {
       onTap: () => this.goBack(),
     });
     const start = new Button({
-      label: T.menu.startRun,
+      label: boss ? T.menu.bossTestStart : T.menu.startRun,
       width: START_W,
       height: BTN_H,
-      color: START_COLOR,
+      color: boss ? BOSS_START_COLOR : START_COLOR,
       fontSize: 48,
       onTap: () => this.start(),
     });
@@ -188,7 +211,8 @@ export class CharacterSelectScene extends Scene {
     this.dim.clear().rect(0, 0, w, h).fill({ color: UI_COLORS.bg, alpha: 0.8 });
 
     const top = vp.safeTop + 26;
-    const headerBottom = top + this.header.height;
+    const subH = this.subHeader ? this.subHeader.height + 6 : 0;
+    const headerBottom = top + this.header.height + subH;
     const btnY = h - vp.safeBottom - 34 - BTN_H / 2;
     const contentTop = headerBottom + 18;
     const contentBottom = btnY - BTN_H / 2 - 26;
@@ -207,6 +231,7 @@ export class CharacterSelectScene extends Scene {
     const offset = Math.max(0, (avail - usedH) / 2);
 
     this.header.position.set(w / 2, top + offset * 0.4);
+    this.subHeader?.position.set(w / 2, top + offset * 0.4 + this.header.height + 2);
     const cardsCenterY = contentTop + offset + gapAbove + cardsH / 2;
     const rowW = this.cards.length * CARD_W + (this.cards.length - 1) * CARD_GAP;
     this.cards.forEach((c, i) => c.holder.position.set((w - rowW) / 2 + i * (CARD_W + CARD_GAP) + CARD_W / 2, cardsCenterY));
@@ -347,7 +372,14 @@ export class CharacterSelectScene extends Scene {
     });
     sections.push(statBlock);
 
-    // 4) 시작 아이템 (+ 팁)
+    // 4) 보스 테스트: 프리셋 가방 미리보기 / 일반: 시작 아이템 (+ 팁)
+    const preset = this.mode === 'bossTest' ? game.data.bossTest.presets[c.id] : undefined;
+    if (preset) {
+      sections.push(this.buildPresetSection(preset, innerW));
+      root.addChild(...sections);
+      const heights = sections.map((s) => s.getLocalBounds().maxY);
+      return { root, sections, heights, bars };
+    }
     const items = new Container();
     const itemsLabel = new Text({ text: T.menu.startItems, style: textStyle('small', { fontSize: 24 }) });
     items.addChild(itemsLabel);
@@ -407,6 +439,71 @@ export class CharacterSelectScene extends Scene {
     root.addChild(...sections);
     const heights = sections.map((s) => s.getLocalBounds().maxY);
     return { root, sections, heights, bars };
+  }
+
+  /** 프리셋 가방: 왼쪽에 실제 배치 그대로의 작은 가방 격자, 오른쪽에 요약(무기·강화석·장비 수, 진화 무기, 가방 안내) */
+  private buildPresetSection(preset: BossTestPreset, innerW: number): Container {
+    const data = game.data;
+    const box = new Container();
+    const label = new Text({ text: T.menu.presetItems, style: textStyle('small', { fontSize: 24 }) });
+    box.addChild(label);
+    const top = label.height + 10;
+    const gw = preset.cols * PRESET_CELL;
+    const gh = preset.rows * PRESET_CELL;
+    const grid = new Graphics().roundRect(-6, -6, gw + 12, gh + 12, 14).fill({ color: 0x000000, alpha: 0.28 });
+    for (let y = 0; y < preset.rows; y++) {
+      for (let x = 0; x < preset.cols; x++) {
+        grid.roundRect(x * PRESET_CELL + 2, y * PRESET_CELL + 2, PRESET_CELL - 4, PRESET_CELL - 4, 8).fill({ color: UI_COLORS.panelLight, alpha: 0.75 });
+      }
+    }
+    grid.position.set(6, top + 6);
+    box.addChild(grid);
+    let weapons = 0;
+    let stones = 0;
+    let gear = 0;
+    let evolved: { name: string; tier: Tier } | null = null;
+    const evolvedIds = new Set(data.recipes.map((r) => r.result));
+    for (const it of preset.items) {
+      const def = data.items[it.defId];
+      if (!def) continue;
+      const tier = it.tier ?? 1;
+      if (def.kind === 'weapon') weapons++;
+      else if (def.kind === 'stone') stones++;
+      else gear++;
+      if (evolvedIds.has(def.id) && !evolved) evolved = { name: def.name, tier };
+      const v = new ItemView(def, tier, it.rot, PRESET_CELL);
+      v.position.set(it.x * PRESET_CELL + v.fw / 2, it.y * PRESET_CELL + v.fh / 2);
+      grid.addChild(v);
+    }
+    const infoX = gw + 12 + PRESET_GAP;
+    const infoW = Math.max(120, innerW - infoX);
+    const lines: Text[] = [
+      new Text({ text: T.menu.presetSummary(weapons, stones, gear), style: textStyle('heading', { fontSize: 28, align: 'left' }) }),
+    ];
+    if (evolved) {
+      const stars = evolved.tier > 1 ? ' ' + T.common.tier(evolved.tier) : '';
+      lines.push(
+        new Text({
+          text: T.menu.presetEvolved(evolved.name) + stars,
+          style: textStyle('body', { fontSize: 25, lineHeight: 34, fill: UI_COLORS.gold, wordWrap: true, wordWrapWidth: infoW, breakWords: true }),
+        }),
+      );
+    }
+    lines.push(
+      new Text({
+        text: T.menu.presetBagHint,
+        style: textStyle('body', { fontSize: 23, lineHeight: 32, fill: 0xfff1c9, wordWrap: true, wordWrapWidth: infoW, breakWords: true }),
+      }),
+    );
+    let ly = top + 4;
+    for (const t of lines) {
+      if (t.width > infoW) t.scale.set(infoW / t.width);
+      t.position.set(infoX, ly);
+      box.addChild(t);
+      ly += t.height + 14;
+    }
+    box.addChild(new Graphics().rect(0, Math.max(top + gh + 12, ly) - 1, 1, 1).fill({ color: 0x000000, alpha: 0 }));
+    return box;
   }
 
   private detailsMinHeight(d: Details): number {
@@ -471,7 +568,8 @@ export class CharacterSelectScene extends Scene {
     const c = this.chars[this.selected];
     if (!c) return;
     this.leaving = true;
-    game.startRun(c.id);
+    if (this.mode === 'bossTest') game.startBossTest(c.id);
+    else game.startRun(c.id);
   }
 
   private goBack(): void {

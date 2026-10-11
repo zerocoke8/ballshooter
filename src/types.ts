@@ -186,6 +186,173 @@ export interface StageDef {
   legend: Record<string, string>;
   /** 배경 에셋 키 */
   background: string;
+  /**
+   * 보스전 스테이지(보스 테스트): BossDef id (src/data/bosses.ts). 있으면 sim이 그 보스를 고정 위치에 세우고
+   * (대형 하강을 따르지 않는다 — 마지막 페이즈에서만 천천히 기어 내려옴), 행동 스케줄러·졸개 소환·위험 지역을 돌린다.
+   * rows는 비워 둔다(위에서 내려오는 대형은 보스와 겹친다). 승리 = 보스 처치(남은 졸개는 함께 터짐).
+   * 없으면 일반 스테이지 — 동작이 예전과 비트 단위로 같다.
+   */
+  boss?: string;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 보스 (src/data/bosses.ts) — 보스 행동은 데이터로 정하고 sim의 스케줄러가 시드 RNG로 고른다
+// ─────────────────────────────────────────────────────────────
+
+export type BossActionKind = 'volley' | 'ring' | 'slam' | 'marbles' | 'summon';
+
+/** 보스 탄 1발 (피해는 stage.dmgMul이 곱해진다 — EnemyAttack과 같은 규칙) */
+export interface BossShotSpec {
+  /** 적 탄 그림 키 (assets.json enemyShot) */
+  sprite: string;
+  radius: number;
+  /** px/s */
+  speed: number;
+  damage: number;
+}
+
+/**
+ * 블록 일제 사격: 입(보스 아래 가운데)에서 발사 순간의 플레이어를 노린 부채꼴.
+ * bursts번 burstInterval 간격으로. 두 번째부터는 reaim이면 다시 노리고, 아니면 첫 발의 방향 + k × burstShiftDeg
+ * (발 사이의 절반이면 앞 부채꼴의 틈을 메운다 — 부채꼴 밖으로 나가야 피한다. 따라오지 않아 구석에 몰리지 않는다)
+ */
+export interface BossVolleySpec extends BossShotSpec {
+  count: number;
+  spreadDeg: number;
+  bursts: number;
+  burstInterval: number;
+  reaim: boolean;
+  burstShiftDeg: number;
+}
+
+/**
+ * 팽이 고리: 입에서 아래쪽 arcDeg 부채꼴로 count발을 고르게 뿌리되, 이어진 gap발을 비워 '빈틈'을 만든다.
+ * 빈틈은 플레이어 쪽(발사 순간 플레이어 방향에서 gapShiftPx 안으로 어긋남)에 생긴다 — 늘 걸어서 닿을 수 있다.
+ * waves번 waveInterval 간격으로, 웨이브마다 rotateDeg씩 같은 방향으로 돌아간다(나선). 빈틈도 같이 돈다.
+ */
+export interface BossRingSpec extends BossShotSpec {
+  count: number;
+  arcDeg: number;
+  gap: number;
+  /** 빈틈 가운데가 플레이어 방향에서 어긋날 수 있는 최대 거리(플레이어 높이에서 px) */
+  gapShiftPx: number;
+  waves: number;
+  waveInterval: number;
+  rotateDeg: number;
+}
+
+/**
+ * 깜짝 상자 내려찍기: 플레이어가 있는 열(cols칸 폭)에 보스 아래 끝부터 바닥까지 위험 지역.
+ * 예고(warn초) → 발동(active초, 이때만 피해) → 끝. repeats번(매번 그때의 플레이어 열), 사이 repeatInterval초.
+ */
+export interface BossSlamSpec {
+  cols: 1 | 2;
+  warn: number;
+  active: number;
+  damage: number;
+  repeats: number;
+  repeatInterval: number;
+  /** 렌더용 그림 키 (내려찍는 깜짝 상자) */
+  sprite: string;
+}
+
+/**
+ * 구슬 비: 필드 아래쪽에 떨어질 자리(그림자, 반경 radius)를 예고(warn초) → 떨어지는 순간(active초)만 피해.
+ * count개를 stagger초 간격으로, 처음 aimed개는 그 순간 플레이어 자리, 나머지는 아래쪽(yMinFrac × FIELD_H 아래) 무작위 —
+ * 다른 구슬과 중심 사이 spacing px 이상(빠져나갈 틈 보장).
+ */
+export interface BossMarblesSpec {
+  count: number;
+  aimed: number;
+  radius: number;
+  warn: number;
+  active: number;
+  damage: number;
+  stagger: number;
+  spacing: number;
+  yMinFrac: number;
+  /** 렌더용 그림 키 (떨어지는 구슬) */
+  sprite: string;
+}
+
+/** 졸개 소환: 입을 벌려 지금 페이즈의 졸개 풀에서 count마리를 보스 바로 아래 칸에 뱉는다 (살아있는 졸개 상한 안에서) */
+export interface BossSummonSpec {
+  count: number;
+}
+
+interface BossActionBase {
+  /** 행동 id (데이터 안에서 고유 — 이벤트·연출용) */
+  id: string;
+  /** 예비 동작(초): 'bossAction' 이벤트 후 이만큼 뒤에 실행 — 화면이 미리 보여 줄 시간 */
+  windup: number;
+  /** 같은 행동을 다시 고를 수 있기까지(초, 행동 시작 기준). 페이즈 cooldownMul이 곱해진다 */
+  cooldown: number;
+  /** 마지막 발사·위험 지역이 끝난 뒤 다음 행동까지 더 쉬는 시간(초, 페이즈 gap에 더해짐). 없으면 0 */
+  recover?: number;
+  /** 페이즈별 고를 가중치 (길이 = 페이즈 수, 0 = 그 페이즈에서 안 씀) */
+  weights: number[];
+}
+
+export type BossActionDef = BossActionBase &
+  (
+    | { kind: 'volley'; volley: BossVolleySpec }
+    | { kind: 'ring'; ring: BossRingSpec }
+    | { kind: 'slam'; slam: BossSlamSpec }
+    | { kind: 'marbles'; marbles: BossMarblesSpec }
+    | { kind: 'summon'; summon: BossSummonSpec }
+  );
+
+export interface BossMinionWeight {
+  /** EnemyDef id (1×1, 보스 아님) */
+  enemy: string;
+  weight: number;
+}
+
+export interface BossPhaseDef {
+  /** 이 페이즈가 시작되는 보스 HP 비율 (첫 페이즈 1, 내림차순). 넘는 피해는 문턱에서 멈춘다 — 페이즈를 건너뛰지 않음 */
+  hpFrac: number;
+  /** 페이즈 시작 포효(초): 무적 + 행동 정지 (첫 페이즈는 등장 포효) */
+  roar: number;
+  /** 행동 사이 쉬는 시간(초) */
+  gap: number;
+  /** 행동 쿨타임 배수 */
+  cooldownMul: number;
+  /** 페이즈 시작(포효) 때 바로 소환하는 졸개 수 (상한 안에서) */
+  enterSummon: number;
+  /** 소환 졸개 풀 (가중치) */
+  minions: BossMinionWeight[];
+  /** 살아있는 졸개 상한 */
+  minionCap: number;
+  /** 보스가 아래로 기어 내려오는 속도 px/s (0 = 제자리). 스테이지 하강 속도보다 느려야 한다(졸개와 겹치지 않게) */
+  creep: number;
+}
+
+export interface BossDef {
+  id: string;
+  /** EnemyDef id (boss: true) — 크기·체력·그림 */
+  enemy: string;
+  /** 고정 위치: 보스 왼쪽 열 / 칸 위끝 y(px). 충돌 박스는 칸에서 ENEMY_INSET 안쪽 — 위끝과 천장 사이 틈으로 공이 넘어가 윗면을 친다 */
+  anchorCol: number;
+  anchorY: number;
+  /** 등장: 화면 위에서 고정 위치까지 내려오는 속도 px/s */
+  enterSpeed: number;
+  phases: BossPhaseDef[];
+  actions: BossActionDef[];
+}
+
+/** 보스 테스트 캐릭터별 시작 가방 (이미 어느 정도 키운 빌드) */
+export interface BossTestPreset {
+  cols: number;
+  rows: number;
+  /** 가방 좌표 (회전 적용 후 좌상단) */
+  items: StartItem[];
+}
+
+export interface BossTestDef {
+  /** 보스 테스트 스테이지 (StageDef.boss가 있는 보스전) — data.stages에는 없다 */
+  stage: StageDef;
+  /** 캐릭터 id → 프리셋 */
+  presets: Record<string, BossTestPreset>;
 }
 
 export interface StartItem {
@@ -263,6 +430,10 @@ export interface GameData {
   enemies: Record<string, EnemyDef>;
   stages: StageDef[];
   characters: Record<string, CharacterDef>;
+  /** 보스 행동 데이터 (StageDef.boss가 가리킨다) */
+  bosses: Record<string, BossDef>;
+  /** 보스 테스트 모드: 스테이지 + 캐릭터별 프리셋 가방 */
+  bossTest: BossTestDef;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -450,11 +621,90 @@ export type CombatEvent =
   | { type: 'chain'; fromX: number; fromY: number; toX: number; toY: number }
   | { type: 'split'; x: number; y: number; count: number }
   | { type: 'bounce'; x: number; y: number; wall: boolean }
-  | { type: 'enemyShoot'; enemyId: number; x: number; y: number }
-  /** 적 탄에 맞음 (적 몸에 닿는 것은 피해가 아니라 즉시 패배 — 'lost' reason 'contact') */
-  | { type: 'playerHit'; damage: number; x: number; y: number; source: 'shot' }
+  /** sprite = 보스 행동 탄의 그림 키 (보스는 EnemyDef.attack이 없다 — 효과음 고르기용). 일반 적 탄에는 없다 */
+  | { type: 'enemyShoot'; enemyId: number; x: number; y: number; sprite?: string }
+  /**
+   * 적 탄('shot') 또는 보스 위험 지역('hazard' — 내려찍기·구슬)에 맞음.
+   * (적 몸에 닿는 것은 피해가 아니라 즉시 패배 — 'lost' reason 'contact')
+   */
+  | { type: 'playerHit'; damage: number; x: number; y: number; source: 'shot' | 'hazard' }
+  /**
+   * 보스 페이즈 시작: phase 0 = 등장 끝(고정 위치 도착), 1.. = HP 문턱을 넘음. roar초 동안 무적·행동 정지(포효 — 화면 번쩍임),
+   * 그 순간 졸개 소환('summon' 이벤트들이 바로 뒤따름).
+   */
+  | { type: 'bossPhase'; enemyId: number; phase: number; roar: number }
+  /** 보스 행동 시작(예비 동작): windup초 뒤 실행. x, y = 입(보스 아래 가운데) */
+  | { type: 'bossAction'; enemyId: number; action: BossActionKind; id: string; windup: number; x: number; y: number }
+  /**
+   * 졸개 소환: 입(fromX, fromY)에서 뱉어 칸(x, y = 새 적 충돌 박스 중심)에 내려앉는다. 새 적은 이미 sim.enemies에 있다(공은 맞는다).
+   * 내려앉기까지(SUMMON_LAND_TIME) 플레이어 몸에 닿아도 접촉 패배가 아니다 — 렌더는 그동안 입에서 칸으로 날아가는 연출
+   */
+  | { type: 'summon'; enemyId: number; defId: string; fromX: number; fromY: number; x: number; y: number }
+  /** 위험 지역 예고 시작 (sim.hazards에 새로 생김). x, y = 중심, warn = 발동까지(초) */
+  | { type: 'hazardWarn'; hazardId: number; kind: HazardKind; x: number; y: number; warn: number }
+  /** 위험 지역 발동 — 이제부터 activeTime초 동안 피해. x, y = 중심, hitPlayer = 이 순간 플레이어가 맞았나 */
+  | { type: 'hazardImpact'; hazardId: number; kind: HazardKind; x: number; y: number; hitPlayer: boolean }
   | { type: 'won' }
   | { type: 'lost'; reason: LostReason };
+
+/** 보스 위험 지역 종류: 깜짝 상자 내려찍기(열 사각형) / 구슬 비(원) */
+export type HazardKind = 'slam' | 'marble';
+
+/**
+ * 위험 지역 (보스 행동이 만든다, sim.hazards). 예고(warn) → 발동(active, 이때만 피해) → 끝(done — 스텝 끝에 목록에서 빠짐).
+ * 위치는 언제나 바운딩 박스 (x, y) 좌상단 + w × h. shape 'circle'은 그 안에 내접한 원(w = h = 지름).
+ * 피해: 발동 중 플레이어 피격 원과 겹치고 무적이 아니면 한 번 (무적 시간 적용, 'playerHit' source 'hazard').
+ */
+export interface HazardEntity {
+  id: number;
+  kind: HazardKind;
+  shape: 'rect' | 'circle';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  state: 'warn' | 'active' | 'done';
+  /** 지금 상태에 남은 시간(초) */
+  timer: number;
+  /** 예고·발동 전체 길이(초) — 렌더 진행도용 */
+  warnTime: number;
+  activeTime: number;
+  /** stage.dmgMul 곱한 뒤 */
+  damage: number;
+  /** 렌더용 그림 키 (구슬 shot_marble, 내려찍는 깜짝 상자 enemy_jack 등) */
+  sprite: string;
+  /** 이번 발동에서 이미 플레이어를 때렸다 (한 번만) */
+  hit: boolean;
+}
+
+export type BossMode = 'enter' | 'roar' | 'idle' | 'windup' | 'act' | 'dead';
+
+/**
+ * 보스전 상태 (sim.boss — 보스전이 아니면 null). 렌더·HUD용, sim이 매 스텝 제자리에서 갱신한다(새로 만들지 않음).
+ * mode: enter 등장(위에서 내려오는 중) / roar 포효(무적·행동 정지) / idle 쉬는 중 / windup 예비 동작 / act 행동 중 / dead 처치됨
+ */
+export interface BossState {
+  /** 보스 적 id (sim.enemies 안 — 죽으면 빠진다) */
+  enemyId: number;
+  /** BossDef id */
+  defId: string;
+  /** 지금 페이즈(0부터) / 페이즈 수 */
+  phase: number;
+  phases: number;
+  mode: BossMode;
+  /** windup·act일 때 지금 행동, 아니면 null */
+  action: BossActionKind | null;
+  actionId: string | null;
+  /** roar·windup에 남은 시간(초), 다른 모드는 0 */
+  modeTime: number;
+  /** 포효 중 무적 (피해·상태이상 무시) */
+  invulnerable: boolean;
+  /** 살아있는 졸개 수 / 지금 페이즈 상한 */
+  minions: number;
+  minionCap: number;
+  /** 보스 HP 비율 0..1 */
+  hpFrac: number;
+}
 
 /** 패배 사유: HP 0 / 적이 방어선(필드 바닥)에 닿음 / 플레이어가 살아있는 적 몸에 닿음(무적 시간과 무관하게 즉시) */
 export type LostReason = 'hp' | 'breach' | 'contact';
@@ -501,7 +751,15 @@ export interface RunState {
   /** 전투 시드 생성용 */
   seed: number;
   stats: RunStats;
+  /**
+   * 런 종류. 없으면 'normal'(일반 런 — newRun은 이 필드를 쓰지 않아 세이브 모양이 예전과 같다).
+   * 'bossTest' = 보스 테스트(newBossTestRun): 보스전 한 판, 저장·삭제하지 않는다(saveRun/clearRun 무시, loadRun이 거름) —
+   * 일반 런 세이브를 절대 건드리지 않는다.
+   */
+  mode?: RunMode;
 }
+
+export type RunMode = 'normal' | 'bossTest';
 
 /** 적 처치 보상 처리 결과 */
 export interface KillReward {

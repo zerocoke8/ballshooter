@@ -17,6 +17,45 @@ export const menu = {
   continueRun: '이어하기',
   confirmNewRun: '진행 중인 게임이 사라져요.\n새로 시작할까요?',
   version: (v: string): string => `v${v} 프로토타입`,
+  /** 타이틀의 보스 테스트 버튼 (+ 시험용 표시 딱지) */
+  bossTest: '보스 테스트',
+  testTag: 'TEST',
+
+  // ── 보스 테스트: 캐릭터 선택 ──────────────────────────────
+  bossTestHeader: '보스 테스트',
+  bossTestSub: '키운 장비로 보스와 한 판! (저장 안 됨)',
+  bossTestStart: '보스전!',
+  presetItems: '준비된 장비',
+  /** 프리셋 가방 요약 */
+  presetSummary: (weapons: number, stones: number, gear: number): string => `무기 ${weapons} · 강화석 ${stones} · 장비 ${gear}`,
+  /** 두 줄: 이름이 길어도 ★가 혼자 다음 줄로 떨어지지 않게 */
+  presetEvolved: (name: string): string => `진화 무기\n${name}`,
+  presetBagHint: '전투 중 가방을 열어 배치를 바꿀 수 있어요',
+
+  // ── 보스 테스트: 결과 ─────────────────────────────────────
+  bossWin: '격파!',
+  bossLose: '패배…',
+  bossWinDesc: (boss: string): string => `${josa(boss, '을', '를')} 물리쳤어요!`,
+  bossLoseDesc: (hpLeftPct: number): string => `보스 HP ${hpLeftPct}% 남음 — 다시 도전해 봐요!`,
+  clearTime: '클리어 시간',
+  survivedTime: '버틴 시간',
+  /** 0.1초 단위 시간 (예: 523 → '52.3초', 754 → '1분 15.4초') */
+  tenths: (t: number): string => {
+    const s = Math.max(0, t) / 10;
+    const m = Math.floor(s / 60);
+    const rest = (s - m * 60).toFixed(1);
+    return m > 0 ? `${m}분 ${rest}초` : `${rest}초`;
+  },
+  hpLeft: '남은 HP',
+  hpOf: (cur: number, max: number): string => `${cur} / ${max}`,
+  bossDamage: '보스에게 준 피해',
+  damageOf: (dmg: number, pct: number): string => `${dmg.toLocaleString('ko-KR')} (${pct}%)`,
+  backAttacks: '백어택 (보스 윗면)',
+  minionKills: '처치한 졸개',
+  phaseReached: '도달 페이즈',
+  phaseOf: (n: number, total: number): string => `${n} / ${total}`,
+  bossRetry: '다시 도전',
+  changeCharacter: '캐릭터 변경',
 
   // ── 캐릭터 선택 ───────────────────────────────────────────
   selectCharacter: '누구랑 갈까?',

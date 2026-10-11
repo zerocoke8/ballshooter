@@ -19,7 +19,10 @@
 //      보관함 → 가방 빈 칸으로 드래그 → run.bag 변경, 유자 선택 후 '★ 합성' 탭 → ★2 유자 1개,
 //      '계속하기' 탭 → 오버레이 닫힘 + 전투 무기 목록 갱신
 //   4. 상점: 카드 탭 → 툴팁 미리보기, 가방 아이템 탭 → 툴팁, 보관함 → 가방 드래그 → run.bag 변경
-//   5. 접촉 = 즉시 패배: 다음 전투에서 드래그로 캐릭터를 적 몸에 밀어 넣음 → lostReason 'contact' + 패배 배너 문구 → 결과 화면
+//   5. 보스 테스트 (일반 런 세이브가 있는 채로, 실제 탭): 타이틀 '보스 테스트' → 펭구 카드 → '보스전!' → 보스 착지 →
+//      HUD 가방 → '그만두기' → 타이틀 (세이브 그대로) → 다시 보스 테스트 → 승리 → 결과 '다시 도전' → 같은 캐릭터 → 패배 →
+//      '캐릭터 변경' → 보스 테스트 선택 → '뒤로' → 타이틀: 일반 세이브가 한 글자도 안 바뀜 + '이어하기' → 상점
+//   6. 접촉 = 즉시 패배: 다음 전투에서 드래그로 캐릭터를 적 몸에 밀어 넣음 → lostReason 'contact' + 패배 배너 문구 → 결과 화면
 // 스크린샷: tools/.out/interaction/NN-name.png. stdout 마지막에 JSON 요약. 실패하면 exit 1.
 // 드래그는 '닫힌 루프': 손가락을 목표 칸 쪽으로 옮긴 뒤 BagView가 계산한 목표 칸(drag.tx/ty)을 읽어
 // 어긋나면 손가락을 보정하고 놓는다 (터치 고스트 띄움 거리 같은 내부 상수를 하드코딩하지 않기 위해).
@@ -569,6 +572,115 @@ async function contactDeathCheck(crushedText) {
   await shot('contact-result');
 }
 
+// ── 보스 테스트 ──────────────────────────────────────────────
+
+async function savedRun() {
+  return page.evaluate(() => localStorage.getItem('ballshooter.run'));
+}
+
+async function tapBagButton() {
+  const p = await page.evaluate(() => {
+    const b = window.__game.game.scenes.current.hud.bag.getBounds();
+    return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+  });
+  await page.touchscreen.tap(p.x, p.y);
+}
+
+/** 타이틀 → (탭) 보스 테스트 → (탭) 캐릭터 카드 → (탭) 보스전! → 보스 착지까지. 들어간 런 요약 */
+async function enterBossTest(T, cardName) {
+  await waitFor(() => window.__game.scene() === 'TitleScene', null, 8000, 'TitleScene');
+  await sleep(2600);
+  await tapText(T.bossTest, 'title boss test');
+  await waitFor(
+    () => window.__game.scene() === 'CharacterSelectScene' && window.__game.game.scenes.current.mode === 'bossTest',
+    null,
+    8000,
+    'boss test character select',
+  );
+  await sleep(1200);
+  await tapText(cardName, 'boss character card');
+  await sleep(600);
+  await tapText(T.bossTestStart, 'boss start');
+  await waitFor(() => window.__game.game.scenes.current?.debugState?.()?.phase === 'fight', null, 10000, 'boss fight');
+  await waitFor(
+    () => {
+      const st = window.__game.game.scenes.current?.debugState?.();
+      return !!st?.boss && st.boss.mode !== 'enter';
+    },
+    null,
+    10000,
+    'boss landed',
+  );
+  return page.evaluate(() => {
+    const r = window.__game.game.run;
+    return r ? { mode: r.mode ?? null, characterId: r.characterId, cols: r.bag.cols, rows: r.bag.rows, items: r.bag.items.length } : null;
+  });
+}
+
+async function bossTestChecks(T, names) {
+  const saveBefore = await savedRun();
+  check('boss: a normal run save exists before the boss test', !!saveBefore, {});
+  await page.evaluate(() => window.__game.game.toTitle());
+
+  // 그만두기 (전투 중 가방 → '그만두기')
+  const run1 = await enterBossTest(T, names.penguin);
+  check('boss: title → card → start enters a boss-test fight with the 6×5 preset bag', run1?.mode === 'bossTest' && run1.characterId === 'penguin' && run1.cols === 6 && run1.rows === 5 && run1.items >= 8, { run: run1 });
+  await sleep(600);
+  await shot('boss-landed');
+  await tapBagButton();
+  await waitFor(() => window.__game.game.scenes.current.debugState().bagOpen && !!window.__game.game.scenes.current.overlay, null, 4000, 'boss bag overlay');
+  await sleep(500);
+  await shot('boss-bag-quit');
+  await tapText(T.quitBossTest, 'quit boss test', 's.overlay');
+  await waitFor(() => window.__game.scene() === 'TitleScene', null, 8000, 'TitleScene after quitting the boss test');
+  const afterQuit = { save: (await savedRun()) === saveBefore, hasSave: await page.evaluate(() => window.__game.game.hasSave()), run: await page.evaluate(() => window.__game.game.run) };
+  check('boss: quitting mid-fight (bag → quit) returns to the title and keeps the normal save', afterQuit.save && afterQuit.hasSave && afterQuit.run === null, {
+    saveUnchanged: afterQuit.save,
+    hasSave: afterQuit.hasSave,
+    runCleared: afterQuit.run === null,
+  });
+
+  // 승리 → 다시 도전 → 패배 → 캐릭터 변경 → 뒤로
+  await enterBossTest(T, names.penguin);
+  await page.evaluate(() => window.__game.debug.winStage());
+  await waitFor(() => window.__game.scene() === 'BossResultScene', null, 12000, 'BossResultScene (win)');
+  await sleep(1500);
+  const win = await page.evaluate(() => window.__game.game.scenes.current.result);
+  check('boss: winning shows the boss result (won, full boss damage)', win?.won === true && win.bossDamage === win.bossMaxHp && win.characterId === 'penguin', { result: win });
+  await shot('boss-result-win');
+  await tapText(T.bossRetry, 'boss retry');
+  await waitFor(() => window.__game.game.scenes.current?.debugState?.()?.phase === 'fight', null, 10000, 'boss retry fight');
+  const retryRun = await page.evaluate(() => ({ mode: window.__game.game.run?.mode ?? null, characterId: window.__game.game.run?.characterId }));
+  check('boss: 다시 도전 restarts the boss test with the same character', retryRun.mode === 'bossTest' && retryRun.characterId === 'penguin', { run: retryRun });
+  await page.evaluate(() => window.__game.debug.loseStage());
+  await waitFor(() => window.__game.scene() === 'BossResultScene', null, 12000, 'BossResultScene (lose)');
+  await sleep(1500);
+  const lose = await page.evaluate(() => window.__game.game.scenes.current.result);
+  check('boss: losing shows the boss result (lost)', lose?.won === false, { result: lose });
+  await shot('boss-result-lose');
+  await tapText(T.changeCharacter, 'boss change character');
+  await waitFor(
+    () => window.__game.scene() === 'CharacterSelectScene' && window.__game.game.scenes.current.mode === 'bossTest',
+    null,
+    8000,
+    'boss select after change character',
+  );
+  await sleep(1000);
+  await tapText(T.back, 'boss select back');
+  await waitFor(() => window.__game.scene() === 'TitleScene', null, 8000, 'TitleScene after boss select back');
+  const saveAfter = await savedRun();
+  const hasSave = await page.evaluate(() => window.__game.game.hasSave());
+  check('boss: the normal run save is byte-identical after the boss test', saveAfter === saveBefore && hasSave, { saveUnchanged: saveAfter === saveBefore, hasSave });
+
+  // 이어하기 → 상점 (일반 런)
+  await sleep(2600);
+  await tapText(T.continueRun, 'continue after boss test');
+  await waitFor(() => window.__game.scene() === 'ShopScene', null, 8000, 'ShopScene after continue');
+  await sleep(800);
+  const cont = await page.evaluate(() => ({ scene: window.__game.scene(), mode: window.__game.game.run?.mode ?? 'normal', characterId: window.__game.game.run?.characterId }));
+  check('boss: 이어하기 still resumes the normal run in the shop', cont.scene === 'ShopScene' && cont.mode === 'normal' && cont.characterId === 'capybara', cont);
+}
+
 async function combatAimChecks() {
   await sleep(300);
 
@@ -787,11 +899,24 @@ async function run() {
         resume: T.combat.resume,
         mergeTier: T.bag.mergeTier,
         crushed: T.combat.crushed,
+        continueRun: T.menu.continueRun,
+        bossTest: T.menu.bossTest,
+        bossTestStart: T.menu.bossTestStart,
+        bossRetry: T.menu.bossRetry,
+        changeCharacter: T.menu.changeCharacter,
+        quitBossTest: T.combat.quitBossTest,
+        back: T.common.back,
       };
     });
     const names = await page.evaluate(() => {
       const d = window.__game.game.data;
-      return { capybara: d.characters.capybara.name, yuzu: d.items.w_yuzu.name, fire: d.items.s_fire.name, sneakers: d.items.g_sneakers.name };
+      return {
+        capybara: d.characters.capybara.name,
+        penguin: d.characters.penguin.name,
+        yuzu: d.items.w_yuzu.name,
+        fire: d.items.s_fire.name,
+        sneakers: d.items.g_sneakers.name,
+      };
     });
 
     // 1) 메뉴 → 카피로 시작 (실제 탭)
@@ -991,7 +1116,10 @@ async function run() {
     check('shop: bag change is saved', !!saved && saved.includes(snUid), { savedUids: saved });
     await shot('shop-after-drag');
 
-    // 5) 접촉 = 즉시 패배 (마지막: 런이 끝난다)
+    // 5) 보스 테스트 (일반 세이브가 있는 채로) — 끝나면 '이어하기'로 상점에 돌아와 있다
+    await bossTestChecks(T, names);
+
+    // 6) 접촉 = 즉시 패배 (마지막: 런이 끝난다)
     await contactDeathCheck(T.crushed);
   } finally {
     await browser.close().catch(() => {});

@@ -39,6 +39,13 @@ const VERSION_COLOR = 0x6b4430;
 const SETTINGS_W = 150;
 const SETTINGS_H = 72;
 const SETTINGS_MARGIN = 18;
+/** 보스 테스트 버튼: 주 버튼들 아래 작은 보조 버튼 + 'TEST' 딱지 (시험용 모드라는 표시) */
+const BOSS_BTN_W = 320;
+const BOSS_BTN_H = 84;
+const BOSS_BTN_GAP = 30;
+const BOSS_BTN_COLOR = 0x7a4fc4;
+const TEST_TAG_FILL = 0xffd23f;
+const TEST_TAG_TEXT = 0x3a2400;
 
 interface Letter {
   /** layout이 위치를 정하는 바깥 컨테이너 */
@@ -58,6 +65,8 @@ export class TitleScene extends Scene {
   private readonly subtitle = new Container();
   private readonly versionText: Text;
   private readonly buttons: { holder: Container; primary: boolean }[] = [];
+  /** 보스 테스트 (주 버튼 목록과 따로 — 레이아웃·Enter 키에서 빠진다) */
+  private readonly bossBtn: Container;
   private readonly hasSave: boolean;
   /** onEnter에서 만든다 (진입 전에 다른 goto로 버려진 씬이 window 키 리스너를 남기지 않게) */
   private keyboard: Keyboard | null = null;
@@ -84,6 +93,9 @@ export class TitleScene extends Scene {
     } else {
       this.addButton(T.menu.newRun, COLOR_PRIMARY, true, () => this.startNewRun());
     }
+
+    this.bossBtn = this.buildBossButton();
+    this.addChild(this.bossBtn);
 
     this.versionText = new Text({
       text: T.menu.version(APP_VERSION),
@@ -124,6 +136,7 @@ export class TitleScene extends Scene {
       killTweensOf(l.text.scale);
     }
     for (const b of this.buttons) killTweensOf(b.holder.scale);
+    killTweensOf(this.bossBtn.scale);
     killTweensOf(this.subtitle);
     killTweensOf(this.subtitle.scale);
     this.dialog?.dispose();
@@ -154,6 +167,9 @@ export class TitleScene extends Scene {
       b.holder.position.set(w / 2, y);
       y += BTN_H + BUTTON_GAP;
     }
+    // 보스 테스트: 마지막 주 버튼 아래 (조금 더 띄워서 주 흐름과 구분)
+    y += -BTN_H / 2 - BUTTON_GAP + BOSS_BTN_GAP + BOSS_BTN_H / 2;
+    this.bossBtn.position.set(w / 2, y);
 
     this.versionText.position.set(w / 2, vp.height - vp.safeBottom - 14);
     this.settingsBtn.position.set(w - SETTINGS_MARGIN - SETTINGS_W, vp.safeTop + SETTINGS_MARGIN);
@@ -271,6 +287,7 @@ export class TitleScene extends Scene {
     this.subtitle.alpha = 0;
     this.subtitle.scale.set(0.4);
     for (const b of this.buttons) b.holder.scale.set(0);
+    this.bossBtn.scale.set(0);
 
     const lettersEnd = 0.06 * this.letters.length + 0.35;
     await tween(this.subtitle, { alpha: 0 }, lettersEnd);
@@ -284,6 +301,9 @@ export class TitleScene extends Scene {
       if (this.destroyed) return;
       void tween(h.scale, { x: 1, y: 1 }, 0.45, 'outBack');
     }
+    await tween(this.bossBtn.scale, { x: 0 }, 0.08);
+    if (this.destroyed) return;
+    void tween(this.bossBtn.scale, { x: 1, y: 1 }, 0.4, 'outBack');
     await tween(this.subtitle, { alpha: 1 }, 0.45);
     if (this.destroyed) return;
     this.introDone = true;
@@ -309,6 +329,42 @@ export class TitleScene extends Scene {
     if (this.leaving) return;
     this.leaving = true;
     game.toCharacterSelect();
+  }
+
+  private startBossTest(): void {
+    if (this.leaving || this.dialog || this.settingsDialog) return;
+    this.leaving = true;
+    game.toCharacterSelect('bossTest');
+  }
+
+  /** 보조 버튼(보라) + 오른쪽 위 노란 'TEST' 딱지 — 일반 흐름과 다른 시험용 모드라는 표시 */
+  private buildBossButton(): Container {
+    const btn = new Button({
+      label: T.menu.bossTest,
+      width: BOSS_BTN_W,
+      height: BOSS_BTN_H,
+      color: BOSS_BTN_COLOR,
+      fontSize: 34,
+      onTap: () => this.startBossTest(),
+    });
+    const holder = centeredButton(btn, BOSS_BTN_W, BOSS_BTN_H);
+    const label = new Text({ text: T.menu.testTag, style: textStyle('small', { fontSize: 18, fill: TEST_TAG_TEXT, letterSpacing: 1 }) });
+    label.anchor.set(0.5);
+    const tw = label.width + 18;
+    const th = 26;
+    const tag = new Container();
+    const bg = new Graphics()
+      .roundRect(-tw / 2, -th / 2 + 3, tw, th, 8)
+      .fill({ color: 0x000000, alpha: 0.25 })
+      .roundRect(-tw / 2, -th / 2, tw, th, 8)
+      .fill(TEST_TAG_FILL)
+      .stroke({ width: 3, color: TEST_TAG_TEXT });
+    tag.addChild(bg, label);
+    tag.position.set(BOSS_BTN_W / 2 - tw / 2 + 6, -BOSS_BTN_H / 2 + 2);
+    tag.rotation = 0.12;
+    tag.eventMode = 'none';
+    holder.addChild(tag);
+    return holder;
   }
 
   private requestNewRun(): void {

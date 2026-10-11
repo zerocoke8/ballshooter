@@ -14,6 +14,12 @@
   "boss_kill": [
     "boss_kill_1.mp3"
   ],
+  "boss_roar": [
+    "boss_roar_1.mp3"
+  ],
+  "boss_summon": [
+    "boss_summon_1.mp3"
+  ],
   "bounce_wall": [
     "bounce_wall_1.mp3",
     "bounce_wall_2.mp3"
@@ -118,6 +124,9 @@
     "kill_pop_2.mp3",
     "kill_pop_3.mp3"
   ],
+  "marble_impact": [
+    "marble_impact_1.mp3"
+  ],
   "merge_evolve": [
     "merge_evolve_1.mp3"
   ],
@@ -127,6 +136,12 @@
   "player_hurt": [
     "player_hurt_1.mp3",
     "player_hurt_2.mp3"
+  ],
+  "slam_impact": [
+    "slam_impact_1.mp3"
+  ],
+  "slam_warn": [
+    "slam_warn_1.mp3"
   ],
   "split": [
     "split_1.mp3"

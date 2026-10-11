@@ -73,6 +73,49 @@ export function newRun(data: GameData, characterId: string, seed: number): RunSt
   return run;
 }
 
+/**
+ * 보스 테스트 런: 캐릭터별 프리셋 가방(data.bossTest.presets — 이미 키운 빌드)으로 풀 HP, mode 'bossTest'.
+ * 보스전 한 판용 — 저장되지 않는다(saveRun/clearRun 무시, loadRun이 거름). 일반 런 세이브는 절대 건드리지 않는다.
+ */
+export function newBossTestRun(data: GameData, characterId: string, seed: number): RunState {
+  const character = data.characters[characterId];
+  if (!character) throw new Error(`run: unknown character '${characterId}'`);
+  const preset = data.bossTest.presets[characterId];
+  if (!preset) throw new Error(`run: no boss test preset for '${characterId}'`);
+
+  const bag = createBag(preset.cols, preset.rows);
+  for (const si of preset.items) {
+    const placed = addNewToBag(bag, data.items, si.defId, si.tier ?? 1, si.x, si.y, si.rot);
+    if (!placed) throw new Error(`run: cannot place boss test preset item '${si.defId}' for '${characterId}'`);
+  }
+
+  const run: RunState = {
+    version: SAVE_VERSION,
+    characterId,
+    stageIndex: 0,
+    resumeAt: 'combat',
+    gold: 0,
+    hp: 0,
+    bag,
+    shop: {
+      slots: new Array<null>(SHOP_SLOTS).fill(null),
+      rerollCost: SHOP_REROLL_BASE,
+      healBought: false,
+    },
+    rngState: mix32((seed ^ 0x5bd1e995) >>> 0),
+    seed: seed >>> 0,
+    stats: { kills: 0, goldEarned: 0, stagesCleared: 0 },
+    mode: 'bossTest',
+  };
+  run.hp = runPlayerStats(data, run).maxHp;
+  return run;
+}
+
+/** 보스 테스트 런인가 (저장·삭제·이어하기 대상이 아니다) */
+export function isBossTestRun(run: RunState | null | undefined): boolean {
+  return !!run && run.mode === 'bossTest';
+}
+
 export function runCharacter(data: GameData, run: RunState): CharacterDef {
   const character = data.characters[run.characterId];
   if (!character) throw new Error(`run: unknown character '${run.characterId}'`);
@@ -87,8 +130,9 @@ export function runLoadout(data: GameData, run: RunState): WeaponLoadout[] {
   return computeLoadout(run.bag, data.items, runPlayerStats(data, run));
 }
 
-/** 진행 중인 스테이지. 런이 끝났으면(범위 밖) 마지막 스테이지 */
+/** 진행 중인 스테이지. 런이 끝났으면(범위 밖) 마지막 스테이지. 보스 테스트 런은 늘 보스 테스트 스테이지 */
 export function currentStage(data: GameData, run: RunState): StageDef {
+  if (run.mode === 'bossTest') return data.bossTest.stage;
   const { stages } = data;
   if (stages.length === 0) throw new Error('run: no stages');
   return stages[Math.max(0, Math.min(run.stageIndex, stages.length - 1))];
@@ -98,7 +142,9 @@ export function combatSeed(run: RunState): number {
   return mix32((run.seed ^ Math.imul(run.stageIndex + 1, 0x9e3779b9)) >>> 0);
 }
 
+/** 일반 런: 마지막 스테이지까지 클리어. 보스 테스트 런: 보스를 한 번 잡음(completeStage) */
 export function isRunComplete(data: GameData, run: RunState): boolean {
+  if (run.mode === 'bossTest') return run.stats.stagesCleared > 0;
   return run.stageIndex >= data.stages.length;
 }
 
@@ -108,7 +154,8 @@ export function isRunComplete(data: GameData, run: RunState): boolean {
  */
 export function isRunValid(data: GameData, run: RunState): boolean {
   if (!data.characters[run.characterId]) return false;
-  if (run.stageIndex >= data.stages.length) return false;
+  // 일반 런: stageIndex < 스테이지 수 / 보스 테스트 런: 아직 보스를 안 잡음 (프리셋 가방도 아래 검사를 그대로 통과해야 한다)
+  if (isRunComplete(data, run)) return false;
   const { bag } = run;
   for (const it of bag.items) {
     if (!data.items[it.defId]) return false;
@@ -182,6 +229,14 @@ export function completeStage(
   hpAfterCombat: number,
 ): { clearGold: number; healed: number; finished: boolean } {
   if (isRunComplete(data, run)) return { clearGold: 0, healed: 0, finished: true };
+
+  // 보스 테스트: 한 판으로 끝 — 골드·회복·상점 없이 HP와 클리어 수만 기록
+  if (run.mode === 'bossTest') {
+    const hpIn = Number.isNaN(hpAfterCombat) ? run.hp : hpAfterCombat;
+    run.hp = Math.min(runPlayerStats(data, run).maxHp, Math.max(0, hpIn));
+    run.stats.stagesCleared++;
+    return { clearGold: 0, healed: 0, finished: true };
+  }
 
   const stage = currentStage(data, run);
   const player = runPlayerStats(data, run);
@@ -274,6 +329,7 @@ function isRunShape(v: unknown): v is RunState {
   if (!isRecord(v) || v.version !== SAVE_VERSION) return false;
   const { stats } = v;
   return (
+    (v.mode === undefined || v.mode === 'normal' || v.mode === 'bossTest') &&
     typeof v.characterId === 'string' &&
     isInt(v.stageIndex, 0) &&
     (v.resumeAt === 'combat' || v.resumeAt === 'shop') &&
@@ -292,7 +348,9 @@ function isRunShape(v: unknown): v is RunState {
   );
 }
 
+/** 보스 테스트 런은 저장하지 않는다 (일반 런 세이브를 덮어쓰지 않게) — 아무것도 하지 않고 돌아간다 */
 export function saveRun(run: RunState): void {
+  if (run.mode === 'bossTest') return;
   try {
     storage()?.setItem(SAVE_KEY, JSON.stringify(run));
   } catch {
@@ -300,20 +358,28 @@ export function saveRun(run: RunState): void {
   }
 }
 
-/** data를 넘기면 isRunValid까지 확인한다 (게임에서는 항상 넘길 것) */
+/**
+ * data를 넘기면 isRunValid까지 확인한다 (게임에서는 항상 넘길 것).
+ * 보스 테스트 런은 이어하기 대상이 아니다 — 어쩌다 저장돼 있어도 null (지우지도 않는다).
+ */
 export function loadRun(data?: GameData): RunState | null {
   try {
     const raw = storage()?.getItem(SAVE_KEY);
     if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
-    if (!isRunShape(parsed)) return null;
+    if (!isRunShape(parsed) || parsed.mode === 'bossTest') return null;
     return data && !isRunValid(data, parsed) ? null : parsed;
   } catch {
     return null;
   }
 }
 
-export function clearRun(): void {
+/**
+ * 세이브 삭제 (일반 런이 끝났을 때). 지금 런을 넘기면 그 런이 보스 테스트일 때는 아무것도 지우지 않는다 —
+ * 보스 테스트를 끝내거나 그만둬도 일반 런 세이브(이어하기)는 남는다. 게임 코드는 항상 지금 런을 넘길 것.
+ */
+export function clearRun(run?: RunState | null): void {
+  if (run && run.mode === 'bossTest') return;
   try {
     storage()?.removeItem(SAVE_KEY);
   } catch {

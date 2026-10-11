@@ -207,10 +207,20 @@ export class Hud extends Container {
   }
 
   setStage(stageNumber: number, name: string): void {
-    this.stageLabel.text = T.combat.stage(stageNumber);
+    this.setStageText(T.combat.stage(stageNumber), name);
+  }
+
+  /** 가운데 작은 글자(예: '스테이지 3' / '보스 테스트') + 이름 */
+  setStageText(label: string, name: string): void {
+    this.stageLabel.text = label;
     this.stageName.text = name;
     this.stageName.scale.set(1);
     if (this.stageName.width > CENTER_W) this.stageName.scale.set(CENTER_W / this.stageName.width);
+  }
+
+  /** 골드 표시 켜기/끄기 (보스 테스트는 골드를 쓰지 않는다) */
+  setGoldVisible(on: boolean): void {
+    this.gold.visible = on;
   }
 
   setHp(hp: number, maxHp: number): void {

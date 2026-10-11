@@ -79,6 +79,12 @@ export const SFX_IDS = [
   'boss_appear',
   'danger',
   'victory_run',
+  // 보스 테스트 (장난감 상자 대마왕)
+  'boss_roar',
+  'boss_summon',
+  'slam_warn',
+  'slam_impact',
+  'marble_impact',
 ] as const;
 
 export type SfxId = (typeof SFX_IDS)[number];
@@ -121,6 +127,11 @@ export const SFX_OVERRIDES: Readonly<Partial<Record<SfxId, { priority?: number; 
   player_hurt: { priority: 3, reserve: null },
   // 드롭은 드물고(minInterval 0.2초·동시 1개) 꼭 들려야 한다 — 예산에 넣으면 빠른 전투에서 콤보·동전·처치음이 마지막 토큰을 써서 빠졌다
   item_drop: { reserve: null },
+  // 보스 행동 신호: 내려찍기 예고·충격은 피하라는 신호라 꼭 들려야 한다 (드물다 — minInterval·동시 수로 묶음)
+  slam_warn: { priority: 4, reserve: null },
+  slam_impact: { priority: 4, reserve: null },
+  boss_summon: { priority: 3, reserve: null },
+  marble_impact: { priority: 2, reserve: 0 },
 };
 
 /** 기본 무기 → 발사음 계열. 진화 무기는 레시피의 기본 무기 계열을 따른다 (weaponFireSfx) */
@@ -151,12 +162,18 @@ export function weaponFireSfx(defId: string): SfxId {
   return FALLBACK_FIRE;
 }
 
-/** 적 공격 탄 스프라이트 → 적 발사음 */
+/**
+ * 적 공격 탄 스프라이트 → 적 발사음. 보스 행동 탄(블록·팽이·구슬)은 아직 전용 클립이 없어 비슷한 소리를 빌린다
+ * ('enemyShoot' 이벤트의 sprite — 보스는 EnemyDef.attack이 없다).
+ */
 export const ENEMY_SHOT_SFX: Readonly<Record<string, SfxId>> = {
   shot_dart: 'enemy_shoot_dart',
   shot_bolt: 'enemy_shoot_bolt',
   shot_spring: 'enemy_shoot_spring',
   shot_gear: 'enemy_shoot_gear',
+  shot_block: 'enemy_shoot_gear',
+  shot_top: 'enemy_shoot_spring',
+  shot_marble: 'enemy_shoot_dart',
 };
 
 /** 속성 적중에 겹치는 소리 (번개 연쇄도 elem_zap) */

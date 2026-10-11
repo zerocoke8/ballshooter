@@ -16,12 +16,19 @@ const LABEL_H = 36;
 /** '계속하기' 오른쪽 스피커 버튼 */
 const SOUND_BTN = 64;
 const SOUND_GAP = 26;
+/** 보스 테스트의 '그만두기' ('계속하기' 왼쪽, 작게) */
+const QUIT_W = 130;
+const QUIT_H = 72;
+const QUIT_GAP = 22;
+const QUIT_COLOR = 0x8a3b4b;
 
 export interface BagOverlayOptions {
   data: GameData;
   run: RunState;
   onChange: () => void;
   onClose: () => void;
+  /** 있으면 '그만두기' 버튼 (보스 테스트 — 결과 없이 타이틀로) */
+  onQuit?: () => void;
 }
 
 export class BagOverlay extends Container {
@@ -30,6 +37,7 @@ export class BagOverlay extends Container {
   private readonly view: BagView;
   private readonly button: Button;
   private readonly soundToggle = new SoundToggle(SOUND_BTN);
+  private readonly quit: Button | null = null;
   private vp: Viewport | null = null;
   private top = 0;
   private t = 0;
@@ -59,6 +67,11 @@ export class BagOverlay extends Container {
       onTap: () => opts.onClose(),
     });
     this.addChild(this.dim, this.caption, this.view, this.button, this.soundToggle);
+    if (opts.onQuit) {
+      const onQuit = opts.onQuit;
+      this.quit = new Button({ label: T.combat.quitBossTest, width: QUIT_W, height: QUIT_H, color: QUIT_COLOR, fontSize: 26, sound: 'ui_back', onTap: () => onQuit() });
+      this.addChild(this.quit);
+    }
     this.alpha = 0;
   }
 
@@ -92,6 +105,7 @@ export class BagOverlay extends Container {
     const btnY = vp.height - vp.safeBottom - BTN_H - 28;
     this.button.position.set((DESIGN_W - BTN_W) / 2, btnY);
     this.soundToggle.position.set((DESIGN_W + BTN_W) / 2 + SOUND_GAP, btnY + (BTN_H - SOUND_BTN) / 2 - 3);
+    this.quit?.position.set((DESIGN_W - BTN_W) / 2 - QUIT_GAP - QUIT_W, btnY + (BTN_H - QUIT_H) / 2 - 3);
     this.caption.position.set(DESIGN_W / 2, this.top + PAD);
     const viewTop = this.top + PAD + LABEL_H;
     const avail = Math.max(100, btnY - 20 - viewTop);

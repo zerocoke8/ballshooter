@@ -10,6 +10,13 @@ export const combat = {
   confirmGiveUp: '정말 포기할까요?\n이번 모험이 끝나요.',
 
   bossIncoming: '보스 등장!',
+  /** 보스 테스트: HUD 위 작은 글자 / 승리 배너 / 가방 오버레이의 그만두기 */
+  bossTest: '보스 테스트',
+  bossDefeated: '격파!',
+  quitBossTest: '그만두기',
+  /** 페이즈 전환 배너: 제목 (n = 1부터) + 부제 (페이즈 인덱스 1.. → 문구, 없으면 마지막 것) */
+  phase: (n: number): string => `${n}페이즈!`,
+  phaseSub: ['', '화가 났어요! 공격이 더 거세져요', '폭주! 천천히 내려와요'] as readonly string[],
   breach: '방어선이 뚫렸어요!',
   knockedOut: '쓰러졌어요…',
   /** 적 몸에 닿아 패배 (접촉 = 즉시 패배) */

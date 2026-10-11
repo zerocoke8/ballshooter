@@ -91,6 +91,12 @@ export const CHILL_ATTACK_RATE_RESIST = 0.8;
  */
 export const BOSS_REHIT_WINDOW = 1.0;
 export const BOSS_REHIT_DAMAGE_MUL = 0.3;
+/**
+ * 보스가 소환한 졸개가 입에서 자기 칸까지 날아가 내려앉는 시간(초). 이 동안은 칸에 몸(충돌 박스)이 있어 공은 맞지만
+ * 플레이어 몸에 닿아도 즉사가 아니다 — 화면에서는 아직 입에서 날아오는 중이라, 보이지 않는 몸에 부딪혀 지는 일이 없게.
+ * 내려앉는 순간 그 자리에 있으면 일반 규칙대로 접촉 패배. 렌더의 소환 튀어나오기(visual.ts SUMMON_HOP_TIME)와 같은 값.
+ */
+export const SUMMON_LAND_TIME = 0.32;
 export const CHAIN_RANGE = 160;
 export const CHAIN_TARGETS = 2;
 export const CHAIN_DAMAGE_MUL = 0.5;

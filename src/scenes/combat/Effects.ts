@@ -59,6 +59,8 @@ const RING_TINT = 0xfff4d6;
 /** 처치 파편 모양 (가중치 = 등장 횟수). 적 탄과 같은 그림(볼트·스프링·톱니)은 작고 칙칙하게 — 날아오는 탄으로 착각하지 않게 */
 const DEBRIS: readonly FxFrame[] = ['bolt', 'spring', 'sparkle', 'gear', 'sparkle', 'shard', 'shard'];
 const DEBRIS_TINT = [0xc9bfb4, 0xd8b8b0, 0xffffff, 0xd2c6a8, 0xffffff, 0xffe9b8, 0xfff6e0];
+/** 보스 소환 반짝임·구슬 조각 색 (장난감 블록 색) */
+const CONFETTI_TINTS = [0xff6b6b, 0xffd23f, 0x5ee07a, 0x6fb8ff, 0xff9ad5];
 
 interface Fx {
   p: Particle;
@@ -789,6 +791,138 @@ export class Effects implements StatusEmitter {
     }
   }
 
+  // ── 보스전 (장난감 상자 대마왕) ─────────────────────────────
+
+  /** 포효: 입에서 퍼지는 충격파 고리 3겹 + 붉은 빛 (페이즈 전환·등장 포효) */
+  roar(x: number, y: number, size: number): void {
+    const glow = this.spawn('soft', x, y, size * 0.3, size * 1.1, 0.45, 0xff6a4a);
+    if (glow) glow.a0 = 0.3;
+    for (let i = 0; i < 3; i++) {
+      const r = this.spawn('ring', x, y, size * 0.3, size * (1.6 + i * 0.5), 0.55, i === 0 ? 0xffe6d6 : 0xffc4a8);
+      if (!r) break;
+      r.delay = i * 0.16;
+      r.a0 = 0.7 - i * 0.18;
+      r.fadeStart = 0.25;
+    }
+  }
+
+  /** 보스가 고정 위치에 쿵 내려앉음: 몸 아래 끝을 따라 먼지가 양옆으로 */
+  landDust(x0: number, x1: number, y: number): void {
+    const n = 6;
+    for (let i = 0; i < n; i++) {
+      if (!this.roomFor(false)) return;
+      const t = i / (n - 1);
+      const x = x0 + (x1 - x0) * t;
+      const side = t < 0.5 ? -1 : 1;
+      const f = this.spawn('dust', x, y, 30, 70, 0.5, 0xffffff);
+      if (!f) return;
+      f.vx = side * this.rng.range(90, 180);
+      f.vy = this.rng.range(-50, -10);
+      f.drag = 4;
+      f.a0 = 0.9;
+      f.fadeStart = 0.35;
+    }
+  }
+
+  /** 소환: 입에서 연기 펑 + 반짝 (졸개들이 튀어나오는 순간) */
+  summonPuff(x: number, y: number): void {
+    const puff = this.spawn('puff', x, y, 40, 120, 0.45, 0xffffff);
+    if (puff) {
+      puff.curve = C_POP;
+      puff.popFrac = 0.3;
+      puff.fadeStart = 0.35;
+      puff.vy = 40;
+      puff.p.rotation = this.rng.range(-0.3, 0.3);
+    }
+    const ring = this.spawn('ring', x, y, 30, 150, 0.3, 0xc8ffb0);
+    if (ring) ring.a0 = 0.8;
+    for (let i = 0; i < 5; i++) {
+      if (!this.roomFor(false)) break;
+      const a = Math.PI / 2 + this.rng.range(-1.2, 1.2);
+      const f = this.spawn('star', x, y, 10, 26, 0.45, CONFETTI_TINTS[i % CONFETTI_TINTS.length]);
+      if (!f) break;
+      f.vx = Math.cos(a) * this.rng.range(160, 300);
+      f.vy = Math.sin(a) * this.rng.range(120, 260) - 120;
+      f.grav = 700;
+      f.vr = this.rng.range(-8, 8);
+      f.curve = C_POP;
+    }
+  }
+
+  /** 졸개가 칸에 내려앉음: 발밑 작은 먼지 */
+  landPuff(x: number, y: number): void {
+    if (!this.roomFor(false)) return;
+    for (let side = -1; side <= 1; side += 2) {
+      const f = this.spawn('dust', x + side * 16, y, 16, 36, 0.3, 0xffffff);
+      if (!f) return;
+      f.vx = side * 80;
+      f.vy = -15;
+      f.drag = 6;
+      f.a0 = 0.85;
+      f.fadeStart = 0.35;
+    }
+  }
+
+  /** 깜짝 상자 내려찍기 충격: 열 바닥(y = 바닥)에 폭발 구름 + 충격파 + 먼지가 양옆으로 + 파편, 열을 따라 위로 번쩍 */
+  slamImpact(cx: number, y: number, w: number): void {
+    const boom = this.spawn('boom', cx, y - 20, w * 0.4, w * 1.05, 0.42, 0xffffff);
+    if (boom) {
+      boom.curve = C_POP;
+      boom.popFrac = 0.25;
+      boom.fadeStart = 0.45;
+      boom.p.rotation = this.rng.range(-0.3, 0.3);
+    }
+    const ring = this.spawn('ring', cx, y - 10, w * 0.4, w * 1.6, 0.32, 0xffd2b8);
+    if (ring) {
+      ring.aspect = 0.45;
+      ring.a0 = 0.9;
+    }
+    for (let i = 0; i < 6; i++) {
+      if (!this.roomFor(false)) break;
+      const side = i % 2 === 0 ? -1 : 1;
+      const f = this.spawn('dust', cx + side * w * 0.3, y - 8, 30, 72, 0.5, 0xffffff);
+      if (!f) break;
+      f.vx = side * this.rng.range(160, 320);
+      f.vy = this.rng.range(-90, -20);
+      f.drag = 4;
+      f.a0 = 0.9;
+      f.fadeStart = 0.35;
+    }
+    this.debris(cx, y - 20, 6, w * 0.3, 1.1);
+  }
+
+  /** 구슬이 떨어짐: 충격파 + 먼지 + 색 조각 (반경 r) */
+  marbleImpact(x: number, y: number, r: number): void {
+    const ring = this.spawn('ring', x, y, r * 0.6, r * 2.6, 0.3, 0xffffff);
+    if (ring) {
+      ring.aspect = 0.6;
+      ring.a0 = 0.85;
+    }
+    const s = this.spawn('impact', x, y, r * 0.8, r * 1.8, 0.16, 0xffffff);
+    if (s) s.curve = C_POP;
+    for (let i = 0; i < 4; i++) {
+      if (!this.roomFor(false)) break;
+      const a = -Math.PI / 2 + this.rng.range(-1.3, 1.3);
+      const f = this.spawn('shard', x, y, 12, 9, this.rng.range(0.4, 0.55), CONFETTI_TINTS[(i + 1) % CONFETTI_TINTS.length]);
+      if (!f) break;
+      const sp = this.rng.range(180, 320);
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.grav = 1100;
+      f.vr = this.rng.range(-12, 12);
+      f.fadeStart = 0.5;
+    }
+    for (let side = -1; side <= 1; side += 2) {
+      const d = this.spawn('dust', x + side * r * 0.5, y, 18, 44, 0.35, 0xffffff);
+      if (!d) break;
+      d.vx = side * 90;
+      d.vy = -10;
+      d.drag = 5;
+      d.a0 = 0.8;
+      d.fadeStart = 0.35;
+    }
+  }
+
   /** 승리 연출용 색종이 펑 */
   confetti(x: number, y: number): void {
     const colors = [0xff6b9a, 0xffd23f, 0x5ee07a, 0x6fd8ff, 0xb46cff];
@@ -947,6 +1081,19 @@ export class Effects implements StatusEmitter {
     this.killBurst(x, y, 80, 1, 0);
     this.splitPuff(x, y, 3);
     this.fizzle(x, y, 24);
+    this.update(0);
+  }
+
+  /** 보스전 연출도 화면 밖에서 한 번씩 (prewarm과 같은 이유) */
+  prewarmBoss(): void {
+    const x = 300;
+    const y = -1400;
+    this.roar(x, y, 120);
+    this.landDust(x - 100, x + 100, y);
+    this.summonPuff(x, y);
+    this.landPuff(x, y);
+    this.slamImpact(x, y, 168);
+    this.marbleImpact(x, y, 40);
     this.update(0);
   }
 

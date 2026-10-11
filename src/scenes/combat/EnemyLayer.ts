@@ -3,6 +3,7 @@
 // 피격: 맞은 면 반대로 밀렸다가 스프링으로 복귀 + 맞은 축으로 스쿼시(출렁) + 흰 번쩍임.
 // 번쩍임·냉기·화상은 필터 대신 '덮개' 스프라이트(키마다 한 번 구운 흰/얼음 실루엣)를 몸 위에 겹친다 → 필터 비용 없음.
 // 프레임 애니메이션이 있는 적(실루엣이 프레임과 안 맞음)은 예전 방식(ActorSprite 'hit' + tint)으로.
+// 보스전: 씬이 보스 자세(setPose — 예비 동작·포효)를 덧입히고, 소환된 졸개는 입에서 칸으로 튀어나와 내려앉는다(hop).
 import { BitmapText, Container, Sprite, type Renderer } from 'pixi.js';
 import { ActorSprite } from '../../render/actor';
 import { animFrames, tex } from '../../render/assets';
@@ -29,6 +30,7 @@ import {
   ENEMY_SPRITE_SCALE,
   ENEMY_SQUASH,
   FROST_EMIT_INTERVAL,
+  BOSS_FROST_OVERLAY_ALPHA,
   FROST_OVERLAY_ALPHA,
   MAX_HIT_FLASHES,
 } from './visual';
@@ -44,6 +46,9 @@ const STATUS_FADE = 7;
 const EDGE_RATIO = 0.55;
 /** 얼어 있는 적의 피격 번쩍임 색 (흰 실루엣에 곱함 — 아주 옅은 하늘색) */
 const FROST_FLASH_TINT = 0xe2f6ff;
+/** 소환 졸개가 입에서 칸으로 날아가는 포물선 높이(px)와 시작 크기 */
+const HOP_ARC = 70;
+const HOP_START_SCALE = 0.35;
 
 /** 상태이상 파티클을 뿌리는 쪽 (Effects) */
 export interface StatusEmitter {
@@ -91,6 +96,8 @@ interface EnemyView {
   ovMode: 0 | 1 | 2 | 3;
   flashT: number;
   frost: number;
+  /** 냉기 덮개 최대 알파 — 보스는 낮게(큰 그림이 얼음 실루엣에 묻혀 읽히지 않게) */
+  frostAlpha: number;
   burn: number;
   /** 밀림 스프링 (px) */
   kx: number;
@@ -106,6 +113,16 @@ interface EnemyView {
   frostEmitT: number;
   /** 처치 '펑' 진행 (초). 덮개 없는 적은 쓰지 않음 */
   popT: number;
+  /** 씬이 덧입히는 자세 (보스 예비 동작·포효): 위치 오프셋(px)·크기 배수 */
+  poseX: number;
+  poseY: number;
+  poseSx: number;
+  poseSy: number;
+  /** 소환 튀어나오기: 진행(초) / 길이, 시작점 - 칸 중심 */
+  hopT: number;
+  hopDur: number;
+  hopDx: number;
+  hopDy: number;
 }
 
 const OV_NONE = 0;
@@ -121,6 +138,8 @@ export class EnemyLayer extends Container {
   private readonly live: EnemyView[] = [];
   private readonly dying: EnemyView[] = [];
   private readonly framesByKey = new Map<string, boolean>();
+  /** 아직 뷰가 없는 적의 소환 튀어나오기 (뷰를 만들 때 적용) */
+  private readonly pendingHops = new Map<number, { x: number; y: number; dur: number }>();
   private stamp = 0;
   private flashing = 0;
   private clock = 0;
@@ -200,6 +219,17 @@ export class EnemyLayer extends Container {
         } else v.frostEmitT = 0;
       }
 
+      if (v.hopT < v.hopDur) {
+        v.hopT += dt;
+        if (v.hopT >= v.hopDur) {
+          // 착지: 세로로 납작했다 출렁
+          v.sq = Math.max(v.sq, 0.75);
+          v.sqv = 0;
+          v.sqAxis = 0;
+          v.springing = true;
+          v.hp.visible = true;
+        }
+      }
       if (v.springing) stepSpring(v, dt);
       this.applyPose(v, cx, cy);
       v.actor.update(dt);
@@ -301,6 +331,31 @@ export class EnemyLayer extends Container {
     v.springing = true;
   }
 
+  /**
+   * 씬이 덧입히는 자세 (보스): 위치 오프셋(px)과 크기 배수. 피격 밀림·스쿼시 위에 곱해진다. 뷰가 없으면 무시
+   */
+  setPose(enemyId: number, x: number, y: number, sx: number, sy: number): void {
+    const v = this.views.get(enemyId);
+    if (!v) return;
+    v.poseX = x;
+    v.poseY = y;
+    v.poseSx = sx;
+    v.poseSy = sy;
+  }
+
+  /**
+   * 소환 연출: (fromX, fromY)(보스 입)에서 작게 튀어나와 포물선을 그리며 자기 칸으로 날아가 내려앉는다(dur초).
+   * 판정은 sim이 이미 칸에 두었다 — 그림만. 뷰가 아직 없으면 만들 때 적용
+   */
+  hop(enemyId: number, fromX: number, fromY: number, dur: number): void {
+    const v = this.views.get(enemyId);
+    if (!v) {
+      this.pendingHops.set(enemyId, { x: fromX, y: fromY, dur });
+      return;
+    }
+    startHop(v, fromX, fromY, dur);
+  }
+
   onAttack(enemyId: number): void {
     const v = this.views.get(enemyId);
     if (!v || v.hitAnim > 0) return;
@@ -333,11 +388,27 @@ export class EnemyLayer extends Container {
   }
 
   private applyPose(v: EnemyView, cx: number, cy: number): void {
-    v.actor.position.set(cx + v.kx, cy + v.ky);
-    if (!v.overlay) return;
+    let ox = v.kx + v.poseX;
+    let oy = v.ky + v.poseY;
+    let ex = v.poseSx;
+    let ey = v.poseSy;
+    if (v.hopT < v.hopDur) {
+      const k = v.hopT / v.hopDur;
+      const e = 1 - (1 - k) * (1 - k);
+      ox += v.hopDx * (1 - e);
+      oy += v.hopDy * (1 - e) - Math.sin(Math.PI * k) * HOP_ARC;
+      const s = HOP_START_SCALE + (1 - HOP_START_SCALE) * e;
+      ex *= s;
+      ey *= s;
+    }
+    v.actor.position.set(cx + ox, cy + oy);
+    if (!v.overlay) {
+      if (v.actor.scale.x !== ex || v.actor.scale.y !== ey) v.actor.scale.set(ex, ey);
+      return;
+    }
     const a = ENEMY_SQUASH * v.sq;
-    if (v.sqAxis === 0) v.actor.scale.set(1 + a * 0.75, 1 - a);
-    else v.actor.scale.set(1 - a, 1 + a * 0.75);
+    if (v.sqAxis === 0) v.actor.scale.set((1 + a * 0.75) * ex, (1 - a) * ey);
+    else v.actor.scale.set((1 - a) * ex, (1 + a * 0.75) * ey);
   }
 
   private applyOverlay(v: EnemyView): void {
@@ -360,14 +431,14 @@ export class EnemyLayer extends Container {
         // 얼어 있는 적: 하늘빛 흰 번쩍임, 냉기 덮개 알파 아래로는 내려가지 않음 — 번쩍임 끝에 원래 색(빨강·크림)이
         // 비쳐 '파랑 → 분홍 → 파랑'으로 깜빡이던 것을 막는다
         if (o.tint !== FROST_FLASH_TINT) o.tint = FROST_FLASH_TINT;
-        o.alpha = Math.max(FROST_OVERLAY_ALPHA * v.frost, a);
+        o.alpha = Math.max(v.frostAlpha * v.frost, a);
       } else {
         if (o.tint !== 0xffffff) o.tint = 0xffffff;
         // 번쩍임이 끝나 갈 때 아래 깔린 덮개 쪽으로 자연스럽게 (알파만)
         o.alpha = a;
       }
     } else if (mode === OV_FROST) {
-      o.alpha = FROST_OVERLAY_ALPHA * v.frost * (0.92 + 0.08 * Math.sin(this.clock * 5 + v.id));
+      o.alpha = v.frostAlpha * v.frost * (0.92 + 0.08 * Math.sin(this.clock * 5 + v.id));
     } else if (mode === OV_BURN) {
       o.alpha = BURN_OVERLAY_ALPHA * v.burn * (0.65 + 0.35 * Math.sin(this.clock * 13 + v.id * 1.7));
     }
@@ -448,6 +519,7 @@ export class EnemyLayer extends Container {
       ovMode: OV_NONE,
       flashT: 0,
       frost: 0,
+      frostAlpha: e.boss ? BOSS_FROST_OVERLAY_ALPHA : FROST_OVERLAY_ALPHA,
       burn: 0,
       kx: 0,
       ky: 0,
@@ -460,11 +532,33 @@ export class EnemyLayer extends Container {
       burnEmitT: 0,
       frostEmitT: 0,
       popT: 0,
+      poseX: 0,
+      poseY: 0,
+      poseSx: 1,
+      poseSy: 1,
+      hopT: 0,
+      hopDur: 0,
+      hopDx: 0,
+      hopDy: 0,
     };
     this.views.set(e.id, v);
     this.live.push(v);
+    const hop = this.pendingHops.get(e.id);
+    if (hop) {
+      this.pendingHops.delete(e.id);
+      startHop(v, hop.x, hop.y, hop.dur);
+    }
     return v;
   }
+}
+
+function startHop(v: EnemyView, fromX: number, fromY: number, dur: number): void {
+  if (!(dur > 0)) return;
+  v.hopT = 0;
+  v.hopDur = dur;
+  v.hopDx = fromX - (v.x + v.w / 2);
+  v.hopDy = fromY - (v.y + v.h / 2);
+  v.hp.visible = false;
 }
 
 /** 밀림·스쿼시 스프링 (반암시적 오일러, 작은 스텝으로 쪼갬). 멈추면 springing = false */

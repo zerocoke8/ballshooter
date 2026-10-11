@@ -26,10 +26,15 @@ function bakeBackground(renderer: Renderer, key: string): Texture {
 }
 
 /**
- * 그리는 순서 (아래 → 위): 바닥 → 투사체 꼬리 → 적 → 플레이어 투사체 → 타격 이펙트 → 적 탄 → 숫자·콤보.
- * 적 탄은 이펙트보다 위 — 화면이 아무리 번쩍여도 피해야 할 것이 가려지지 않게.
+ * 그리는 순서 (아래 → 위): 바닥 → 보스 위험 지역 예고(바닥) → 투사체 꼬리 → 적 → 플레이어 투사체 → 타격 이펙트 →
+ * 보스 위험 지역의 떨어지는 것(깜짝 상자·구슬)·입 빛 → 적 탄 → 숫자·콤보.
+ * 적 탄은 이펙트·예고보다 위 — 화면이 아무리 번쩍여도 피해야 할 것이 가려지지 않게.
  */
 export class FieldView extends Container {
+  /** 보스 위험 지역 예고: 바닥에 깔리는 빨간 열·그림자 (적보다 아래 — 졸개가 가려지지 않게) */
+  readonly hazardLayer = new Container();
+  /** 보스 위험 지역의 떨어지는 물체·입 빛 (이펙트 위, 적 탄 아래) */
+  readonly hazardTopLayer = new Container();
   /** 투사체 꼬리 (적 아래) */
   readonly trailLayer = new Container();
   /** 적 스프라이트 */
@@ -61,10 +66,12 @@ export class FieldView extends Container {
     this.addChild(
       bg,
       shade,
+      this.hazardLayer,
       this.trailLayer,
       this.enemyLayer,
       this.projectileLayer,
       this.fxLayer,
+      this.hazardTopLayer,
       this.shotLayer,
       this.topLayer,
     );

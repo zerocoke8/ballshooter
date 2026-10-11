@@ -184,5 +184,17 @@
     "placeholder": { "emoji": "✨", "color": "#fffbe0", "shape": "circle" } },
   { "key": "fx_dust", "category": "fx", "size": 96,
     "prompt": "a small flat cartoon dust kick-up: a few beige-brown soft puffs in a little arc, flat, NO face, NO eyes",
-    "placeholder": { "emoji": "💨", "color": "#d9c3a0", "shape": "circle" } }
+    "placeholder": { "emoji": "💨", "color": "#d9c3a0", "shape": "circle" } },
+  { "key": "enemy_toybox_king", "category": "enemy", "size": 640, "anims": ["idle", "attack", "hit", "die"],
+    "prompt": "a huge angry toy chest monster boss: a wide wooden toy box whose open lid is a big mouth with teeth made of colorful building blocks, glowing angry eyes on the box front, two stubby arms, toys (a tin soldier, a balloon, a ball) spilling out of its mouth, very wide imposing silhouette, front view facing the viewer",
+    "placeholder": { "emoji": "📦", "color": "#b5651d", "shape": "roundrect" } },
+  { "key": "shot_marble", "category": "enemyShot", "size": 64,
+    "prompt": "a single shiny glass marble with a colorful swirl inside, small game projectile",
+    "placeholder": { "emoji": "🔮", "color": "#7ec8e3", "shape": "circle" } },
+  { "key": "shot_top", "category": "enemyShot", "size": 80,
+    "prompt": "a single red and yellow wooden spinning top toy, seen from slightly above, small game projectile",
+    "placeholder": { "emoji": "🌀", "color": "#e74c3c", "shape": "circle" } },
+  { "key": "shot_block", "category": "enemyShot", "size": 72,
+    "prompt": "a single colorful toy building block brick with studs on top, angry little dot eyes, small game projectile",
+    "placeholder": { "emoji": "🧱", "color": "#f39c12", "shape": "roundrect" } }
 ]
