@@ -85,6 +85,15 @@ export const SFX_IDS = [
   'slam_warn',
   'slam_impact',
   'marble_impact',
+  // 레벨업·액티브 스킬·행동하는 적 (재미 기능 연출)
+  'level_up',
+  'card_flip',
+  'skill_ready',
+  'skill_ice',
+  'skill_hotspring',
+  'skill_hairstorm',
+  'shield_block',
+  'heal_pulse',
 ] as const;
 
 export type SfxId = (typeof SFX_IDS)[number];
@@ -132,6 +141,10 @@ export const SFX_OVERRIDES: Readonly<Partial<Record<SfxId, { priority?: number; 
   slam_impact: { priority: 4, reserve: null },
   boss_summon: { priority: 3, reserve: null },
   marble_impact: { priority: 2, reserve: 0 },
+  // 방패병이 막음: 내 공이 튕겨 나갔다는 신호 — 처치음과 같은 줄 (드물게 몰리면 minInterval·동시 2개로 묶음)
+  shield_block: { priority: 2, reserve: 0 },
+  // 게이지 가득: 꼭 들려야 한다 (전투 중 드물다)
+  skill_ready: { priority: 4, reserve: null },
 };
 
 /** 기본 무기 → 발사음 계열. 진화 무기는 레시피의 기본 무기 계열을 따른다 (weaponFireSfx) */

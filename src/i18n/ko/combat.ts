@@ -44,4 +44,33 @@ export const combat = {
   backstabCombo: '백어택',
   /** 콤보 배수 — 숫자 비트맵 폰트로 그리므로 숫자·x·! 만 */
   comboCount: (n: number): string => `x${n}!`,
+  /** 방패병 정면이 공을 튕겨 냄 (적중점 위에 잠깐 뜨는 꼬리표) */
+  blocked: '막음!',
+
+  /** HUD 경험치 막대 위 레벨 */
+  level: (n: number): string => `Lv ${n}`,
+
+  /** 레벨업 창 (전투 일시정지 3지선다 — scenes/combat/LevelUpOverlay) */
+  levelUp: {
+    title: '레벨 업!',
+    /** 지금 고르는 레벨 */
+    sub: (level: number): string => `Lv ${level} · 하나를 골라요`,
+    /** 이 다음에 더 고를 레벨업 수 */
+    more: (n: number): string => `+${n} 더`,
+    kindItem: '새 아이템',
+    kindUpgrade: '★ 강화',
+    kindBoon: '런 보너스',
+    /** 런 보너스 중첩 (고른 뒤 / 최대) */
+    boonStacks: (next: number, max: number): string => `${next}/${max}`,
+    /** ★ + 1 카드의 효과: 무기는 공격력·쿨타임 변화, 돌·장비는 새 ★의 효과 */
+    weaponUpgrade: (dmgFrom: string, dmgTo: string, cdFrom: string, cdTo: string): string =>
+      `공격력 ${dmgFrom} → ${dmgTo}\n쿨타임 ${cdFrom} → ${cdTo}`,
+    effectUpgrade: (text: string): string => `강화 후: ${text}`,
+    /** 결과 알림: 가방 칸(1부터) / 보관함 / ★ / 보너스 */
+    toBag: (name: string, x: number, y: number): string => `${name} → 가방 (${x}, ${y})`,
+    toStash: (name: string): string => `${name} → 보관함`,
+    tierUp: (name: string, tier: number): string => `${name} ${'★'.repeat(Math.max(1, Math.min(3, tier)))}!`,
+    boonGot: (name: string, n: number, max: number): string => `${name} ${n}/${max}`,
+    healed: (n: number): string => `HP +${n}`,
+  },
 } as const;

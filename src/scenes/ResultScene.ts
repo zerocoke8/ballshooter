@@ -33,6 +33,8 @@ const CLOUD_COLOR = 0x8a93b0;
 const RAIN_DROPS = 6;
 const WIN_DIM = 0.7;
 const CLOUD_SPACE = 100;
+/** 도달 레벨 숫자 색 (HUD 경험치 막대와 같은 하늘색) */
+const LEVEL_COLOR = 0x5ec8ff;
 
 interface StatRow {
   body: Container;
@@ -128,6 +130,8 @@ export class ResultScene extends Scene {
     // 통계
     const rows: { label: string; value: number; fmt: (n: number) => string; color: number }[] = [
       { label: T.menu.reachedStageLabel, value: reached, fmt: (n) => T.menu.stageOf(n, totalStages), color: UI_COLORS.text },
+      // 도달 레벨 (레벨업 — game.toResult가 채운다)
+      ...(result.level !== undefined ? [{ label: T.menu.levelReached, value: result.level, fmt: (n: number) => T.menu.levelOf(n), color: LEVEL_COLOR }] : []),
       { label: T.menu.killsCount, value: result.stats.kills, fmt: (n) => String(n), color: UI_COLORS.text },
       { label: T.menu.goldEarned, value: result.stats.goldEarned, fmt: (n) => String(n), color: UI_COLORS.gold },
       {

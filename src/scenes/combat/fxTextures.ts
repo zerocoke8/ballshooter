@@ -26,6 +26,10 @@ export interface FxTextures {
   shadow: Texture;
   /** 조준 가이드 점: 진한 외곽선 + 흰 속 (24px, 바닥 위에서도 잘 보이게) */
   dot: Texture;
+  /** 얼음 상자 (96px): 반투명 하늘색 + 흰 테 + 빛 줄 — 빙하기로 꽁꽁 언 적 위에 덮는다 */
+  iceBlock: Texture;
+  /** 소용돌이 (128px): 흰 꼬리 호 세 갈래 — 털뭉치 폭풍 동안 캐릭터 둘레에서 돈다 */
+  swirl: Texture;
 }
 
 /**
@@ -40,6 +44,7 @@ export type FxFrame =
   | 'ice' // fx_ice: 얼음 조각
   | 'sparkle' // fx_spark: 네 갈래 반짝 (노랑 + 외곽선)
   | 'dust' // fx_dust: 먼지
+  | 'heal' // fx_heal: 초록 더하기 + 하트 (치유병·온천)
   | 'bolt' // shot_bolt (파편)
   | 'spring' // shot_spring (파편)
   | 'gear' // shot_gear (파편)
@@ -101,6 +106,29 @@ export function fxTextures(renderer: Renderer): FxTextures {
       g.circle(12, 12, 11).fill({ color: AIM_OUTLINE, alpha: 0.85 });
       g.circle(12, 12, 7).fill(0xffffff);
     }),
+    iceBlock: bake(renderer, 96, 96, (g) => {
+      g.roundRect(4, 4, 88, 88, 16).fill({ color: 0xbfeaff, alpha: 0.38 });
+      g.roundRect(4, 4, 88, 88, 16).stroke({ width: 5, color: 0xffffff, alpha: 0.95 });
+      g.roundRect(10, 10, 76, 76, 11).stroke({ width: 2, color: 0x7fd2ff, alpha: 0.7 });
+      // 빛 줄 (왼쪽 위 → 사선) + 모서리 반짝
+      g.poly([18, 30, 30, 18, 40, 18, 18, 40]).fill({ color: 0xffffff, alpha: 0.85 });
+      g.poly([18, 52, 52, 18, 58, 18, 18, 58]).fill({ color: 0xffffff, alpha: 0.45 });
+      g.poly([60, 80, 80, 60, 80, 66, 66, 80]).fill({ color: 0xffffff, alpha: 0.5 });
+    }),
+    swirl: bake(renderer, 128, 128, (g) => {
+      // 세 갈래 꼬리 호: 머리 굵고 진함 → 꼬리 가늘고 옅게 (짧은 호 조각을 이어서)
+      const parts = 9;
+      for (let arm = 0; arm < 3; arm++) {
+        const base = (arm / 3) * Math.PI * 2;
+        for (let i = 0; i < parts; i++) {
+          const k = i / parts;
+          const a0 = base + k * 1.9;
+          const a1 = a0 + 1.9 / parts + 0.02;
+          const r = 56 - k * 18;
+          g.arc(64, 64, r, a0, a1).stroke({ width: 10 * (1 - k * 0.75), color: 0xffffff, alpha: 0.95 * (1 - k * 0.8), cap: 'round' });
+        }
+      }
+    }),
   };
   return cache;
 }
@@ -140,6 +168,7 @@ export function fxAtlas(renderer: Renderer, trailTaper: number): FxAtlas {
     ['ice', 'fx_ice'],
     ['sparkle', 'fx_spark'],
     ['dust', 'fx_dust'],
+    ['heal', 'fx_heal'],
     ['bolt', 'shot_bolt'],
     ['spring', 'shot_spring'],
     ['gear', 'shot_gear'],

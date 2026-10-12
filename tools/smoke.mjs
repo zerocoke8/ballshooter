@@ -7,7 +7,8 @@
 //                  처음 불러온 코드 그대로 끝까지 검사한다)
 //
 // 흐름: 타이틀 → (탭) 새 게임 → 캐릭터 선택 → (탭) 카드 + 시작! → 전투(1초·6초 스크린샷, 터치 드래그 이동)
-//       → 가방(B) → 닫기(B) → debug.winStage() → 스테이지 클리어 → (탭) 상점으로 → 상점
+//       → 가방(B) → 닫기(B) → debug.winStage() → (남은 레벨업 카드 탭 — 클리어 화면 전) → 스테이지 클리어 → (탭) 상점으로 → 상점
+//       (레벨업 창은 전투 중에는 Game.debugHoldLevelUps로 보류해 두었다가 승리 직전에 풀어, 스테이지 끝 레벨업 경로를 탄다)
 //       → 보스 테스트(일반 세이브가 있는 채로): 타이틀 → (탭) 보스 테스트 → (탭) 카드 + 보스전! → 보스전(인트로·착지 후)
 //         → debug.winStage() → 보스 결과(승) → (탭) 다시 도전 → 같은 캐릭터로 보스전 → debug.loseStage() → 보스 결과(패)
 //         → (탭) 타이틀로 → 일반 세이브가 한 글자도 안 바뀌었는지 + (탭) 이어하기 → 상점
@@ -48,6 +49,7 @@ const summary = {
   ignoredErrors: [],
   failures: [],
   playerMove: null,
+  levelUps: null,
   boss: null,
   stress: null,
   durationMs: 0,
@@ -255,6 +257,48 @@ async function playerX() {
 
 const SAVE_KEY = 'ballshooter.run';
 
+/** 측정 도구용 레벨업 보류 (Game.debugHoldLevelUps) */
+async function setLevelUpHold(on) {
+  await page.evaluate((v) => {
+    window.__game.game.debugHoldLevelUps = v;
+  }, on);
+}
+
+/** 전투 씬의 레벨업 창이 카드를 받으면 첫 카드를 실제 탭 — sceneName이 될 때까지. 고른 수 */
+async function pickLevelUpsUntil(sceneName, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let picks = 0;
+  while (Date.now() < deadline) {
+    const st = await page.evaluate(() => ({
+      scene: window.__game?.scene() ?? '',
+      lu: window.__game?.game.scenes.current?.debugState?.()?.levelUp ?? null,
+    }));
+    if (st.scene === sceneName) return picks;
+    if (st.lu?.open && st.lu.armed) {
+      const p = await page.evaluate(() => {
+        const c = window.__game.game.scenes.current?.levelUp?.cards?.[0];
+        if (!c) return null;
+        const b = c.root.getBounds();
+        return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+      });
+      if (p) {
+        if (picks === 0) {
+          stepNo++;
+          const file = path.join(OUT_DIR, `${String(stepNo).padStart(2, '0')}-levelup-stage-end.png`);
+          await page.screenshot({ path: file });
+          summary.steps.push({ step: stepNo, name: 'levelup-stage-end', expected: 'CombatScene', scene: st.scene, ok: true, screenshot: path.relative(ROOT, file) });
+        }
+        await page.touchscreen.tap(p.x, p.y);
+        picks++;
+        await sleep(700);
+        continue;
+      }
+    }
+    await sleep(120);
+  }
+  return picks;
+}
+
 async function savedRun() {
   return page.evaluate((k) => localStorage.getItem(k), SAVE_KEY);
 }
@@ -267,6 +311,8 @@ async function bossTestPath(T, chars) {
   summary.boss = rec;
 
   await page.evaluate(() => window.__game.game.toTitle());
+  // 보스전 중 졸개 처치로 레벨업 창이 떠 대기(sleep)·승패 검사를 가리지 않게
+  await setLevelUpHold(true);
   await step('title-boss-button', 'TitleScene', { settleMs: 2600 });
   await tapText(T.menu.bossTest, 'title boss test');
   await step('boss-select', 'CharacterSelectScene', { settleMs: 1200 });
@@ -407,6 +453,8 @@ async function run() {
 
   // 1) 타이틀 → 새 게임 (새 컨텍스트라 세이브 없음)
   await step('title', 'TitleScene', { timeoutMs: 20000, settleMs: 2200 });
+  // 전투 중 레벨업 창은 보류 (스크린샷·가방 단계가 갑자기 뜬 창에 가리지 않게) — 승리 직전에 푼다
+  await setLevelUpHold(true);
   await tapText(T.menu.newRun, 'title new game');
 
   // 2) 캐릭터 선택 → 마지막 캐릭터 카드 탭 → 시작!
@@ -448,9 +496,17 @@ async function run() {
   await sleep(500);
   await step('bag-closed', 'CombatScene');
 
-  // 5) 승리 → 스테이지 클리어 → (탭) 상점으로
+  // 5) 승리 → (마지막 처치들로 오른 레벨업 고르기) → 스테이지 클리어 → (탭) 상점으로
+  await setLevelUpHold(false);
+  const lv0 = await page.evaluate(() => window.__game.game.scenes.current?.debugState?.()?.levelUp ?? null);
   const won = await page.evaluate(() => window.__game.debug.winStage());
   if (!won) fail('[debug] winStage() not handled by current scene (CombatScene.debugWin missing?)');
+  const stageEndPicks = await pickLevelUpsUntil('StageClearScene', 20000);
+  const runLv = await page.evaluate(() => ({ level: window.__game.game.run?.level ?? 1, levelUps: window.__game.game.run?.levelUps ?? 0 }));
+  summary.levelUps = { beforeWin: lv0, stageEndPicks, after: runLv };
+  // st1을 다 잡으면 레벨이 적어도 한 번은 오른다 — 남은 레벨업은 클리어 화면 전에 모두 골라야 한다
+  if (stageEndPicks < 1 || runLv.levelUps !== 0) fail(`[levelup] expected level-up picks before the stage clear screen: ${JSON.stringify(summary.levelUps)}`);
+  await setLevelUpHold(true);
   await step('stage-clear', 'StageClearScene', { timeoutMs: 12000, settleMs: 4200 });
   if ((await scene()) === 'StageClearScene') {
     const finished = await page.evaluate(() => window.__game.game.scenes.current?.summary?.finished === true);

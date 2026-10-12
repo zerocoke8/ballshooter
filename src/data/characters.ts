@@ -18,9 +18,10 @@ const CHARACTER_LIST: CharacterDef[] = [
       { defId: 's_ice', x: 1, y: 2, rot: 0 },
     ],
     // 최대 HP +15%: 냉기가 공격을 멈추지 않게 바뀌어 참치 미사일로 적을 얼려 두던 펭구가 st5에서 가장 자주 졌다
-    // (진 판은 대부분 HP — 체력만 조금. 이동 속도를 더 올리면 프로브 회피 AI는 오히려 더 맞았다)
-    passive: { moveSpeedMul: 0.2, maxHpMul: 0.15 },
-    passiveDesc: '이동 속도 +20%, 최대 HP +15%',
+    // (진 판은 대부분 HP — 체력만 조금. 이동 속도를 더 올리면 프로브 회피 AI는 오히려 더 맞았다).
+    // +15 → +25% (네 번째 조정): st5 톱니 한 발이 21이 되자 체력 115 펭구가 프로브 빌드 st5 7/16 · 이어서 하는 런 3/16으로 혼자 떨어졌다 → 11/16 · 9/16
+    passive: { moveSpeedMul: 0.2, maxHpMul: 0.25 },
+    passiveDesc: '이동 속도 +20%, 최대 HP +25%',
   },
   {
     id: 'capybara',

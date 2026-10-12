@@ -112,5 +112,21 @@
   { "id": "slam_impact", "category": "hit", "duration": 0.8, "influence": 0.55, "variants": 1, "volume": 0.42, "maxVoices": 2, "minInterval": 0.12, "pitchVar": 0.05,
     "prompt": "Heavy cartoon jack-in-the-box slamming down on a wooden floor, deep boomy thud with a springy boing" },
   { "id": "marble_impact", "category": "hit", "duration": 0.5, "influence": 0.6, "variants": 1, "volume": 1.0, "maxVoices": 3, "minInterval": 0.06, "pitchVar": 0.1,
-    "prompt": "Big glass marble dropping onto a wooden floor with a hard clack and a tiny bounce, short" }
+    "prompt": "Big glass marble dropping onto a wooden floor with a hard clack and a tiny bounce, short" },
+  { "id": "level_up", "category": "ui", "duration": 1.0, "influence": 0.5, "variants": 1, "volume": 0.6, "maxVoices": 1, "minInterval": 0.4, "pitchVar": 0,
+    "prompt": "Bright cheerful level up chime: a quick rising sparkly bell arpeggio ending on a shiny ding, casual mobile game, short" },
+  { "id": "card_flip", "category": "ui", "duration": 0.5, "influence": 0.6, "variants": 1, "volume": 0.6, "maxVoices": 3, "minInterval": 0.04, "pitchVar": 0.08,
+    "prompt": "Single quick playing card flip snap, crisp light paper flick, very short, casual game UI" },
+  { "id": "skill_ready", "category": "reward", "duration": 0.5, "influence": 0.6, "variants": 1, "volume": 0.5, "maxVoices": 1, "minInterval": 0.5, "pitchVar": 0,
+    "prompt": "Short magical power up ready shimmer, a bright twinkling chime swell, clean, casual mobile game" },
+  { "id": "skill_ice", "category": "ui", "duration": 1.0, "influence": 0.55, "variants": 1, "volume": 0.6, "maxVoices": 1, "minInterval": 0.5, "pitchVar": 0.02,
+    "prompt": "Big magical ice freeze blast: a cold whoosh of wind followed by crackling ice forming and crystal tinkles, cartoon, short" },
+  { "id": "skill_hotspring", "category": "ui", "duration": 1.0, "influence": 0.55, "variants": 1, "volume": 0.65, "maxVoices": 1, "minInterval": 0.5, "pitchVar": 0.02,
+    "prompt": "Warm magical hot spring burst: bubbling water splash with a soft steam hiss and a gentle rising harp chime, cartoon, short" },
+  { "id": "skill_hairstorm", "category": "ui", "duration": 0.8, "influence": 0.55, "variants": 1, "volume": 0.5, "maxVoices": 1, "minInterval": 0.5, "pitchVar": 0.02,
+    "prompt": "Fast swirling whirlwind whoosh with many soft fluffy puffs flying out, cartoon cat hairball tornado, short" },
+  { "id": "shield_block", "category": "hit", "duration": 0.5, "influence": 0.6, "variants": 1, "volume": 0.4, "maxVoices": 2, "minInterval": 0.07, "pitchVar": 0.08,
+    "prompt": "Small metal toy shield clang: a bright ringing ping as a rubber ball bounces off, cartoon, very short" },
+  { "id": "heal_pulse", "category": "enemy", "duration": 0.5, "influence": 0.6, "variants": 1, "volume": 0.58, "maxVoices": 1, "minInterval": 0.3, "pitchVar": 0.05,
+    "prompt": "Soft magical healing twinkle with a gentle green sparkle shimmer, short and light, cartoon game" }
 ]

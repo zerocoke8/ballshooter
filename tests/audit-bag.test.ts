@@ -8,8 +8,19 @@ import {
   BAG_MAX_ROWS,
   BAG_START_COLS,
   BAG_START_ROWS,
+  CHAIN_TARGETS,
+  CHAIN_TARGETS_MAX,
   COOLDOWN_FLOOR_MUL,
+  HOMING_MAX_DEG,
+  KILL_BURST_MAX,
   MAX_TIER,
+  PROJ_RADIUS_BONUS_MAX,
+  PROJ_SPEED_BONUS_MAX,
+  PROJ_SPEED_BONUS_MIN,
+  SEED_CHILD_MIN_RADIUS,
+  SEED_CHILD_RADIUS_MUL,
+  SEED_SPLIT_COUNT,
+  SEED_SPLIT_DAMAGE_MAX,
   SELL_RATIO,
   STASH_CAPACITY,
   TIER_COOLDOWN_MUL,
@@ -208,6 +219,11 @@ function refPlayerRaw(ch: CharacterDef, bag: BagState): PlayerStats {
   let regen = 0;
   let gold = 0;
   let dmg = 0;
+  // 시너지 장비 (docs/DESIGN.md '시너지 아이템'): 수치는 ★배수 합, 트램펄린은 ★·개수와 무관(있으면 1), 폭죽은 합 상한
+  let steam = 0;
+  let burst = 0;
+  let tramp = false;
+  let backGold = 0;
   for (const it of bag.items) {
     const d = ITEMS[it.defId];
     if (d.kind !== 'gear' || !d.gear) continue;
@@ -217,9 +233,13 @@ function refPlayerRaw(ch: CharacterDef, bag: BagState): PlayerStats {
     regen += (d.gear.regenPerSec ?? 0) * m;
     gold += (d.gear.goldMul ?? 0) * m;
     dmg += (d.gear.damageMul ?? 0) * m;
+    steam += (d.gear.steamMul ?? 0) * m;
+    burst += (d.gear.killBurst ?? 0) * m;
+    if (d.gear.trampoline) tramp = true;
+    backGold += (d.gear.backKillGold ?? 0) * m;
   }
   const p = ch.passive;
-  return {
+  const out: PlayerStats = {
     maxHp: (ch.baseMaxHp + hp) * (1 + (p.maxHpMul ?? 0)), // 반올림 전
     moveSpeed: ch.baseMoveSpeed * (1 + (p.moveSpeedMul ?? 0) + ms),
     regenPerSec: regen,
@@ -227,6 +247,11 @@ function refPlayerRaw(ch: CharacterDef, bag: BagState): PlayerStats {
     damageMul: 1 + (p.damageMul ?? 0) + dmg,
     cooldownMul: 1 + (p.cooldownMul ?? 0),
   };
+  if (steam > 0) out.steamMul = steam;
+  if (burst > 0) out.killBurst = Math.min(KILL_BURST_MAX, burst);
+  if (tramp) out.trampoline = 1;
+  if (backGold > 0) out.backKillGold = backGold;
+  return out;
 }
 
 function refWeapon(bag: BagState, uid: number, player: PlayerStats): WeaponLoadout | null {
@@ -239,19 +264,45 @@ function refWeapon(bag: BagState, uid: number, player: PlayerStats): WeaponLoado
   // ★배수를 10배 정수로 다뤄 내림을 정확히 계산 (1, 1.6, 2.2 → 10, 16, 22)
   let count10 = 0;
   let pierce10 = 0;
+  // 시너지 돌 (docs/DESIGN.md '시너지 아이템')
+  let bounce = 0;
+  let hammer = 0;
+  let seed = 0;
+  let chain10 = 0;
+  let chainDmg = 0;
+  let hop = false;
+  let rad = 0;
+  let spd = 0;
+  let spread = 0;
+  let homingDeg = 0;
   const els = new Set<Element>(def.weapon.element ? [def.weapon.element] : []);
   for (const nb of bag.items) {
     const nd = ITEMS[nb.defId];
     if (nd.kind !== 'stone' || !nd.stone || !refAdjacent(it, def, nb, nd)) continue;
     const m = TIER_EFFECT_MUL[nb.tier];
     const m10 = Math.round(m * 10);
-    dmgB += (nd.stone.damageMul ?? 0) * m;
-    cdB += (nd.stone.cooldownMul ?? 0) * m;
-    count10 += (nd.stone.projectileCountAdd ?? 0) * m10;
-    pierce10 += (nd.stone.pierceAdd ?? 0) * m10;
-    if (nd.stone.element) els.add(nd.stone.element);
+    const s = nd.stone;
+    dmgB += (s.damageMul ?? 0) * m;
+    cdB += (s.cooldownMul ?? 0) * m;
+    count10 += (s.projectileCountAdd ?? 0) * m10;
+    pierce10 += (s.pierceAdd ?? 0) * m10;
+    if (s.element) els.add(s.element);
+    bounce += (s.bounceDamage ?? 0) * m;
+    hammer += (s.backAttackBonus ?? 0) * m;
+    seed += (s.seedSplit ?? 0) * m;
+    chain10 += (s.chainTargetsAdd ?? 0) * m10;
+    chainDmg += (s.chainDamageAdd ?? 0) * m;
+    if (s.chainHop) hop = true;
+    rad += (s.radiusMul ?? 0) * m;
+    spd += (s.speedMul ?? 0) * m;
+    spread = Math.max(spread, (s.burnSpread ?? 0) * m);
+    homingDeg += (s.homingDeg ?? 0) * m;
   }
   const p = def.weapon.projectile;
+  const radiusMul = 1 + Math.min(PROJ_RADIUS_BONUS_MAX, rad);
+  const speedMul = 1 + Math.min(PROJ_SPEED_BONUS_MAX, Math.max(PROJ_SPEED_BONUS_MIN, spd));
+  const radius = p.radius * radiusMul;
+  const none = (v: number): number | undefined => (v > 0 ? v : undefined);
   return {
     uid,
     defId: it.defId,
@@ -260,17 +311,32 @@ function refWeapon(bag: BagState, uid: number, player: PlayerStats): WeaponLoado
     damage: p.damage * TIER_DAMAGE_MUL[it.tier] * (1 + dmgB) * player.damageMul,
     count: p.count + Math.floor(count10 / 10),
     spreadDeg: p.spreadDeg,
-    speed: p.speed,
-    radius: p.radius,
+    speed: p.speed * speedMul,
+    radius,
     pierce: p.pierce + Math.floor(pierce10 / 10),
     maxBounces: p.maxBounces,
     elements: ELEMENT_ORDER.filter((e) => els.has(e)),
     explodeRadius: p.explodeRadius ?? 0,
-    split: p.split ?? null,
+    // 원래 분열은 반경만 버섯 배수, 분열 없는 무기 + 씨앗 = 자기 공을 줄인 자식 2개
+    split: p.split
+      ? { ...p.split, radius: p.split.radius * radiusMul }
+      : seed > 0
+        ? { count: SEED_SPLIT_COUNT, damageMul: Math.min(SEED_SPLIT_DAMAGE_MAX, seed), sprite: p.sprite, radius: Math.max(SEED_CHILD_MIN_RADIUS, radius * SEED_CHILD_RADIUS_MUL), seed: true }
+        : null,
     sprite: p.sprite,
     spin: p.spin ?? false,
+    bounceDamage: none(bounce),
+    backAttackBonus: none(hammer + (player.backAttackBonus ?? 0)),
+    chainTargetsAdd: none(Math.min(CHAIN_TARGETS_MAX - CHAIN_TARGETS, Math.floor(chain10 / 10))),
+    chainDamageAdd: none(chainDmg),
+    chainHops: hop ? 1 : undefined,
+    burnSpread: none(spread),
+    homing: none((Math.min(HOMING_MAX_DEG, homingDeg) * Math.PI) / 180),
   };
 }
+
+/** 부동소수로 비교할 무기 필드 (나머지는 정확히 같아야 한다). undefined(시너지 없음)는 양쪽 다 undefined */
+const WEAPON_CLOSE_KEYS = ['damage', 'cooldown', 'speed', 'radius', 'bounceDamage', 'backAttackBonus', 'chainDamageAdd', 'burnSpread', 'homing'] as const;
 
 function expectWeaponClose(got: WeaponLoadout | null, want: WeaponLoadout | null): void {
   if (want === null) {
@@ -278,14 +344,34 @@ function expectWeaponClose(got: WeaponLoadout | null, want: WeaponLoadout | null
     return;
   }
   expect(got).not.toBeNull();
-  const { damage, cooldown, ...rest } = got!;
-  const { damage: wd, cooldown: wc, ...wantRest } = want;
-  expect(rest).toEqual(wantRest);
-  expect(damage).toBeCloseTo(wd, 9);
-  expect(cooldown).toBeCloseTo(wc, 9);
+  const g: Record<string, unknown> = { ...got! };
+  const w: Record<string, unknown> = { ...want };
+  for (const k of WEAPON_CLOSE_KEYS) {
+    const a = g[k];
+    const b = w[k];
+    delete g[k];
+    delete w[k];
+    if (b === undefined) expect(a, k).toBeUndefined();
+    else expect(a as number, k).toBeCloseTo(b as number, 9);
+  }
+  const gs = g.split as WeaponLoadout['split'];
+  const ws = w.split as WeaponLoadout['split'];
+  delete g.split;
+  delete w.split;
+  if (ws === null) expect(gs).toBeNull();
+  else {
+    expect(gs).not.toBeNull();
+    expect({ ...gs!, radius: 0, damageMul: 0 }).toEqual({ ...ws, radius: 0, damageMul: 0 });
+    expect(gs!.radius).toBeCloseTo(ws.radius, 9);
+    expect(gs!.damageMul).toBeCloseTo(ws.damageMul, 9);
+  }
+  expect(g).toEqual(w);
+  const { damage, cooldown } = got!;
   expect(Number.isFinite(damage) && Number.isFinite(cooldown)).toBe(true);
   expect(cooldown).toBeGreaterThan(0);
   expect(Number.isInteger(got!.count) && Number.isInteger(got!.pierce)).toBe(true);
+  // 서브스텝 안전(틈새로 새지 않음)을 지키는 범위의 속도·반경
+  expect(Number.isFinite(got!.speed) && got!.speed > 0 && Number.isFinite(got!.radius) && got!.radius > 0).toBe(true);
 }
 
 // ── 무작위 가방 ──────────────────────────────────────────────
@@ -301,7 +387,8 @@ function randomBag(seed: number): BagState {
   const pool = Array.from({ length: rng.int(2, 6) }, () => rng.pick(IDS));
   const attempts = rng.int(0, 45);
   for (let i = 0; i < attempts; i++) {
-    const defId = rng.chance(0.35) ? rng.pick(RECIPE_PARTS) : rng.pick(pool);
+    // 레시피 재료 비율: 시너지 아이템 12종이 들어와 풀이 커진 뒤(34 → 46종) 레시피 합성 표본이 모자라지 않게 0.35 → 0.42
+    const defId = rng.chance(0.42) ? rng.pick(RECIPE_PARTS) : rng.pick(pool);
     addNewToBag(bag, ITEMS, defId, randomTier(rng), rng.int(0, bag.cols - 1), rng.int(0, bag.rows - 1), rng.pick(ROTS));
   }
   const stashN = rng.int(0, bag.stashCapacity);
@@ -887,7 +974,12 @@ describe('audit: stats vs. documented formulas', () => {
         }
         if (d.gear) {
           const g = scaledGear(deepFreeze(clone(d.gear)), t);
-          for (const [k, v] of Object.entries(d.gear)) expect((g as Record<string, number>)[k]).toBeCloseTo((v as number) * TIER_EFFECT_MUL[t], 12);
+          for (const [k, v] of Object.entries(d.gear)) {
+            // boolean 효과(트램펄린)는 ★와 무관하게 그대로
+            if (typeof v === 'number') expect((g as Record<string, number>)[k]).toBeCloseTo(v * TIER_EFFECT_MUL[t], 12);
+            else expect((g as Record<string, unknown>)[k]).toBe(v);
+          }
+          expect(Object.keys(g).sort()).toEqual(Object.keys(d.gear).sort());
         }
       }
     }
@@ -907,6 +999,11 @@ describe('audit: stats vs. documented formulas', () => {
       expect(got.goldMul).toBeCloseTo(raw.goldMul, 9);
       expect(got.damageMul).toBeCloseTo(raw.damageMul, 9);
       expect(got.cooldownMul).toBeCloseTo(raw.cooldownMul, 12);
+      // 시너지 장비: 있을 때만 키가 있다
+      for (const k of ['steamMul', 'killBurst', 'trampoline', 'backKillGold'] as const) {
+        if (raw[k] === undefined) expect(got[k], k).toBeUndefined();
+        else expect(got[k], k).toBeCloseTo(raw[k]!, 9);
+      }
       for (const v of Object.values(got)) expect(Number.isFinite(v)).toBe(true);
       // 보관함은 아무리 바뀌어도 영향 없음
       const swapped = { ...bag, stash: [{ uid: 777, defId: 'g_potlid', tier: 3 as Tier }, { uid: 778, defId: 'g_piggybank', tier: 3 as Tier }] };
@@ -935,6 +1032,9 @@ describe('audit: stats vs. documented formulas', () => {
   it('computeWeapon / stoneBuffsFor / computeLoadout match the formulas on random bags', () => {
     let floored = 0;
     let clamped = 0;
+    // 시너지 돌이 맞닿은 무기 / 분열 씨앗으로 분열을 얻은 무기 (퍼징이 새 규칙도 지나가는지)
+    let synergy = 0;
+    let seeded = 0;
     for (const seed of SEEDS) {
       const rng = new Rng(seed);
       const bag = randomBag(seed);
@@ -950,6 +1050,8 @@ describe('audit: stats vs. documented formulas', () => {
         if (want) {
           if (stones.some((s) => s.tier > 1 && (ITEMS[s.defId].stone?.projectileCountAdd || ITEMS[s.defId].stone?.pierceAdd))) floored++;
           if ((1 + b.cooldownMul) * player.cooldownMul < COOLDOWN_FLOOR_MUL) clamped++;
+          if (want.bounceDamage || want.backAttackBonus || want.chainHops || want.burnSpread || want.homing || want.speed !== ITEMS[it.defId].weapon!.projectile.speed) synergy++;
+          if (want.split && !ITEMS[it.defId].weapon!.projectile.split) seeded++;
         }
       }
       for (const s of bag.stash) expect(computeWeapon(bag, ITEMS, s.uid, player)).toBeNull();
@@ -963,6 +1065,8 @@ describe('audit: stats vs. documented formulas', () => {
     }
     expect(floored).toBeGreaterThan(20);
     expect(clamped).toBeGreaterThan(0);
+    expect(synergy).toBeGreaterThan(20);
+    expect(seeded).toBeGreaterThan(3);
   });
 
   it('cooldown floor: exact boundary cases with real stones and the cat passive', () => {

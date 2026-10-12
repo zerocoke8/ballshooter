@@ -25,6 +25,13 @@
 // 졸개 평균/최대·위험 지역/적 탄 맞은 수 + 이상적인 회피(반응 0 / 0.25초, 앞 2.2초)의 공정성. PROBE_BOSS_IDEAL_SEEDS(기본 4)·
 // PROBE_BOSS_IDEAL_HORIZON(기본 2.2). 회피 AI·이상적인 회피는 보스 위험 지역(예고·발동 중)도 피한다(일반 스테이지는 위험 지역이 없어 그대로).
 // PROBE_DUMP_NOSAFE=1: 이상적인 회피가 '안 맞는 자리가 없던' 순간의 장면을 판마다 한 번 찍는다.
+// 백어택·행동하는 적(첫 테스트의 'back attacks and behaving enemies' 표): 직접 적중 중 백어택 몫, 방패에 막힌 공, 치유 HP, 폭탄 폭발,
+// 꼬마 젤리, RC카 옆걸음 (판당). 스테이지 표의 'behaving enemies' = 스테이지에 놓인 행동하는 적 수. PROBE_PATCH는 bosses도 받는다(배열은 통째로).
+// 레벨업·액티브 스킬(docs/DESIGN.md '레벨업'·'액티브 스킬'): 프로브 AI는 처치마다 경험치를 받아 레벨업 선택지를 고르고(무기가 가방에 들어가면 무기 >
+// 가장 센 무기 ★ + 1 > 데미지 보너스 > …, probeChoice), 게이지가 차면 스킬을 쓴다(빙하기·폭풍 = 보이는 적 PROBE_SKILL_MIN(기본 8)마리 이상이거나 보스,
+// 온천 = HP 60% 아래이거나 가까운 적 탄 3발 이상, skillAi). st2부터의 빌드는 앞 스테이지 적을 다 잡은 만큼 레벨업을 미리 고른 채로 시작한다(catchUpLevels).
+// 끄기(예전 프로브와 비교): PROBE_LEVELUP=0(레벨업 없음 — 경험치도 안 받음), PROBE_SKILL=0(스킬 안 씀). 이상적인 회피(공정성)는 둘 다 쓰지 않는다
+// (레벨업·스킬은 플레이어를 해치는 경로가 없다 — 공정성 판정에는 영향 없음). 표: 첫 테스트의 'level-ups and skills', 스윕·보스 테스트의 'lv · skill' 열.
 import { describe, expect, it } from 'vitest';
 import {
   BAG_EXPAND_COSTS,
@@ -57,7 +64,22 @@ import {
 import { stepPlayerMotion, type Mover } from '../src/logic/combat/movement';
 import { CombatSim, FIRE_OFFSET_Y, traceAim, type AimTrace } from '../src/logic/combat/sim';
 import { Rng } from '../src/logic/rng';
-import { newBossTestRun, newRun, rewardKill, runLoadout, runPlayerStats } from '../src/logic/run';
+import {
+  applyLevelUpChoice,
+  enemyXp,
+  grantKillXp,
+  grantXp,
+  levelUpOffer,
+  levelUpSpot,
+  newBossTestRun,
+  newRun,
+  pendingLevelUps,
+  rewardKill,
+  runLevel,
+  runLoadout,
+  runPlayerStats,
+  runSkill,
+} from '../src/logic/run';
 import { itemPrice } from '../src/logic/stats';
 import type {
   BagItem,
@@ -65,6 +87,7 @@ import type {
   CombatInput,
   EnemyEntity,
   EnemyShotEntity,
+  LevelUpChoice,
   PlayerStats,
   ProjectileEntity,
   Rot,
@@ -99,9 +122,12 @@ function probeData(): typeof GAME_DATA {
     if (!st) throw new Error(`PROBE_PATCH: no stage ${id}`);
     deepPatch(st as unknown as Record<string, unknown>, p);
   }
-  for (const key of ['enemies', 'items', 'characters'] as const) {
+  // bossTest: 보스 테스트 스테이지·프리셋 — 예 {"bossTest":{"stage":{"dmgMul":2.2}}} (presets의 items 배열은 통째로)
+  if (patch.bossTest) deepPatch(d.bossTest as unknown as Record<string, unknown>, patch.bossTest as Record<string, unknown>);
+  // bosses: 배열(phases·actions·minions)은 통째로 바뀐다 — 예 {"bosses":{"toybox_king":{"phases":[…]}}}
+  for (const key of ['enemies', 'items', 'characters', 'bosses', 'skills', 'boons'] as const) {
     for (const [id, p] of Object.entries(patch[key] ?? {})) {
-      const rec = d[key][id] as unknown as Record<string, unknown> | undefined;
+      const rec = (d[key] as unknown as Record<string, Record<string, unknown> | undefined>)[id];
       if (!rec) throw new Error(`PROBE_PATCH: no ${key}.${id}`);
       deepPatch(rec, p);
     }
@@ -111,6 +137,11 @@ function probeData(): typeof GAME_DATA {
 
 const data = probeData();
 const items = data.items;
+/** 레벨업(경험치·선택지)·액티브 스킬을 쓰나 — PROBE_LEVELUP=0 / PROBE_SKILL=0이면 끈다 (예전 프로브와 비교용) */
+const LEVELUPS = env.PROBE_LEVELUP !== '0';
+const SKILLS = env.PROBE_SKILL !== '0';
+/** 빙하기·털뭉치 폭풍을 쓰는 보이는 적 수 (보스가 보이면 바로) */
+const SKILL_MIN_ENEMIES = Number(env.PROBE_SKILL_MIN ?? 8);
 const CHARACTERS_ALL = ['penguin', 'capybara', 'cat'] as const;
 /** PROBE_CHARS=capybara,cat 로 캐릭터를 줄일 수 있다 */
 const CHARACTERS = env.PROBE_CHARS
@@ -147,24 +178,28 @@ const PROGRESSION: { expand?: ('col' | 'row')[]; add: Addition[] }[] = [
  * 수동 조준(틈 쏘기)과 같이 쓰면 '실력 상한'.
  */
 const STRONG: Record<(typeof CHARACTERS_ALL)[number], { expand?: ('col' | 'row')[]; add: Addition[] }[]> = {
+  // 재미 기능 뒤(네 번째 조정): 잘하는 사람은 시너지 장비도 산다 — 대형을 쓸어 내는 폭죽 심지(st3)·불 + 얼음의 증기 주전자(st4).
+  // 예전 목록은 레벨업이 들어온 뒤 st3·st4에서 프로브 빌드보다 약했다(시드 16개 st3 12/16)
   penguin: [
     { add: [] },
     { add: [{ defId: 'w_sock' }, { defId: 's_haste' }] },
-    { add: [{ defId: 'w_yuzu' }, { defId: 's_fire' }, { defId: 'g_potlid' }] },
-    { expand: ['col'], add: [{ defId: 'w_toaster' }, { defId: 's_fire' }, { defId: 's_ice' }] },
-    { expand: ['row'], add: [{ defId: 's_mirror' }, { defId: 's_ice' }] },
+    { add: [{ defId: 'w_yuzu' }, { defId: 's_fire' }, { defId: 'g_potlid' }, { defId: 'g_firecracker' }] },
+    { expand: ['col'], add: [{ defId: 'w_toaster' }, { defId: 's_fire' }, { defId: 'g_kettle' }] },
+    { expand: ['row'], add: [{ defId: 's_mirror' }, { defId: 's_ice' }, { defId: 's_power' }] },
   ],
+  // 카피: st3 상점에서 쓸 돈이 많이 남아(16 / 약 50골드) 고무오리·뒤통수 망치(관통 개틀링의 보스 윗면 백어택)를 더 산다 — 레벨업·보스 체력이
+  // 바뀐 뒤 예전 목록은 st5 보스를 방어선 전에 못 잡았다(시드 16개 2승). st4 냄비 대신 폭죽 심지
   capybara: [
     { add: [] },
     { add: [{ defId: 's_fire' }, { defId: 'w_sock' }] },
-    { add: [{ defId: 's_haste' }, { defId: 's_ice' }] },
-    { expand: ['col'], add: [{ defId: 'w_toaster' }, { defId: 's_fire' }, { defId: 'g_potlid' }] },
-    { expand: ['row'], add: [{ defId: 's_mirror' }, { defId: 's_power' }] },
+    { add: [{ defId: 's_haste' }, { defId: 's_ice' }, { defId: 's_hammer' }, { defId: 'w_duck' }] },
+    { expand: ['col'], add: [{ defId: 'w_toaster' }, { defId: 's_fire' }, { defId: 'g_firecracker' }] },
+    { expand: ['row'], add: [{ defId: 's_mirror' }, { defId: 's_power' }, { defId: 's_hammer' }] },
   ],
   cat: [
     { add: [] },
     { add: [{ defId: 's_lightning' }, { defId: 'w_sock' }] },
-    { add: [{ defId: 's_haste' }, { defId: 'w_yuzu' }, { defId: 's_fire' }] },
+    { add: [{ defId: 's_haste' }, { defId: 'w_yuzu' }, { defId: 's_fire' }, { defId: 'g_firecracker' }] },
     { expand: ['col'], add: [{ defId: 'w_toaster' }, { defId: 's_fire' }, { defId: 'g_potlid' }] },
     { expand: ['row'], add: [{ defId: 's_mirror' }, { defId: 's_ice' }] },
   ],
@@ -267,8 +302,8 @@ function fillSockets(bag: BagState): void {
   }
 }
 
-type BuildMode = 'probe' | 'noice' | 'ice' | 'strong' | 'starter' | 'raw';
-type ShopMode = 'probe' | 'noice' | 'ice' | 'strong';
+type BuildMode = 'probe' | 'noice' | 'ice' | 'strong' | 'starter' | 'raw' | 'greedy';
+type ShopMode = 'probe' | 'noice' | 'ice' | 'strong' | 'greedy';
 
 /** 얼음 비교 빌드에서 속성석 하나를 더 사는 상점 (st4 전투 전 — 프로브 빌드가 쓰고 남는 돈 14골드 안, 속성석 10골드) */
 const EXTRA_STONE_AT = 3;
@@ -281,7 +316,7 @@ const EXTRA_STONE_AT = 3;
  */
 function progressionOf(characterId: string, mode: ShopMode): { expand?: ('col' | 'row')[]; add: Addition[] }[] {
   if (mode === 'strong') return STRONG[characterId as (typeof CHARACTERS_ALL)[number]];
-  if (mode === 'probe') return PROGRESSION;
+  if (mode === 'probe' || mode === 'greedy') return PROGRESSION;
   return PROGRESSION.map((step, i) => ({
     expand: step.expand,
     add: [
@@ -298,21 +333,198 @@ function progressionOf(characterId: string, mode: ShopMode): { expand?: ('col' |
  * starter = 구매 없이 소켓 정리·합성만 (펭구 참치 미사일, 카피 유자★2) — "상점 없이" 기준선
  * raw     = 시작 아이템 배치 그대로 (가방을 한 번도 안 연 첫 플레이)
  */
-function buildRun(characterId: string, stageIndex: number, mode: BuildMode = 'probe'): { run: RunState; notes: string[] } {
-  const run = newRun(data, characterId, 7);
+type Progression = { expand?: ('col' | 'row')[]; add: Addition[] }[];
+
+/** buildRun 옵션 (분석 테스트용): 런 시드(레벨업 선택지 운), 상점 구매 목록 덮어쓰기, 앞 스테이지 레벨업을 고르는 함수(다음 전투 스테이지 → Chooser) */
+interface BuildOpts {
+  seed?: number;
+  prog?: Progression;
+  chooseFor?: (nextStage: number, shop: (r: RunState) => void) => Chooser;
+}
+
+/** 상점 한 번(스테이지 i 전투 전)의 구매를 가방에 적용 → 소켓 정리·합성 */
+function applyShopStep(run: RunState, step: Progression[number], notes: string[]): void {
+  for (const dir of step.expand ?? []) expandBag(run.bag, dir);
+  for (const a of step.add) {
+    if (!addBest(run.bag, a.defId, a.tier ?? 1)) notes.push(`no room: ${a.defId}`);
+  }
+  fillSockets(run.bag);
+  notes.push(...mergeAll(run.bag));
+}
+
+/**
+ * 'greedy' 빌드(프로브 상점 + 앞 스테이지 레벨업을 그리디 평가로)와 PROBE_STRONG_GREEDY=1일 때의 'strong'은
+ * (그리디 평가는 다음 전투 시드 2판만 보는 근시안이라 st5 보스에 약한 선택을 자주 해서 — 예: 카피 관통 무기 대신 다른 것 — 기본 'strong'은 probeChoice)
+ * greedyChooser를 쓴다 — 무거우므로 buildRun 결과를 (캐릭터, 스테이지, 모드, 시드)로 기억해 복사본을 준다
+ */
+const STRONG_GREEDY = env.PROBE_STRONG_GREEDY === '1';
+const GREEDY_BUILD_SEEDS = (env.PROBE_GREEDY_SEEDS ?? '11,2024').split(',').map(Number);
+const buildCache = new Map<string, { run: RunState; notes: string[] }>();
+
+function buildRun(characterId: string, stageIndex: number, mode: BuildMode = 'probe', o: BuildOpts = {}): { run: RunState; notes: string[] } {
+  const greedy = !o.chooseFor && !o.prog && LEVELUPS && (mode === 'greedy' || (mode === 'strong' && STRONG_GREEDY));
+  if (!greedy) return buildRunRaw(characterId, stageIndex, mode, o);
+  const key = `${characterId}|${stageIndex}|${mode}|${o.seed ?? 7}`;
+  let hit = buildCache.get(key);
+  if (!hit) {
+    hit = buildRunRaw(characterId, stageIndex, mode, { ...o, chooseFor: (next, shop) => greedyChooser(next, shop, GREEDY_BUILD_SEEDS, []) });
+    buildCache.set(key, hit);
+  }
+  return structuredClone(hit);
+}
+
+function buildRunRaw(characterId: string, stageIndex: number, mode: BuildMode, o: BuildOpts): { run: RunState; notes: string[] } {
+  const run = newRun(data, characterId, o.seed ?? 7);
   const notes: string[] = [];
+  const prog = o.prog ?? (mode === 'starter' || mode === 'raw' ? null : progressionOf(characterId, mode as ShopMode));
   for (let i = 0; mode !== 'raw' && i <= stageIndex; i++) {
-    const step = mode === 'starter' ? { add: [] } : progressionOf(characterId, mode)[i];
-    for (const dir of step.expand ?? []) expandBag(run.bag, dir);
-    for (const a of step.add) {
-      if (!addBest(run.bag, a.defId, a.tier ?? 1)) notes.push(`no room: ${a.defId}`);
-    }
-    fillSockets(run.bag);
-    notes.push(...mergeAll(run.bag));
+    const step = prog ? prog[i] : { add: [] };
+    // 앞 스테이지(i - 1)에서 오른 레벨: 그 스테이지 적을 다 잡은 경험치로 레벨업을 미리 고른다 (상점보다 먼저 — 실제 순서)
+    if (LEVELUPS && i > 0) notes.push(...catchUpLevels(run, i - 1, o.chooseFor?.(i, (r) => applyShopStep(r, step, []))));
+    applyShopStep(run, step, notes);
   }
   run.stageIndex = stageIndex;
   run.hp = runPlayerStats(data, run).maxHp;
   return { run, notes };
+}
+
+// ── 레벨업 · 스킬 AI ─────────────────────────────────────────
+
+/** 장착 무기 중 초당 피해(damage × count / cooldown)가 가장 큰 무기 uid */
+function bestWeaponUid(run: RunState): number | null {
+  let best: WeaponLoadout | null = null;
+  for (const l of runLoadout(data, run)) if (!best || (l.damage * l.count) / l.cooldown > (best.damage * best.count) / best.cooldown) best = l;
+  return best ? best.uid : null;
+}
+
+/**
+ * 프로브 AI의 레벨업 선택: 가방에 들어가는 새 무기 > 가장 센 무기 ★ + 1 > 데미지 보너스 > 다른 무기 ★ + 1 > 쿨타임 보너스 >
+ * 가방에 들어가는 돌 > 그 밖의 보너스 > ★ + 1 > 맨 앞. (보관함으로 가는 아이템은 프로브가 꺼내 놓지 않으니 버린 셈)
+ */
+function probeChoice(run: RunState, offer: LevelUpChoice[]): number {
+  const fits = (defId: string): boolean => levelUpSpot(items, run.bag, defId) !== null;
+  const best = bestWeaponUid(run);
+  const kindOf = (c: LevelUpChoice): string | null => (c.kind === 'boon' ? null : items[c.defId].kind);
+  const rules: ((c: LevelUpChoice) => boolean)[] = [
+    (c) => c.kind === 'item' && kindOf(c) === 'weapon' && fits(c.defId),
+    (c) => c.kind === 'upgrade' && c.uid === best,
+    (c) => c.kind === 'boon' && c.boon === 'power',
+    (c) => c.kind === 'upgrade' && kindOf(c) === 'weapon',
+    (c) => c.kind === 'boon' && c.boon === 'haste',
+    (c) => c.kind === 'item' && kindOf(c) === 'stone' && fits(c.defId),
+    (c) => c.kind === 'boon',
+    (c) => c.kind === 'upgrade',
+  ];
+  for (const rule of rules) {
+    const i = offer.findIndex(rule);
+    if (i >= 0) return i;
+  }
+  return 0;
+}
+
+/** 레벨업 선택 함수 (선택지 인덱스) — 기본 probeChoice, 그리디 평가(PROBE_GREEDY 분석)는 다른 함수를 넘긴다 */
+type Chooser = (run: RunState, offer: LevelUpChoice[]) => number;
+
+/** 대기 중인 레벨업을 전부 choose(기본 probeChoice)로 고른다. 고른 것의 요약(빌드 로그용: +아이템@자리 / 아이템★n / boon id) */
+function resolveLevelUps(run: RunState, choose: Chooser = probeChoice): string[] {
+  const picked: string[] = [];
+  for (let guard = 0; guard < 50; guard++) {
+    const offer = levelUpOffer(data, run);
+    if (!offer) break;
+    const res = applyLevelUpChoice(data, run, choose(run, offer));
+    if (!res) throw new Error('probe: level-up choice rejected');
+    picked.push(res.kind === 'item' ? `+${res.defId}@${res.where}` : res.kind === 'upgrade' ? `${res.defId}★${res.tier}` : `boon ${res.boon}`);
+  }
+  return picked;
+}
+
+/** 스테이지 s의 적을 다 잡은 만큼 경험치 → 레벨업을 고른다 (st2+ 빌드가 앞 스테이지에서 오른 레벨로 시작하게) */
+function catchUpLevels(run: RunState, s: number, choose: Chooser = probeChoice): string[] {
+  const st = data.stages[s];
+  let xp = 0;
+  for (const row of st.rows) for (const ch of row) if (ch !== '.') xp += enemyXp(data.enemies[st.legend[ch]]);
+  grantXp(run, xp);
+  return resolveLevelUps(run, choose).map((t) => `L${s + 1}:${t}`);
+}
+
+// ── 그리디 평가 (레벨업 선택지 분석 — PROBE_GREEDY) ──────────────
+
+interface GreedyPick {
+  stage: number;
+  offer: LevelUpChoice[];
+  scores: number[];
+  pick: number;
+  probe: number;
+  /** 선택 전 가방에 들어가는가 (item 선택지만 — 보관함으로 가면 프로브에게는 버린 셈) */
+  fits: boolean[];
+}
+
+/** 그리디 평가 점수: 이김 1 + 남은 HP 비율 × 0.5 + (1 - 가장 깊은 적) × 0.5 + 처치 비율 × 0.5 - 전투 시간(초) × 0.002 */
+function greedyScore(o: Outcome): number {
+  return (o.won ? 1 : 0) + 0.5 * (o.hpLeft / o.maxHp) + 0.5 * (1 - o.deepest) + 0.5 * (o.kills / Math.max(1, o.total)) - 0.002 * o.time;
+}
+
+/**
+ * 그리디 평가로 고르는 Chooser: 선택지마다 런을 복사해 그 선택을 적용하고(+ 바로 다음 상점 구매 shop) 다음 전투(nextStage)를
+ * 수동 조준 회피 AI로 seeds 판 돌려(전투 중 레벨업 없음 — 이 선택만의 값, 선택지끼리 같은 시드 = 공통 난수) 점수 합이 가장 큰 것
+ */
+function greedyChooser(nextStage: number, shop: (r: RunState) => void, seeds: readonly number[], log: GreedyPick[]): Chooser {
+  return (run, offer) => {
+    let best = 0;
+    let bestScore = -Infinity;
+    const scores: number[] = [];
+    for (let i = 0; i < offer.length; i++) {
+      const r = structuredClone(run);
+      if (!applyLevelUpChoice(data, r, i)) throw new Error('greedy: choice rejected');
+      r.levelUps = 0;
+      delete r.levelOffer;
+      shop(r);
+      r.stageIndex = nextStage;
+      r.hp = runPlayerStats(data, r).maxHp;
+      let sc = 0;
+      for (const seed of seeds) {
+        const o = simulate(r, nextStage, seed, manualAi(seed, guideRadius(runLoadout(data, r))), data.stages[nextStage], { levelups: false });
+        sc += greedyScore(o);
+      }
+      scores.push(sc / seeds.length);
+      if (sc > bestScore + 1e-9) {
+        bestScore = sc;
+        best = i;
+      }
+    }
+    log.push({
+      stage: nextStage,
+      offer: offer.map((c) => ({ ...c })),
+      scores,
+      pick: best,
+      probe: probeChoice(run, offer),
+      fits: offer.map((c) => c.kind === 'item' && levelUpSpot(items, run.bag, c.defId) !== null),
+    });
+    return best;
+  };
+}
+
+/**
+ * 프로브 AI의 스킬 발동 판단 (게이지가 찼을 때): 빙하기·폭풍 = 보이는 적 SKILL_MIN_ENEMIES 이상 또는 보스가 보임,
+ * 온천 = HP 60% 아래 또는 가까운(250 px) 적 탄 3발 이상
+ */
+function skillAi(sim: CombatSim): boolean {
+  const s = sim.skill;
+  if (!s || !s.ready) return false;
+  const pl = sim.player;
+  if (s.kind === 'spring') {
+    if (pl.hp < 0.6 * pl.maxHp) return true;
+    let near = 0;
+    for (const sh of sim.enemyShots) if (Math.hypot(sh.x - pl.x, sh.y - pl.y) < 250) near++;
+    return near >= 3;
+  }
+  let n = 0;
+  for (const e of sim.enemies) {
+    if (!e.alive || e.y + e.h <= 0) continue;
+    if (e.boss) return true;
+    n++;
+  }
+  return n >= SKILL_MIN_ENEMIES;
 }
 
 /**
@@ -380,18 +592,27 @@ interface StageShape {
   killGold: number;
   /** 아이템 드롭 기대 개수 */
   drops: number;
+  /** 행동하는 적 수 (적 id → 수: 방패·치유·폭탄·장갑·젤리·RC카) */
+  special: Record<string, number>;
 }
+
+/** 행동하는 적인가 (EnemyDef의 특수 행동 필드 중 하나라도) */
+const isSpecial = (id: string): boolean => {
+  const e = data.enemies[id];
+  return !!(e && (e.shield || e.armor !== undefined || e.heal || e.deathBlast || e.splitOnDeath || e.shift));
+};
 
 /** 여러 칸 적이 덮는 칸까지 포함한 점유 격자 → 웨이브(연속된 비어 있지 않은 줄) 높이 목록 */
 function stageShape(st: StageDef): StageShape {
   const occupied = st.rows.map(() => new Array<boolean>(FIELD_COLS).fill(false));
-  const shape: StageShape = { rows: st.rows.length, waves: [], enemies: 0, attackers: 0, elites: 0, totalHp: 0, killGold: 0, drops: 0 };
+  const shape: StageShape = { rows: st.rows.length, waves: [], enemies: 0, attackers: 0, elites: 0, totalHp: 0, killGold: 0, drops: 0, special: {} };
   st.rows.forEach((row, i) => {
     [...row].forEach((ch, c) => {
       if (ch === '.') return;
       const e = data.enemies[st.legend[ch]];
       for (let dy = 0; dy < e.h; dy++) for (let dx = 0; dx < e.w; dx++) occupied[i + dy][c + dx] = true;
       shape.enemies++;
+      if (isSpecial(e.id)) shape.special[e.id] = (shape.special[e.id] ?? 0) + 1;
       if (e.attack && !e.boss && e.w * e.h === 1) shape.attackers++;
       if (!e.boss && e.w * e.h > 1) shape.elites++;
       shape.totalHp += Math.max(1, Math.round(e.hp * st.hpMul));
@@ -612,6 +833,43 @@ function standStill(): CombatInput {
   return { targetX: FIELD_W / 2, targetY: HOME_Y };
 }
 
+// ── 보스 옆 통로 캠핑 (보스 테스트 'lane camp' 열) ──────────────
+// 사용자 리뷰의 꼼수: 왼쪽 통로 위쪽(x 45, y 200)에 서서 거의 수직(-82°)으로만 쏜다 — 공이 바로 보스 윗면 틈으로 들어가 백어택이 쏟아진다.
+// still = 그 자리에 가만히(예전 측정: 냥냥 12판 중 10승, 43~45초). smart = 위험 지역(예고·발동)이 그 자리나 지금 자리에 걸리면
+// 회피 AI(aiInput)로 내려가 피했다가, 다 끝나면 바닥을 따라 왼쪽 끝으로 가서 통로로 다시 올라간다(보스 아래 졸개 줄을 가로지르지 않게).
+
+const LANE_X = Number(env.PROBE_CAMP_X ?? 45);
+const LANE_Y = Number(env.PROBE_CAMP_Y ?? 200);
+const LANE_AIM = (Number(env.PROBE_CAMP_AIM ?? -82) * Math.PI) / 180;
+
+function laneCamper(smart: boolean): Ai {
+  const touches = (h: { shape: 'rect' | 'circle'; x: number; y: number; w: number; h: number }, x: number, y: number, pad: number): boolean => {
+    if (h.shape === 'circle') return Math.hypot(x - (h.x + h.w / 2), y - (h.y + h.h / 2)) < h.w / 2 + pad;
+    const dx = Math.max(h.x - x, 0, x - (h.x + h.w));
+    const dy = Math.max(h.y - y, 0, y - (h.y + h.h));
+    return Math.hypot(dx, dy) < pad;
+  };
+  return (sim) => {
+    const pl = sim.player;
+    if (smart) {
+      const pad = PLAYER_HIT_RADIUS + 14;
+      const live = sim.hazards.filter((h) => h.state !== 'done');
+      if (live.some((h) => touches(h, LANE_X, LANE_Y, pad) || touches(h, pl.x, pl.y, pad))) {
+        // 통로 안이면 통로를 따라 아래로 — 위험 지역이 안 닿는 가장 가까운 높이(보스 아래 졸개 줄을 가로지르지 않는다). 없으면 회피 AI
+        if (pl.x <= CELL - PLAYER_HIT_RADIUS) {
+          for (let y = Math.max(pl.y, LANE_Y); y <= PLAYER_MAX_Y; y += 12) {
+            if (!live.some((h) => touches(h, LANE_X, y, pad))) return { targetX: LANE_X, targetY: y, aimAngle: LANE_AIM };
+          }
+        }
+        return { ...aiInput(sim), aimAngle: LANE_AIM };
+      }
+    }
+    // 통로 열(0열) 밖이면 먼저 바닥을 따라 왼쪽 끝으로, 그다음 통로로 올라간다
+    if (pl.x > CELL - PLAYER_HIT_RADIUS) return { targetX: LANE_X, targetY: Math.max(pl.y, HOME_Y), aimAngle: LANE_AIM };
+    return { targetX: LANE_X, targetY: LANE_Y, aimAngle: LANE_AIM };
+  };
+}
+
 // ── 수동 조준 흉내 (실제 게임의 탭 조준) ─────────────────────
 
 const DEG = Math.PI / 180;
@@ -781,14 +1039,32 @@ interface Outcome {
   minionDirectHits: number;
   minionKills: number;
   minionDeepest: number;
+  /**
+   * 백어택·행동하는 적 (docs/DESIGN.md '백어택'·'행동하는 적'): 직접 적중 중 백어택(윗면) 수, 방패병 정면에 막힌 수,
+   * 치유병이 회복한 HP 합, 폭탄병 폭발 수, 갈라져 나온 꼬마 젤리 수, RC카 옆걸음 수
+   */
+  backHits: number;
+  blocked: number;
+  healed: number;
+  blasts: number;
+  spawned: number;
+  shifts: number;
+  /** 레벨업·스킬: 전투를 시작한 레벨, 전투 중 고른 레벨업 수(종류별 item/upgrade/boon), 스킬 쓴 횟수 */
+  entryLevel: number;
+  levelUps: number;
+  levelKinds: { item: number; upgrade: number; boon: number };
+  skillUses: number;
 }
 
 /** '반사 횟수 상한을 두면?' 계측용 가정 상한 (maxBounces 0 무기의 기본 상한 후보) */
 const BOUNCE_CAP_PROBE = 12;
 
-/** 프로브 계측용: CombatSim의 내부 적중 처리(투사체 직접 적중 1번마다 1회 호출)를 가로챈다 */
+/**
+ * 프로브 계측용: CombatSim의 내부 적중 처리(투사체 직접 적중 1번마다 1회 호출 — 방패병 정면에 막힌 것은 아님)를 가로챈다.
+ * back = 백어택(윗면), pierce = 관통 적중 — 원래 함수에 그대로 넘긴다
+ */
 interface ProbeHooks {
-  projectileHit(p: ProjectileEntity, e: EnemyEntity, hx: number, hy: number): void;
+  projectileHit(p: ProjectileEntity, e: EnemyEntity, hx: number, hy: number, back: boolean, pierce: boolean): void;
 }
 
 /** 투사체가 사라진 사유. 수명 상한은 sim 내부 값(분열 자식은 더 짧을 수 있음)을 그대로 읽는다 */
@@ -815,8 +1091,24 @@ function assertFiniteState(sim: CombatSim): void {
   }
 }
 
+/** simulate 옵션: 스킬·레벨업을 판마다 켜고 끄기(기본 PROBE_SKILL·PROBE_LEVELUP), 전투 중 레벨업 선택 함수(기본 probeChoice) */
+interface SimOpts {
+  skill?: boolean;
+  levelups?: boolean;
+  choose?: Chooser;
+}
+
 /** stage를 주면 그 스테이지(보스 테스트 등 data.stages 밖)로, 아니면 data.stages[stageIndex] */
-function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, stage: StageDef = data.stages[stageIndex]): Outcome {
+function simulate(
+  source: RunState,
+  stageIndex: number,
+  seed: number,
+  ai: Ai,
+  stage: StageDef = data.stages[stageIndex],
+  opts: SimOpts = {},
+): Outcome {
+  const useSkill = opts.skill ?? SKILLS;
+  const useLevel = opts.levelups ?? LEVELUPS;
   // 보상은 복사본 런에 받는다 (빌드 런은 다른 시뮬에서도 쓴다)
   const run = structuredClone(source);
   // 처치 골드(소수 부분 확률)·드롭 굴림이 판마다 같은 운이 되지 않게 보상 RNG를 시드로 바꾼다
@@ -831,7 +1123,11 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, st
     player,
     hp: run.hp,
     seed,
+    skill: useSkill ? runSkill(data, run) : null,
   });
+  const entryLevel = runLevel(run);
+  let levelUps = 0;
+  const levelKinds = { item: 0, upgrade: 0, boon: 0 };
   // 보스전 계측 (보스 테스트 표): 위험 지역·적 탄 맞은 수, 살아있는 졸개, 도달한 페이즈, 소환 수
   let hazardHits = 0;
   let hazardTaken = 0;
@@ -844,6 +1140,12 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, st
   let minionDirectHits = 0;
   let minionKills = 0;
   let minionDeepest = 0;
+  let backHits = 0;
+  let blocked = 0;
+  let healed = 0;
+  let blasts = 0;
+  let spawned = 0;
+  let shifts = 0;
 
   let taken = 0;
   let dealt = 0;
@@ -875,8 +1177,10 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, st
   let bossGatlingDamage = 0;
   let bossChillBonus = 0;
   const bossByWeapon: Record<string, number> = {};
-  hooks.projectileHit = (p, e, hx, hy) => {
+  if (origHit.length !== 6) throw new Error(`probe: CombatSim.projectileHit takes ${origHit.length} args (expected 6 — signature changed?)`);
+  hooks.projectileHit = (p, e, hx, hy, back, pierce) => {
     directHits++;
+    if (back) backHits++;
     const behind = frontTop !== null && frontTop >= 0 && p.y < frontTop + ENEMY_INSET;
     if (behind) behindHits++;
     const rec = perProj.get(p.id);
@@ -886,7 +1190,7 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, st
     } else perProj.set(p.id, [1, behind ? 1 : 0]);
     const before = e.hp;
     const chilled = e.chillTime > 0;
-    origHit.call(sim, p, e, hx, hy);
+    origHit.call(sim, p, e, hx, hy, back, pierce);
     if (sim.boss && !e.boss) minionDirectHits++;
     if (e.boss) {
       const d = before - Math.max(0, e.hp);
@@ -947,11 +1251,30 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, st
       else if (ev.type === 'split') launched += ev.count;
       else if (ev.type === 'kill') {
         if (rewardKill(data, run, ev.defId).drop) drops++;
+        if (useLevel) grantKillXp(data, run, ev.defId);
         if (ev.boss) bossEnd = sim.time;
         else if (sim.boss && sim.boss.mode !== 'dead') minionKills++;
       } else if (ev.type === 'summon') summoned++;
       else if (ev.type === 'bossPhase') phaseMax = Math.max(phaseMax, ev.phase);
+      else if (ev.type === 'blocked') blocked++;
+      else if (ev.type === 'heal') healed += ev.amount;
+      else if (ev.type === 'enemySpawn') spawned++;
+      else if (ev.type === 'shift') shifts++;
+      if (ev.type === 'explode' && ev.fromEnemy !== undefined) blasts++;
     }
+    // 레벨업: 화면처럼 전투를 멈추고(스텝 사이) 고른 뒤 가방 변화를 sim에 반영
+    if (useLevel && sim.status === 'running' && pendingLevelUps(run) > 0) {
+      for (const t of resolveLevelUps(run, opts.choose)) {
+        levelUps++;
+        if (t.startsWith('+')) levelKinds.item++;
+        else if (t.startsWith('boon')) levelKinds.boon++;
+        else levelKinds.upgrade++;
+      }
+      const lo = runLoadout(data, run);
+      for (const l of lo) defByUid.set(l.uid, l.defId);
+      sim.setLoadout(lo, runPlayerStats(data, run));
+    }
+    if (useSkill && skillAi(sim)) sim.activateSkill();
     if (sim.boss) {
       minionSum += sim.boss.minions;
       minionPeak = Math.max(minionPeak, sim.boss.minions);
@@ -1043,6 +1366,16 @@ function simulate(source: RunState, stageIndex: number, seed: number, ai: Ai, st
     minionDirectHits,
     minionKills,
     minionDeepest: minionDeepest / FIELD_H,
+    backHits,
+    blocked,
+    healed,
+    blasts,
+    spawned,
+    shifts,
+    entryLevel,
+    levelUps,
+    levelKinds,
+    skillUses: sim.skill?.uses ?? 0,
   };
 }
 
@@ -1137,6 +1470,8 @@ const SWEEP_COLS: SweepCol[] = [
   { label: 'build auto', mode: 'probe', aim: 'auto', from: 1 },
   { label: 'build manual', mode: 'probe', aim: 'manual', from: 1 },
   { label: 'build still', mode: 'probe', aim: 'auto', still: true, from: 1 },
+  // 프로브 상점 + 레벨업을 그리디 평가로 (느리다 — PROBE_GREEDY_COL=1일 때만)
+  ...(env.PROBE_GREEDY_COL ? [{ label: 'greedy manual', mode: 'greedy' as const, aim: 'manual' as const, from: 1 }] : []),
   { label: 'build -ice auto', mode: 'noice', aim: 'auto', from: 3 },
   { label: 'build -ice manual', mode: 'noice', aim: 'manual', from: 3 },
   { label: 'build +ice auto', mode: 'ice', aim: 'auto', from: 3 },
@@ -1167,6 +1502,13 @@ function spread(xs: number[], scale = 100, unit = '%'): string {
 }
 
 const hpLost = (o: Outcome): number => o.taken / o.maxHp;
+
+/** 'lv · skill' 칸: 시작 레벨(중앙값) + 전투 중 레벨업(판당 평균) · 스킬 사용(판당 평균) */
+function lvSkill(os: Outcome[]): string {
+  if (os.length === 0) return '-';
+  const avg = (f: (o: Outcome) => number): number => os.reduce((a, o) => a + f(o), 0) / os.length;
+  return `L${median(os.map((o) => o.entryLevel))} +${avg((o) => o.levelUps).toFixed(1)} · ${avg((o) => o.skillUses).toFixed(1)}`;
+}
 
 /** 빌드 한 줄 요약 (PROBE_SHOWBUILD): 가방 격자(아이템 머리글자) + 무기 목록 */
 function describeRun(run: RunState): string {
@@ -1242,6 +1584,11 @@ const ANTICIPATE_TIME = 0.6;
 /** 이상적인 회피가 쓰는 바닥 띠의 위끝 (예전 이동 구역 FIELD_H - 260). 더 위로는 가지 않아도 늘 안전한 자리가 있는지 본다 */
 const IDEAL_BAND_TOP = FIELD_H - 260;
 const IDEAL_CANDIDATES: [number, number][] = [];
+/** 띠 위(적 사이) 후보 — 띠가 다 막혔을 때만 (y 300 ~ 띠 위끝, 40 px 간격) */
+const IDEAL_UPPER_CANDIDATES: [number, number][] = [];
+for (let cy = 300; cy < FIELD_H - 260; cy += 40) {
+  for (let x = PLAYER_MIN_X; x <= PLAYER_MAX_X + 0.01; x += 16) IDEAL_UPPER_CANDIDATES.push([Math.min(x, PLAYER_MAX_X), cy]);
+}
 for (let row = 0; row < 5; row++) {
   const cy = IDEAL_BAND_TOP + ((PLAYER_MAX_Y - IDEAL_BAND_TOP) * row) / 4;
   for (let x = X_MIN; x <= X_MAX + 0.01; x += 16) IDEAL_CANDIDATES.push([Math.min(x, X_MAX), cy]);
@@ -1249,7 +1596,8 @@ for (let row = 0; row < 5; row++) {
 
 /** react: 생긴 지 이만큼(초) 안 된 탄·위험 지역은 못 본다 (기본 PROBE_IDEAL_REACT) */
 function idealDodger(
-  moveSpeed: number,
+  /** 경로 예측에 쓰는 이동 속도 — 전투 중 레벨업('가벼운 발걸음')으로 바뀌면 simulateIdeal이 v를 고친다 */
+  speed: { v: number },
   descentSpeed: number,
   react = IDEAL_REACT,
   horizon = IDEAL_HORIZON,
@@ -1290,7 +1638,7 @@ function idealDodger(
     ghost.vy = vy0;
     let best = Infinity;
     for (let k = 1; k <= steps; k++) {
-      stepPlayerMotion(ghost, gx, gy, true, moveSpeed, SIM_DT);
+      stepPlayerMotion(ghost, gx, gy, true, speed.v, SIM_DT);
       const px = ghost.x;
       const py = ghost.y;
       const t = k * SIM_DT;
@@ -1394,6 +1742,18 @@ function idealDodger(
           ty = cy;
         }
       }
+      // 바닥 띠에 안전한 자리가 없고 대형이 띠까지 내려와 있으면(방어선 직전) 띠 위 — 적 사이 — 도 본다: 플레이어는 필드 어디든 갈 수 있다.
+      // 띠에 안전한 자리가 있으면 예전과 같은 판정 (밸런스 조정으로 대형이 더 깊이 내려오는 판이 생겨 추가)
+      if (best + (exposed(tx, ty) ? 500 : 0) < 1000 && bodies.some(([, y, , h]) => y + h + desc * horizon >= IDEAL_BAND_TOP)) {
+        for (const [cx, cy] of IDEAL_UPPER_CANDIDATES) {
+          const sc = score(clearance(cx, cy), cx, cy);
+          if (sc > best) {
+            best = sc;
+            tx = cx;
+            ty = cy;
+          }
+        }
+      }
       // 쏘는 졸개 앞 감점은 빼고 잰다 (anticipate가 아니면 예전과 같은 판정)
       noSafe = best + (exposed(tx, ty) ? 500 : 0) < 1000;
     }
@@ -1424,7 +1784,16 @@ interface IdealOutcome {
   worst3Desc: string;
   /** 처음 '안 맞는 자리가 없던' 순간(초) — 없으면 null */
   noSafeAt: number | null;
+  /**
+   * 그중 '방어선 직전'(살아있는 적 아래 끝이 필드의 NEAR_BREACH 넘게 — 대형이 플레이어 띠 안으로 들어와 몇 초 안에 방어선 패배가 나는 판)에
+   * 일어난 '안 맞는 자리가 없던' 구간 수·접촉 패배 수. 공정성 단언은 이것을 뺀 값으로 본다 (이미 진 판 — 탄막이 아니라 적 몸이 바닥을 메운 것)
+   */
+  noSafeNearBreach: number;
+  contactNearBreach: number;
 }
+
+/** '방어선 직전': 살아있는 적 아래 끝이 이 비율(필드 높이) 넘게 내려온 순간 — 23~34 px/s 하강이면 4~6초 안에 방어선 패배 */
+const NEAR_BREACH = 0.85;
 
 function simulateIdeal(
   source: RunState,
@@ -1445,8 +1814,23 @@ function simulateIdeal(
   const stats = runPlayerStats(data, run);
   const player = speedCap < stats.moveSpeed ? { ...stats, moveSpeed: speedCap } : stats;
   const loadout = runLoadout(data, run);
-  const sim = new CombatSim({ stage, stageIndex, enemies: data.enemies, bosses: data.bosses, loadout, player, hp: run.hp, seed });
-  const ideal = idealDodger(player.moveSpeed, stage.descentSpeed, react, horizon, anticipate);
+  // 실제 게임처럼 전투 중 레벨업(probeChoice)·스킬(skillAi)도 쓴다 — 둘 다 플레이어를 해치는 경로가 없고, 빠진 채로 재면 실제보다 약한 빌드로
+  // 대형이 방어선 바로 위까지 내려와 '안 맞는 자리가 없던' 순간(몸으로 막힘)이 생겼다. PROBE_IDEAL_PLAIN=1이면 예전처럼 둘 다 없이
+  const useLevel = LEVELUPS && !env.PROBE_IDEAL_PLAIN;
+  const useSkill = SKILLS && !env.PROBE_IDEAL_PLAIN;
+  const sim = new CombatSim({
+    stage,
+    stageIndex,
+    enemies: data.enemies,
+    bosses: data.bosses,
+    loadout,
+    player,
+    hp: run.hp,
+    seed,
+    skill: useSkill ? runSkill(data, run) : null,
+  });
+  const speed = { v: player.moveSpeed };
+  const ideal = idealDodger(speed, stage.descentSpeed, react, horizon, anticipate);
   const aimAi = aim === 'manual' ? manualAi(seed, guideRadius(loadout)) : null;
   let dumped = false;
   const hits: { t: number; d: number; src: string; deep: number }[] = [];
@@ -1455,11 +1839,23 @@ function simulateIdeal(
   let bossEnd: number | null = null;
   let shotHits = 0;
   let contactHits = 0;
+  let noSafeNearBreach = 0;
+  let contactNearBreach = 0;
+  let wasNoSafeStep = false;
   let prevShots: EnemyShotEntity[] = [];
   const maxSteps = Math.round(MAX_SIM_SECONDS / SIM_DT);
   for (let i = 0; i < maxSteps && sim.status === 'running'; i++) {
     if (nochill) for (const e of sim.enemies) e.chillTime = 0;
+    const nsBefore = ideal.noSafeTimes.length;
     const planned = ideal.ai(sim);
+    // 이번 스텝이 '안 맞는 자리가 없던' 구간의 시작인가 — 그때 대형 깊이로 '방어선 직전'인지 가른다
+    const nsNow = ideal.noSafeTimes.length > nsBefore;
+    if (nsNow && !wasNoSafeStep) {
+      let deepLive = 0;
+      for (const e of sim.enemies) if (e.alive) deepLive = Math.max(deepLive, e.y + e.h);
+      if (deepLive / FIELD_H > NEAR_BREACH) noSafeNearBreach++;
+    }
+    wasNoSafeStep = nsNow;
     // PROBE_DUMP_NOSAFE=1: 판마다 처음 '안 맞는 자리가 없던' 순간의 장면(플레이어·적 탄·위험 지역·적)을 찍는다 — 무엇이 겹쳤는지 볼 때
     if (env.PROBE_DUMP_NOSAFE && !dumped && ideal.noSafeTimes.length > 0 && ideal.noSafeTimes[ideal.noSafeTimes.length - 1] === sim.time) {
       dumped = true;
@@ -1484,8 +1880,14 @@ function simulateIdeal(
       if (e.boss && bossSeen === null && e.y + e.h > 0) bossSeen = sim.time;
     }
     for (const ev of sim.drainEvents()) {
+      if (ev.type === 'kill' && useLevel) grantKillXp(data, run, ev.defId);
       if (ev.type === 'kill' && ev.boss) bossEnd = sim.time;
-      if (ev.type === 'lost' && ev.reason === 'contact') contactHits++;
+      if (ev.type === 'lost' && ev.reason === 'contact') {
+        contactHits++;
+        let deepLive = 0;
+        for (const e of sim.enemies) if (e.alive) deepLive = Math.max(deepLive, e.y + e.h);
+        if (deepLive / FIELD_H > NEAR_BREACH) contactNearBreach++;
+      }
       if (ev.type !== 'playerHit') continue;
       let src = '?';
       shotHits++;
@@ -1502,6 +1904,14 @@ function simulateIdeal(
       }
       hits.push({ t: sim.time, d: ev.damage, src, deep: deepNow / FIELD_H });
     }
+    if (useLevel && sim.status === 'running' && pendingLevelUps(run) > 0) {
+      resolveLevelUps(run);
+      const ps = runPlayerStats(data, run);
+      const p2 = speedCap < ps.moveSpeed ? { ...ps, moveSpeed: speedCap } : ps;
+      sim.setLoadout(runLoadout(data, run), p2);
+      speed.v = p2.moveSpeed;
+    }
+    if (useSkill && skillAi(sim)) sim.activateSkill();
   }
   let unavoidable = 0;
   for (const h of hits) if (ideal.noSafeTimes.some((t) => t <= h.t + 1e-9 && t > h.t - horizon - 1e-9)) unavoidable++;
@@ -1528,6 +1938,8 @@ function simulateIdeal(
     shotHits,
     contactHits,
     noSafeEpisodes: ideal.episodes(),
+    noSafeNearBreach,
+    contactNearBreach,
     unavoidable,
     avoidable: hits.length - unavoidable,
     worst3: worst / sim.player.maxHp,
@@ -1555,6 +1967,7 @@ describe('balance probe', () => {
         String(st.clearGold),
         (s.killGold + st.clearGold).toFixed(0),
         s.drops.toFixed(1),
+        Object.entries(s.special).map(([id, n]) => `${id} ${n}`).join(', ') || '-',
       ];
     });
 
@@ -1601,7 +2014,7 @@ describe('balance probe', () => {
           `${label} ${c.padEnd(8)} bag ${r.bag.cols}x${r.bag.rows} dps ${Math.round(sheetDps(runLoadout(data, r)))}` +
           ` weapons [${runLoadout(data, r).map((l) => `${l.defId}${l.tier > 1 ? `★${l.tier}` : ''}${l.elements.length ? `{${l.elements.join(',')}}` : ''}${l.count > 1 ? `x${l.count}` : ''}`).join(' ')}]` +
           ` other [${r.bag.items.filter((it) => data.items[it.defId].kind !== 'weapon').map((it) => it.defId).join(' ')}]` +
-          (n.length ? ` merges: ${n.join(', ')}` : '');
+          (n.length ? ` notes (L<stage>: = level-ups picked after that stage; merges): ${n.join(', ')}` : '');
         buildLog.push(describeBuild(data.stages[s].id, run, notes));
         if (s > 0) {
           const strong = buildRun(c, s, 'strong');
@@ -1690,9 +2103,52 @@ describe('balance probe', () => {
     console.log(
       `\n[balance probe] stages (rows incl. empty separators; (Ns) = rows×CELL/descent, time for the last row to reach the top edge)\n` +
         table(
-          ['stage', 'rows', 'waves', 'enemies', 'attackers', 'elites', 'total HP', 'descent / hp / dmg', 'E[kill g]', 'clear', 'E[income]', 'E[drops]'],
+          ['stage', 'rows', 'waves', 'enemies', 'attackers', 'elites', 'total HP', 'descent / hp / dmg', 'E[kill g]', 'clear', 'E[income]', 'E[drops]', 'behaving enemies'],
           shapeRows,
         ),
+    );
+    // 백어택·행동하는 적: 스테이지마다 프로브 빌드 판(자동 회피 2 + 가만히 + 수동)의 판당 평균
+    const behaveRows = data.stages.map((st, i) => {
+      const os = dens.build[i];
+      const per = (f: (o: Outcome) => number): string => (os.reduce((a, o) => a + f(o), 0) / Math.max(1, os.length)).toFixed(1);
+      const direct = os.reduce((a, o) => a + o.directHits, 0);
+      return [
+        st.id,
+        `${pct(os.reduce((a, o) => a + o.backHits, 0) / Math.max(1, direct))}`,
+        per((o) => o.blocked),
+        per((o) => o.healed),
+        per((o) => o.blasts),
+        per((o) => o.spawned),
+        per((o) => o.shifts),
+      ];
+    });
+    console.log(
+      `\n[balance probe] back attacks and behaving enemies — build runs (2× auto dodge, still, manual), per run` +
+        `\n  back = share of direct hits on an enemy's top face (×BACK_ATTACK_MUL); blocked = shots reflected by a shield's front;` +
+        ` healed = HP restored by healers; blasts = bomber death blasts; spawned = splitlings; shifts = RC car side steps\n` +
+        table(['stage', 'back', 'blocked', 'healed', 'blasts', 'spawned', 'shifts'], behaveRows),
+    );
+    // 레벨업·스킬: 스테이지 × 캐릭터마다 프로브 빌드 판(자동 회피 2 + 가만히 + 수동)의 판당 평균
+    const levelRows = data.stages.flatMap((st, i) =>
+      CHARACTERS.map((c, ci) => {
+        const os = dens.build[i].slice(ci * 4, ci * 4 + 4);
+        const per = (f: (o: Outcome) => number): string => (os.reduce((a, o) => a + f(o), 0) / Math.max(1, os.length)).toFixed(1);
+        return [
+          st.id,
+          c,
+          String(os[0]?.entryLevel ?? '-'),
+          per((o) => o.levelUps),
+          `${per((o) => o.levelKinds.item)} / ${per((o) => o.levelKinds.upgrade)} / ${per((o) => o.levelKinds.boon)}`,
+          per((o) => o.skillUses),
+          `${os.filter((o) => o.won).length}/${os.length}`,
+        ];
+      }),
+    );
+    console.log(
+      `\n[balance probe] level-ups and skills — build runs (2× auto dodge, still, manual), per run` +
+        `\n  entry = level at the start of the stage (build pre-picked the level-ups of earlier stages, all enemies killed);` +
+        ` level-ups = picked during the fight (item / ★+1 / boon); skill = activations (${LEVELUPS ? 'level-ups on' : 'PROBE_LEVELUP=0'}, ${SKILLS ? 'skills on' : 'PROBE_SKILL=0'})\n` +
+        table(['stage', 'char', 'entry lv', 'level-ups', 'item / ★+1 / boon', 'skill uses', 'won'], levelRows),
     );
     console.log(
       `\n[balance probe] economy — bank = gold available at that shop (expected / measured), spend = probe build purchases there` +
@@ -1770,7 +2226,9 @@ describe('balance probe', () => {
   }, 120_000);
 
   it('win-rate sweep: seeds × characters per stage and build, plus chained runs (HP carried over)', () => {
-    const stageIdx = data.stages.map((_, i) => i).filter((i) => !SWEEP_STAGES || SWEEP_STAGES.includes(i));
+    // PROBE_CHAIN_ONLY=1: 스테이지 표는 건너뛰고 이어서 하는 런만 (PROBE_CHARS로 캐릭터별 병렬, PROBE_CHAINS=build manual,… 로 런 종류 고르기)
+    const chainOnly = !!env.PROBE_CHAIN_ONLY;
+    const stageIdx = chainOnly ? [] : data.stages.map((_, i) => i).filter((i) => !SWEEP_STAGES || SWEEP_STAGES.includes(i));
     const rows: string[][] = [];
     const all: Outcome[] = [];
     let ms = 0;
@@ -1830,6 +2288,7 @@ describe('balance probe', () => {
           [breach ? `breach ${breach}` : '', dead ? `hp ${dead}` : '', crushed ? `contact ${crushed}` : ''].filter(Boolean).join(', ') || '-',
           takenShares(outs),
           bossShares(withBoss),
+          lvSkill(outs),
         ]);
       }
     }
@@ -1837,13 +2296,15 @@ describe('balance probe', () => {
     // ── 이어서 하는 런: HP를 다음 스테이지로 가져간다 (클리어 회복 30%, 상점에서 HP가 60% 밑이면 회복 50% 구매) ──
     const HEAL_BELOW = 0.6;
     const chainRows: string[][] = [];
-    if (!SWEEP_STAGES && !SWEEP_COL_FILTER) {
+    if (chainOnly || (!SWEEP_STAGES && !SWEEP_COL_FILTER)) {
       const chains: { label: string; mode: BuildMode; aim: 'auto' | 'manual' }[] = [
         { label: 'build manual', mode: 'probe', aim: 'manual' },
         { label: 'build auto', mode: 'probe', aim: 'auto' },
         { label: 'strong manual', mode: 'strong', aim: 'manual' },
       ];
+      const chainFilter = env.PROBE_CHAINS ? env.PROBE_CHAINS.split(',') : null;
       for (const ch of chains) {
+        if (chainFilter && !chainFilter.includes(ch.label)) continue;
         const diedAt = new Array<number>(data.stages.length).fill(0);
         let wins = 0;
         let heals = 0;
@@ -1905,12 +2366,14 @@ describe('balance probe', () => {
         `\n  pre-boss hp lost = HP lost (of max) before the boss came on screen, median (min–max) · gear hits per boss volley` +
         ` (5 gears; a gear passing during invulnerability doesn't count) of boss volleys per run (avg)` +
         `\n  damage taken from = top 3 sources of all HP lost in the row (gear = boss, dart/12 = dart gun, dart/14 = teddy, bolt = robot, spring = jack)` +
-        `\n  boss direct damage = share of projectile direct damage on the boss added by chill (+25%) · top 4 weapons\n` +
+        `\n  boss direct damage = share of projectile direct damage on the boss added by chill (+25%) · top 4 weapons` +
+        `\n  lv · skill = start level (median) + level-ups picked in the fight (avg) · skill activations (avg)\n` +
         table(
           [
             'stage', 'config', 'win', ...CHARACTERS, 'deep', 'hp lost', 'boss', 'boss chill · above / gatling · dps',
             'pre-boss hp lost · gear hits/volley of volleys', 'time', 'losses', 'damage taken from',
             'boss direct damage: chill bonus · by weapon',
+            'lv · skill',
           ],
           rows,
         ) +
@@ -1921,7 +2384,7 @@ describe('balance probe', () => {
         `\n  ${all.length} sweep sims + chains, ${Math.round(ms)} ms\n`,
     );
     for (const r of all) expect(r.status).not.toBe('TIMEOUT');
-  }, 600_000);
+  }, 3_600_000);
 
   // 공정성: PROBE_IDEAL=1 npx vitest run tests/balance.probe.test.ts -t ideal --silent=false (+ PROBE_SEEDS·PROBE_SEED_LIST·PROBE_STAGES·
   // PROBE_CHARS·PROBE_PATCH, PROBE_IDEAL_REACT, PROBE_IDEAL_MOVE=probe). 시드 16개 × 캐릭터 3 전체 약 70초.
@@ -1956,7 +2419,8 @@ describe('balance probe', () => {
               `${pct(won.length / outs.length)} (${perChar.join(' ')})`,
               won.length ? `${pct(median(won.map((o) => o.deepest)))} / ${pct(median(won.map((o) => o.lostFrac)))}${boss.length ? ` / ${median(boss).toFixed(0)}s` : ''}` : '-',
               `${(sum((o) => o.shotHits) / outs.length).toFixed(2)} / ${(sum((o) => o.contactHits) / outs.length).toFixed(2)}`,
-              `${sum((o) => o.noSafeEpisodes)} · ${sum((o) => o.unavoidable)} / ${sum((o) => o.avoidable)}`,
+              `${sum((o) => o.noSafeEpisodes)} · ${sum((o) => o.unavoidable)} / ${sum((o) => o.avoidable)}` +
+                (sum((o) => o.noSafeNearBreach + o.contactNearBreach) > 0 ? ` (near-breach ${sum((o) => o.noSafeNearBreach)} / ${sum((o) => o.contactNearBreach)})` : ''),
               `${pct(worst.worst3)}${worst.worst3 > 0 ? ` (${worst.worst3Desc})` : ''} · med ${pct(median(outs.map((o) => o.worst3)))}`,
               [...new Set(losses)].map((k) => `${k} ${losses.filter((x) => x === k).length}`).join(', ') || '-',
             ]);
@@ -1972,11 +2436,13 @@ describe('balance probe', () => {
         `\n  worst 3 s = max HP lost within 3 s (of max HP) over all runs (sources, time, deepest enemy) · median over runs\n` +
         table(['stage', 'config', 'win', 'deep / hp lost / boss', 'hits/run shot / contact loss', 'noSafe · unavoidable / avoidable', 'worst 3 s', 'losses'], rows),
     );
-    // 피할 수 없는 탄막이 없어야 한다 (반응 시간 0, 이상적인 이동일 때). 적 몸에 닿아 지는 일도 없어야 한다
+    // 피할 수 없는 탄막이 없어야 한다 (반응 시간 0, 이상적인 이동일 때). 적 몸에 닿아 지는 일도 없어야 한다.
+    // '방어선 직전'(대형 아래 끝이 필드의 NEAR_BREACH 넘게 — 이미 몇 초 안에 방어선으로 지는 판)에서 대형 몸이 바닥 띠를 메워 생긴 것은 빼고 본다
+    // (네 번째 조정 뒤 적 체력이 ~3배라 진 판에서 대형이 바닥까지 내려오는 일이 생겼다 — 표의 near-breach 칸에 따로 센다)
     if (!probeMove && IDEAL_REACT === 0) {
       for (const o of all) {
-        expect(o.noSafeEpisodes).toBe(0);
-        expect(o.contactHits).toBe(0);
+        expect(o.noSafeEpisodes - o.noSafeNearBreach).toBe(0);
+        expect(o.contactHits - o.contactNearBreach).toBe(0);
       }
     }
   }, 3_600_000);
@@ -1998,11 +2464,14 @@ describe('balance probe', () => {
     const all: Outcome[] = [];
     const summary: string[] = [];
     let ms = 0;
-    const cols: { label: string; aim: 'auto' | 'manual'; still: boolean }[] = [
+    // lane camp = 보스 옆 통로 캠핑 꼼수 (laneCamper — 왼쪽 통로 위쪽에서 거의 수직으로만 쏜다). still = 가만히, smart = 위험 지역만 피했다 돌아옴
+    const cols: { label: string; aim: 'auto' | 'manual'; still: boolean; ai?: () => Ai }[] = [
       { label: 'auto dodge', aim: 'auto', still: false },
       { label: 'manual dodge', aim: 'manual', still: false },
       { label: 'auto still', aim: 'auto', still: true },
       { label: 'manual still', aim: 'manual', still: true },
+      { label: 'lane camp still', aim: 'manual', still: true, ai: () => laneCamper(false) },
+      { label: 'lane camp smart', aim: 'manual', still: false, ai: () => laneCamper(true) },
     ];
     const avg = (xs: number[]): number => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN);
     const lossText = (outs: Outcome[]): string =>
@@ -2021,7 +2490,7 @@ describe('balance probe', () => {
       for (const col of cols) {
         const outs: Outcome[] = [];
         for (const seed of BOSS_SEEDS) {
-          const o = simulate(run, 0, seed, aiFor(col, run, seed), stage);
+          const o = simulate(run, 0, seed, col.ai ? col.ai() : aiFor(col, run, seed), stage);
           outs.push(o);
           ms += o.ms;
         }
@@ -2046,6 +2515,7 @@ describe('balance probe', () => {
           `${avg(outs.map((o) => o.hazardHits)).toFixed(2)} / ${avg(outs.map((o) => o.shotHits)).toFixed(2)}`,
           takenShares(outs),
           lossText(outs) || '-',
+          lvSkill(outs),
         ]);
       }
       const rate = (labels: string[]): string => {
@@ -2056,7 +2526,9 @@ describe('balance probe', () => {
       summary.push(
         `  ${c.padEnd(8)} manual dodge win ${rate(['manual dodge'])} (${lossText(md) || 'no losses'}), ` +
           `won fight ${md.some((o) => o.won) ? median(md.filter((o) => o.won).map((o) => o.time)).toFixed(0) : '-'}s · ` +
-          `auto dodge win ${rate(['auto dodge'])} · still win ${rate(['auto still', 'manual still'])}`,
+          `auto dodge win ${rate(['auto dodge'])} · still win ${rate(['auto still', 'manual still'])}` +
+          ` · lane camp still / smart win ${rate(['lane camp still'])} / ${rate(['lane camp smart'])}` +
+          ` (won fight ${['lane camp still', 'lane camp smart'].map((l) => (byCol[l].some((o) => o.won) ? median(byCol[l].filter((o) => o.won).map((o) => o.time)).toFixed(0) : '-')).join(' / ')}s)`,
       );
     }
     const dodgeLosses = all.filter((o, i) => !o.won && Math.floor(i / BOSS_SEEDS.length) % cols.length < 2);
@@ -2120,7 +2592,8 @@ describe('balance probe', () => {
         `\n  boss dps = median boss damage per second on screen; top hits · share = direct hits on the boss top face (ball above the boss — the` +
         ` side-lane 'back attack') per run · their share of boss damage` +
         `\n  minions = avg alive / peak · summoned / killed per run · share of player direct hits taken by minions (shield) · median deepest minion bottom (100% = breach)` +
-        `\n  hits/run = hazard (slam / marble) / enemy shot hits; still = stand at bottom-center (no dodging)\n` +
+        `\n  hits/run = hazard (slam / marble) / enemy shot hits; still = stand at bottom-center (no dodging)` +
+        `\n  lv · skill = start level + level-ups picked in the fight from minion kills (avg) · skill activations (avg)\n` +
         table(
           [
             'char',
@@ -2135,6 +2608,7 @@ describe('balance probe', () => {
             'hits/run hazard / shot',
             'damage taken from',
             'losses',
+            'lv · skill',
           ],
           rows,
         ) +
@@ -2155,5 +2629,156 @@ describe('balance probe', () => {
       expect(o.unavoidable).toBe(0);
       expect(o.contactHits).toBe(0);
     }
-  }, 600_000);
+  }, 3_600_000);
+
+  // ── 레벨업 선택지 분석: 그리디 평가 (PROBE_GREEDY=1 npx vitest run tests/balance.probe.test.ts -t greedy --silent=false) ──
+  // 캐릭터 × 런 시드(PROBE_GREEDY_RUNS — 레벨업 선택지 운)마다 프로브 빌드(PROGRESSION 상점)로 st1 → st5를 쌓으며 앞 스테이지의 레벨업을
+  // 모두 greedyChooser로 고른다(선택지마다 그 선택 + 바로 다음 상점 구매로 다음 전투를 시드 PROBE_GREEDY_SEEDS판, 수동 조준 회피 AI). 표:
+  //  - 다음 전투 스테이지별: 선택 수 · 고른 종류 비율(새 아이템 무기/돌/장비 · ★ + 1 무기/그 밖 · 런 보너스) · 프로브 AI(probeChoice)와 같은 선택 · 1등과 2등 점수 차 중앙값
+  //  - 종류별·보너스별: 나온 선택 수 · 고른 수 · 나왔을 때 고른 비율 (한 보너스가 나오기만 하면 늘 이기면 '지배')
+  it.runIf(!!env.PROBE_GREEDY)('level-up choices: greedy evaluator (pick mix by kind, boon pick rates)', () => {
+    const runSeeds = (env.PROBE_GREEDY_RUNS ?? '7,21,99,1234,4242,8080').split(',').map(Number);
+    const evalSeeds = (env.PROBE_GREEDY_SEEDS ?? '11,2024').split(',').map(Number);
+    const log: GreedyPick[] = [];
+    const finals: string[] = [];
+    const last = data.stages.length - 1;
+    for (const c of CHARACTERS) {
+      for (const rs of runSeeds) {
+        const { run } = buildRun(c, last, 'probe', { seed: rs, chooseFor: (next, shop) => greedyChooser(next, shop, evalSeeds, log) });
+        finals.push(`  ${c.padEnd(8)} run ${String(rs).padEnd(5)} L${runLevel(run)} boons ${JSON.stringify(run.boons ?? {})} | ${describeRun(run)}`);
+      }
+    }
+    const kindOf = (c: LevelUpChoice): string =>
+      c.kind === 'boon' ? 'boon' : c.kind === 'upgrade' ? (items[c.defId].kind === 'weapon' ? '★+1 weapon' : '★+1 other') : `item ${items[c.defId].kind}`;
+    const KINDS = ['item weapon', 'item stone', 'item gear', '★+1 weapon', '★+1 other', 'boon'];
+    const margin = (p: GreedyPick): number => {
+      const sc = [...p.scores].sort((a, b) => b - a);
+      return sc[0] - (sc[1] ?? sc[0]);
+    };
+    const mixRow = (label: string, ps: GreedyPick[]): string[] => {
+      const picked = ps.map((p) => kindOf(p.offer[p.pick]));
+      const n = Math.max(1, ps.length);
+      return [
+        label,
+        String(ps.length),
+        ...KINDS.map((k) => pct(picked.filter((x) => x === k).length / n)),
+        pct(ps.filter((p) => p.offer[p.pick].kind === 'item' && !p.fits[p.pick]).length / n),
+        pct(ps.filter((p) => p.pick === p.probe).length / n),
+        ps.length ? median(ps.map(margin)).toFixed(3) : '-',
+      ];
+    };
+    const stageRows: string[][] = [];
+    for (let st = 1; st <= last; st++) {
+      const ps = log.filter((p) => p.stage === st);
+      if (ps.length > 0) stageRows.push(mixRow(`L${st} → ${data.stages[st].id}`, ps));
+    }
+    stageRows.push(mixRow('all', log));
+    const rateRow = (label: string, has: (c: LevelUpChoice) => boolean): string[] => {
+      const offered = log.filter((p) => p.offer.some(has));
+      const picked = offered.filter((p) => has(p.offer[p.pick]));
+      return [label, String(offered.length), String(picked.length), offered.length ? pct(picked.length / offered.length) : '-'];
+    };
+    const kindRows = KINDS.map((k) => rateRow(k, (c) => kindOf(c) === k));
+    const boonRows = Object.keys(data.boons).map((id) => rateRow(`boon ${id}`, (c) => c.kind === 'boon' && c.boon === id));
+    const itemCounts: Record<string, number> = {};
+    for (const p of log) {
+      const c = p.offer[p.pick];
+      if (c.kind !== 'boon') {
+        const k = `${c.kind === 'upgrade' ? '★' : '+'}${c.defId.replace(/^[wsg]_/, '')}`;
+        itemCounts[k] = (itemCounts[k] ?? 0) + 1;
+      }
+    }
+    console.log(
+      `\n[level-up greedy] ${CHARACTERS.length} characters × ${runSeeds.length} run seeds, probe shop purchases, every level-up of st1–st${last} picked by a greedy evaluator:` +
+        `\n  each choice applied (+ the next shop's purchases) and the next stage simulated (${evalSeeds.length} seeds, manual-aim dodge AI, no further level-ups);` +
+        `\n  score = won + 0.5·HP left + 0.5·(1 − deepest) + 0.5·kill share − 0.002·seconds; agree = same pick as the probe AI's fixed rule; margin = best − 2nd score (median)\n` +
+        table(['level-ups', 'picks', ...KINDS, 'item → stash', 'agree probe AI', 'margin'], stageRows) +
+        `\n\n  pick rate when offered (an offer counts once per kind):\n` +
+        table(['choice', 'offered', 'picked', 'pick rate'], [...kindRows, ...boonRows]) +
+        `\n  items picked: ${Object.entries(itemCounts).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', ')}` +
+        `\n  final builds (st5):\n${finals.join('\n')}\n`,
+    );
+    expect(log.length).toBeGreaterThan(0);
+  }, 3_600_000);
+
+  // ── 시너지 조합 분석 (PROBE_SYNERGY=1 npx vitest run tests/balance.probe.test.ts -t "synergy combos" --silent=false) ──
+  // 프로브 빌드의 st4·st5 상점 구매(토스터 + 불 속성석 / 수박 + 얼음 속성석 + 공격 강화석, 합 72골드)를 비슷한 돈의 시너지 조합으로 바꿔
+  // st4·st5를 돌린다(시드 × 캐릭터, 수동·자동 회피, 가만히). 같은 시드의 generic(바꾸지 않음)·strong(잘하는 사람)과 비교 —
+  // 조합 하나가 승률·시간·가장 깊은 적을 strong보다 크게 좋게 만들면 '판을 깨는' 조합이다. 밀도(살아있는 투사체 평균/최대)도 함께.
+  it.runIf(!!env.PROBE_SYNERGY)('synergy combos: shop combos vs the generic build (st4, st5)', () => {
+    const A = (...ids: string[]): Addition[] => ids.map((defId) => ({ defId }));
+    const combos: { name: string; shop3: Addition[]; shop4: Addition[] }[] = [
+      { name: 'generic', shop3: PROGRESSION[3].add, shop4: PROGRESSION[4].add },
+      { name: 'trampoline+seed+mirror', shop3: A('g_trampoline', 's_seed'), shop4: A('s_mirror', 's_seed') },
+      { name: 'rubber+hammer', shop3: A('s_rubber', 's_hammer', 's_rubber'), shop4: A('s_hammer', 's_rubber', 's_ribbon') },
+      { name: 'kettle+fire/ice', shop3: A('g_kettle', 's_ice', 's_fire'), shop4: A('w_watermelon', 's_ice', 's_match') },
+      { name: 'firecracker x2', shop3: A('g_firecracker', 's_power', 's_haste'), shop4: A('g_firecracker', 'w_watermelon') },
+      { name: 'coil+lightning', shop3: A('s_lightning', 's_coil', 's_coil'), shop4: A('s_lightning', 's_coil', 's_mirror') },
+      { name: 'ribbon+wheel+mushroom', shop3: A('s_wheel', 's_mushroom', 's_mushroom'), shop4: A('s_ribbon', 's_wheel', 's_mushroom') },
+      { name: 'match+seed', shop3: A('s_match', 's_seed', 's_power'), shop4: A('s_match', 's_seed', 'g_firecracker') },
+    ];
+    const comboFilter = env.PROBE_COMBOS ? env.PROBE_COMBOS.split(',') : null;
+    const cfgs: { label: string; aim: 'auto' | 'manual'; still?: boolean }[] = [
+      { label: 'manual', aim: 'manual' },
+      { label: 'auto', aim: 'auto' },
+      { label: 'still', aim: 'auto', still: true },
+    ];
+    const rows: string[][] = [];
+    let ms = 0;
+    for (const s of SWEEP_STAGES ?? [3, 4]) {
+      const variants: { name: string; build: (c: string) => RunState }[] = [
+        ...combos
+          .filter((cb) => !comboFilter || cb.name === 'generic' || comboFilter.includes(cb.name))
+          .map((cb) => ({
+            name: cb.name,
+            build: (c: string): RunState => {
+              const prog: Progression = PROGRESSION.map((st, i) => ({ expand: st.expand, add: i === 3 ? cb.shop3 : i === 4 ? cb.shop4 : st.add }));
+              return buildRun(c, s, 'probe', { prog }).run;
+            },
+          })),
+        { name: 'strong', build: (c: string): RunState => buildRun(c, s, 'strong').run },
+      ];
+      for (const v of variants) {
+        const runs = CHARACTERS.map((c) => v.build(c));
+        const cells: string[] = [];
+        let densAvg = 0;
+        let densPeak = 0;
+        let densN = 0;
+        for (const cfg of cfgs) {
+          const outs: Outcome[] = [];
+          for (const run of runs) {
+            for (const seed of SWEEP_SEEDS) {
+              const o = simulate(run, s, seed, aiFor(cfg, run, seed));
+              outs.push(o);
+              ms += o.ms;
+              if (!cfg.still) {
+                densAvg += o.avgProj;
+                densPeak = Math.max(densPeak, o.maxProj);
+                densN++;
+              }
+            }
+          }
+          const won = outs.filter((o) => o.won);
+          cells.push(
+            `${pct(won.length / outs.length)} d${won.length ? Math.round(median(won.map((o) => o.deepest)) * 100) : '-'}` +
+              ` h${won.length ? Math.round(median(won.map(hpLost)) * 100) : '-'} ${Math.round(median(outs.map((o) => o.time)))}s`,
+          );
+        }
+        rows.push([
+          data.stages[s].id,
+          v.name,
+          String(Math.round(median(runs.map((r) => sheetDps(runLoadout(data, r)))))),
+          ...cells,
+          `${(densAvg / Math.max(1, densN)).toFixed(1)} / ${densPeak}`,
+        ]);
+      }
+    }
+    console.log(
+      `\n[synergy combos] ${SWEEP_SEEDS.length} seeds × ${CHARACTERS.length} characters per cell; st4/st5 shop purchases replaced by the combo (generic = probe build, strong = STRONG)` +
+        `\n  cell = win · median deepest % · median HP lost % (won runs) · median time; dps = median sheet dps (no synergy effects); density = live projectiles avg / peak (dodge runs)\n` +
+        table(['stage', 'variant', 'dps', ...cfgs.map((c) => c.label), 'density'], rows) +
+        `\n  ${Math.round(ms)} ms\n`,
+    );
+    expect(rows.length).toBeGreaterThan(0);
+  }, 3_600_000);
 });

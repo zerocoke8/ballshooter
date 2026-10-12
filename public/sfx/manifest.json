@@ -24,6 +24,9 @@
     "bounce_wall_1.mp3",
     "bounce_wall_2.mp3"
   ],
+  "card_flip": [
+    "card_flip_1.mp3"
+  ],
   "coin": [
     "coin_1.mp3",
     "coin_2.mp3"
@@ -95,6 +98,9 @@
   "heal": [
     "heal_1.mp3"
   ],
+  "heal_pulse": [
+    "heal_pulse_1.mp3"
+  ],
   "hit_heavy": [
     "hit_heavy_1.mp3",
     "hit_heavy_2.mp3"
@@ -124,6 +130,9 @@
     "kill_pop_2.mp3",
     "kill_pop_3.mp3"
   ],
+  "level_up": [
+    "level_up_1.mp3"
+  ],
   "marble_impact": [
     "marble_impact_1.mp3"
   ],
@@ -136,6 +145,21 @@
   "player_hurt": [
     "player_hurt_1.mp3",
     "player_hurt_2.mp3"
+  ],
+  "shield_block": [
+    "shield_block_1.mp3"
+  ],
+  "skill_hairstorm": [
+    "skill_hairstorm_1.mp3"
+  ],
+  "skill_hotspring": [
+    "skill_hotspring_1.mp3"
+  ],
+  "skill_ice": [
+    "skill_ice_1.mp3"
+  ],
+  "skill_ready": [
+    "skill_ready_1.mp3"
   ],
   "slam_impact": [
     "slam_impact_1.mp3"

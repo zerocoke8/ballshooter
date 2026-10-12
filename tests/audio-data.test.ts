@@ -49,9 +49,11 @@ describe('sfx.json', () => {
     expect(/^[\x20-\x7e]+$/.test(d.prompt)).toBe(true);
   });
 
-  it('전체 생성량은 예산 안 (총 길이 ≤ 60초)', () => {
+  // 첫 생성 50초(64클립) + 보스 테스트 4.5초 + 재미 기능 연출 8종 5.8초(2026-10-12, 승인된 소액 생성) = 60.7초.
+  // 새 효과음을 더할 땐 이 상한을 올리기 전에 기존 클립을 빌려 쓸 수 있는지 먼저 본다(초당 약 10 크레딧).
+  it('전체 생성량은 예산 안 (총 길이 ≤ 62초)', () => {
     const total = SFX_DEFS.reduce((a, d) => a + d.variants * d.duration, 0);
-    expect(total).toBeLessThanOrEqual(60);
+    expect(total).toBeLessThanOrEqual(62);
   });
 });
 

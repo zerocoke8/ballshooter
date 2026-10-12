@@ -37,6 +37,8 @@ export class WeaponBar extends Container {
   private slots: Slot[] = [];
   private readonly hint: Text;
   private barH = 220;
+  /** 오른쪽에 비워 둘 폭 (스킬 버튼 자리) — 슬롯·힌트는 남은 폭 가운데 */
+  private rightInset = 0;
   private hintAlpha = 1;
   private hintDismissed = false;
   private clock = 0;
@@ -53,6 +55,14 @@ export class WeaponBar extends Container {
   /** 하단 바 높이가 바뀌면 */
   setHeight(h: number): void {
     this.barH = h;
+    this.layoutSlots();
+  }
+
+  /** 오른쪽 px만큼 비워 둔다 (스킬 버튼). 슬롯이 남은 폭 안에서 가운데 정렬된다 */
+  setRightInset(px: number): void {
+    const v = Math.max(0, px);
+    if (v === this.rightInset) return;
+    this.rightInset = v;
     this.layoutSlots();
   }
 
@@ -132,7 +142,8 @@ export class WeaponBar extends Container {
     const n = this.slots.length;
     const rows = n > PER_ROW_MAX ? 2 : 1;
     const perRow = Math.max(1, Math.ceil(n / rows));
-    const availW = DESIGN_W - SIDE * 2;
+    const usableW = DESIGN_W - this.rightInset;
+    const availW = usableW - SIDE * 2;
     const byW = (availW - GAP * (perRow - 1)) / perRow;
     const byH = (this.barH - TOP - 70 - GAP * (rows - 1)) / rows;
     const size = Math.floor(Math.max(SLOT_MIN, Math.min(SLOT_MAX, byW, byH)));
@@ -141,13 +152,13 @@ export class WeaponBar extends Container {
       const col = i % perRow;
       const inRow = row === rows - 1 ? n - perRow * (rows - 1) : perRow;
       const rowW = inRow * size + (inRow - 1) * GAP;
-      const x = (DESIGN_W - rowW) / 2 + col * (size + GAP);
+      const x = (usableW - rowW) / 2 + col * (size + GAP);
       const y = TOP + row * (size + GAP);
       this.drawSlot(this.slots[i], size);
       this.slots[i].root.position.set(x + size / 2, y + size / 2);
     }
     const slotsBottom = TOP + rows * size + (rows - 1) * GAP;
-    this.hint.position.set(DESIGN_W / 2, Math.min(this.barH - 30, slotsBottom + (this.barH - slotsBottom) / 2));
+    this.hint.position.set(usableW / 2, Math.min(this.barH - 30, slotsBottom + (this.barH - slotsBottom) / 2));
     this.hint.visible = !this.hintDismissed && this.barH - slotsBottom > 56;
     this.hint.alpha = 0.8 * this.hintAlpha;
   }

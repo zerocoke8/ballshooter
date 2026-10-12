@@ -97,10 +97,114 @@ export const BOSS_REHIT_DAMAGE_MUL = 0.3;
  * 내려앉는 순간 그 자리에 있으면 일반 규칙대로 접촉 패배. 렌더의 소환 튀어나오기(visual.ts SUMMON_HOP_TIME)와 같은 값.
  */
 export const SUMMON_LAND_TIME = 0.32;
+/**
+ * 보스 통로 캠핑 대응 (docs/DESIGN.md '통로 캠핑 — 구슬 기둥'): 플레이어가 '캠핑 자리' — 양옆 통로(보스 왼끝·오른끝 바깥)의 보스 아래 끝 +
+ * BOSS_CAMP_DEPTH보다 위, 또는 보스 위 틈 — 에 모두 BOSS_CAMP_TIME초 넘게 있으면 보스가 쉬는 중(idle — 행동 사이 쉬는 시간도 건너뜀)에 곧바로
+ * '구슬 기둥'을 쓴다: 그 통로(보스 위 틈이면 플레이어 자리)를 천장부터 보스 아래 끝 + BOSS_CAMP_DEPTH(보스 위면 보스 위끝)까지 덮는 구슬 —
+ * 구슬 비 행동(BossMarblesSpec)의 반경·발동·그림, 피해 × BOSS_CAMP_DAMAGE_MUL. 통로를 따라 보스 바로 아래로만 비켜 계속 쏘지 못하게 깊이를 둔다.
+ * 예고 = max(구슬 예고, BOSS_CAMP_REACT + 기둥 밖까지 걸어갈 거리 / 이동 속도 + PLAYER_ACCEL_TIME) — 통로 어디에 서 있든 보고 걸어서 빠져나갈 수 있다.
+ * 다음 기둥까지 BOSS_CAMP_COOLDOWN초(쓰는 순간부터). 보스 아래 끝보다 아래에 있으면 쌓인 시간이 BOSS_CAMP_DECAY배 속도로 줄어든다.
+ * RNG를 쓰지 않는다 — 통로에 들어가지 않는 판(프로브 회피 AI·이상적인 회피)은 예전과 비트 단위로 같다.
+ */
+export const BOSS_CAMP_TIME = 0.8;
+export const BOSS_CAMP_DEPTH = 168;
+export const BOSS_CAMP_COOLDOWN = 2.5;
+export const BOSS_CAMP_DECAY = 2;
+export const BOSS_CAMP_REACT = 0.45;
+export const BOSS_CAMP_DAMAGE_MUL = 2;
+/** 구슬 기둥의 구슬은 떨어진 뒤 이 시간(초) 동안 그 자리에 남아 닿으면 아프다(구슬마다 한 번) — 통로를 그동안 막는다 */
+export const BOSS_CAMP_ACTIVE = 2;
+/**
+ * 백어택: 투사체 직접 적중이 적의 윗면(공이 적보다 위 — 접촉 법선이 위로 45° 안)에 맞으면 피해 × 이 값.
+ * 틈으로 들어가 대형 뒤·위에서 덜그럭거리는 공, 보스 옆 통로로 넘어가 보스 윗면을 치는 공의 보상 (docs/DESIGN.md '백어택')
+ */
+export const BACK_ATTACK_MUL = 1.5;
+/**
+ * 죽은 젤리에서 나온 꼬마 젤리 칸은 플레이어 피격 원에서 이만큼(px) 넘게 떨어진 칸만 — 플레이어 몸 위에 생겨 즉사하지 않게.
+ * 젤리 바로 옆 칸에 서 있어도 젤리 자기 칸(42 + 4 - 20 = 26 px 떨어짐)에는 생길 수 있다
+ */
+export const SPLIT_PLAYER_MARGIN = 24;
+/**
+ * RC카(옆으로 미끄러지는 적)는 플레이어 피격 원 + 이만큼(px) 안으로는 움직이지 않는다: 그 안이 걸리면 출발하지 않고,
+ * 미끄러지는 도중이면 플레이어가 비킬 때까지 그 자리에 멈춰 기다린다 (몸에 닿는 즉사를 적이 만들지 않게)
+ */
+export const SHIFT_PLAYER_MARGIN = 24;
 export const CHAIN_RANGE = 160;
 export const CHAIN_TARGETS = 2;
 export const CHAIN_DAMAGE_MUL = 0.5;
 export const EXPLODE_DAMAGE_MUL = 0.5;
+
+// ── 시너지 아이템 (docs/DESIGN.md '시너지 아이템') — 아이템 수치는 data/items.ts, 여기는 규칙의 상한·고정값 ──
+/** 탄성 고무: 반사마다 쌓이는 데미지 보너스 합의 상한 (+100%) */
+export const RUBBER_BONUS_CAP = 1;
+/** 분열 씨앗: 자식 수 (★와 무관), 자식 1개 데미지 배수 합의 상한, 자식 반경 = 부모 반경 × 이 값 (최소 SEED_CHILD_MIN_RADIUS) */
+export const SEED_SPLIT_COUNT = 2;
+export const SEED_SPLIT_DAMAGE_MAX = 1;
+export const SEED_CHILD_RADIUS_MUL = 0.6;
+export const SEED_CHILD_MIN_RADIUS = 8;
+/** 분열 씨앗 자식의 수명(초) — 무기 분열 자식(SPLIT_CHILD_MAX_AGE)보다 짧게: 작은 공이 금방 사그라든다 */
+export const SEED_CHILD_MAX_AGE = 1.5;
+/**
+ * 시너지 밀도 상한: 살아있는(그 스텝 기준) 플레이어 투사체가 이 수 이상이면 분열 씨앗의 분열·트램펄린의 바닥 튕김이 쉰다
+ * (공은 평소처럼 — 씨앗 공은 그냥 반사, 바닥에 닿은 공은 빠진다). 무기 자체의 발사·분열은 막지 않는다.
+ * 빌드를 아무리 쌓아도 시너지가 늘리는 공은 여기까지 — 밀도 목표(스트레스 최대 60, tests/density.test.ts '시너지').
+ * 측정(스트레스 빌드 + 씨앗 4 + 트램펄린, 같은 조준): 상한 없이 최대 99, 45 → 64, 40 → 61, 36 → 58(스트레스 빌드만 57).
+ * 보통 빌드(st5 평균 12~20개)는 거의 닿지 않는다. 36 → 32 (네 번째 조정): 적 체력이 늘어 전투가 길어지자 프로브 빌드 + 트램펄린·씨앗·거울 조합의
+ * st5 평균이 30개 안팎까지 올라 — 조합이 늘리는 공을 조금 더 일찍 쉬게 한다
+ */
+export const SYNERGY_PROJECTILE_CAP = 32;
+/** 번개 코일: 연쇄 대상 수(기본 CHAIN_TARGETS + 코일) 상한 */
+export const CHAIN_TARGETS_MAX = 8;
+/**
+ * 거대화 버섯·가속 바퀴: 공 반경 배수 합의 상한(+100%), 속도 배수 합의 범위(-50% ~ +100%).
+ * 속도 상한은 서브스텝 안전 범위(틈새로 새지 않음 — tests/audit-combat '서브스텝')를 지킨다
+ */
+export const PROJ_RADIUS_BONUS_MAX = 1;
+export const PROJ_SPEED_BONUS_MIN = -0.5;
+export const PROJ_SPEED_BONUS_MAX = 1;
+/** 유도 리본: 회전 속도 합의 상한(도/초) */
+export const HOMING_MAX_DEG = 270;
+/** 증기 주전자: 증기 폭발 반경(px, 적중점 ↔ 충돌 박스), 같은 적에게 다시 터지기까지(초) */
+export const STEAM_RADIUS = 90;
+export const STEAM_ENEMY_COOLDOWN = 1;
+/**
+ * 트램펄린: 바닥에서 튕긴 공은 그 순간부터 이 시간(초)까지만 더 산다(원래 수명이 더 짧으면 그대로) — 두 번째 기회이지 두 번째 수명이 아니다.
+ * 이게 없으면 모든 공이 필드를 두 번 지나 살아있는 투사체가 거의 두 배가 됐다(스트레스 빌드 + 트램펄린 평균 44 → 74, 최대 57 → 99).
+ * 1.5초 → 평균 63, 1초 + SYNERGY_PROJECTILE_CAP → 44 (스트레스 빌드만 44)
+ */
+export const TRAMPOLINE_AFTER_LIFE = 1;
+/** 폭죽 심지: 처치한 적 중심 ↔ 충돌 박스 반경(px — 맞닿은 8칸), 최대 HP 비율 합의 상한 */
+export const KILL_BURST_RADIUS = 96;
+export const KILL_BURST_MAX = 0.7;
+
+// ── 레벨업 (docs/DESIGN.md '레벨업') — 적 경험치는 data/enemies.ts(EnemyDef.xp), 런 보너스 수치는 data/boons.ts ──
+/**
+ * 레벨 L → L+1에 필요한 경험치 = LEVEL_XP_BASE + LEVEL_XP_STEP × (L - 1) — 24, 26, 28, 30 …
+ * 1칸 적 = 1 경험치로 st1(60마리) 끝 레벨 3, st2 끝 6, st3 끝 8, st4 끝 11, st5 끝 13쯤 (모두 잡으면) — 판마다 2 · 3 · 2 · 3 · 2번.
+ * 첫 값 12 + 4는 3 · 3 · 2 · 3 · 1번이었는데 첫 레벨업이 처치 12번에 와서 st1부터 시작 무기가 ★3·무기 하나 더가 되어 눈덩이처럼 커졌다
+ * (프로브 빌드 초당 피해 st2 2배·st3 2.7배) — 처음을 무겁게(24), 뒤를 완만하게(+2)
+ */
+export const LEVEL_XP_BASE = 24;
+export const LEVEL_XP_STEP = 2;
+/** 레벨업 한 번의 선택지 수 */
+export const LEVEL_UP_CHOICES = 3;
+/**
+ * 선택지 종류 뽑기 가중치 [새 아이템, ★ + 1, 런 보너스] — 후보가 없는 종류는 빠진다.
+ * [4, 3, 3] → [4, 2, 4]: ★ + 1(공짜 ★합성 — 주 무기 ★3이면 초당 피해 3.1배)이 나오면 거의 늘 골라 레벨업이 '주 무기 ★ 올리기'로 굳었다.
+ * 그리디 평가(tests/balance.probe.test.ts PROBE_GREEDY)로 고른 비율: 새 아이템 ~40% · ★ + 1 ~28% · 런 보너스 ~33%
+ */
+export const LEVEL_UP_KIND_WEIGHTS: readonly [number, number, number] = [4, 2, 4];
+/** 한 번의 선택지에서 같은 종류는 이 수까지 */
+export const LEVEL_UP_KIND_MAX = 2;
+/** ★ + 1 후보 가중치: 무기 / 그 밖(돌·장비) */
+export const LEVEL_UP_UPGRADE_WEAPON_WEIGHT = 2;
+export const LEVEL_UP_UPGRADE_OTHER_WEIGHT = 1;
+
+// ── 액티브 스킬 (docs/DESIGN.md '액티브 스킬') — 스킬 수치는 data/skills.ts ──
+/** 백어택 직접 적중이 게이지를 채우는 배수 (그 밖의 피해는 1) */
+export const SKILL_BACK_CHARGE_MUL = 2;
+/** 털뭉치 폭풍이 쏜 공의 weaponUid ('fire' 이벤트·ProjectileEntity) — 가방 무기 uid는 1부터라 겹치지 않는다 */
+export const SKILL_WEAPON_UID = -1;
 
 // ── 가방 / 등급 ──────────────────────────────────────────────
 export const BAG_START_COLS = 5;

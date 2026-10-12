@@ -4,7 +4,9 @@
 // 번쩍임·냉기·화상은 필터 대신 '덮개' 스프라이트(키마다 한 번 구운 흰/얼음 실루엣)를 몸 위에 겹친다 → 필터 비용 없음.
 // 프레임 애니메이션이 있는 적(실루엣이 프레임과 안 맞음)은 예전 방식(ActorSprite 'hit' + tint)으로.
 // 보스전: 씬이 보스 자세(setPose — 예비 동작·포효)를 덧입히고, 소환된 졸개는 입에서 칸으로 튀어나와 내려앉는다(hop).
-import { BitmapText, Container, Sprite, type Renderer } from 'pixi.js';
+// 행동하는 적: 폭탄병 심지 불꽃(간격마다), RC카가 옆으로 미끄러지면 뒤로 젖히며 바퀴 먼지, 치유받으면 연두 번쩍임,
+// 빙하기로 언 적(EnemyEntity.frozen)은 진한 얼음 덮개 + 얼음 상자(처음 얼 때 한 번 만듦)를 씌우고 숨쉬기를 멈춘다 — 풀리면 얼음 조각.
+import { BitmapText, Container, Sprite, type Renderer, type Texture } from 'pixi.js';
 import { ActorSprite } from '../../render/actor';
 import { animFrames, tex } from '../../render/assets';
 import type { AnimState, EnemyDef, EnemyEntity } from '../../types';
@@ -32,7 +34,15 @@ import {
   FROST_EMIT_INTERVAL,
   BOSS_FROST_OVERLAY_ALPHA,
   FROST_OVERLAY_ALPHA,
+  FROZEN_OVERLAY_ALPHA,
+  FUSE_EMIT_INTERVAL,
+  HEAL_FLASH_TIME,
+  HEAL_FLASH_TINT,
+  ICE_BLOCK_ALPHA,
   MAX_HIT_FLASHES,
+  SLIDE_DUST_INTERVAL,
+  SLIDE_LEAN,
+  SLIDE_SETTLE_TIME,
 } from './visual';
 
 /** ActorSprite 코드 애니메이션 'hit' 길이 (actor.ts의 CODE_DURATION.hit) */
@@ -50,11 +60,24 @@ const FROST_FLASH_TINT = 0xe2f6ff;
 const HOP_ARC = 70;
 const HOP_START_SCALE = 0.35;
 
-/** 상태이상 파티클을 뿌리는 쪽 (Effects) */
+/** 상태이상·행동 파티클을 뿌리는 쪽 (Effects) */
 export interface StatusEmitter {
   burnEmit(x: number, y: number, w: number, h: number): void;
   frostEmit(x: number, y: number, w: number, h: number): void;
+  /** 폭탄병 심지 끝 불꽃 */
+  fuseEmit(x: number, y: number): void;
+  /** RC카 바퀴 먼지 (뒤쪽 바닥, dir = 가는 쪽) */
+  slideDust(x: number, y: number, dir: number): void;
+  /** 얼림이 풀림 — 얼음 조각 */
+  iceShatter(x: number, y: number, size: number): void;
 }
+/** 폭탄병 그림의 심지 끝 (보이는 크기 대비, 몸 중심 기준) */
+const FUSE_DX = 0.08;
+const FUSE_DY = -0.43;
+/** 이만큼(px) 넘게 옆으로 움직였으면 미끄러지는 중 (적은 옆걸음으로만 옆으로 움직인다) */
+const SLIDE_EPS = 0.05;
+/** 얼음 상자 크기 (충돌 박스 대비) */
+const ICE_BLOCK_SCALE = 1.16;
 
 /** hitInfo 결과 (호출 쪽이 하나 만들어 재사용) */
 export interface HitInfo {
@@ -123,6 +146,21 @@ interface EnemyView {
   hopDur: number;
   hopDx: number;
   hopDy: number;
+  /** 번쩍임 색·길이 (피격 = 흰색 ENEMY_FLASH_TIME, 회복 = 연두 HEAL_FLASH_TIME) */
+  flashTint: number;
+  flashDur: number;
+  /** 폭탄병: 심지 불꽃 다음까지 */
+  fuse: boolean;
+  fuseT: number;
+  /** 옆걸음(RC카): 지난 프레임 x와의 차로 미끄러짐을 본다 — 기울기(라디안)·방향·멈춘 뒤 남은 시간·먼지 타이머 */
+  lean: number;
+  slideDir: number;
+  slideT: number;
+  dustT: number;
+  /** 얼림(빙하기): 얼음 상자 진하기 0..1, 얼음 상자(처음 얼 때 만듦), 지난 프레임에 얼어 있었나 */
+  frozenA: number;
+  ice: Sprite | null;
+  wasFrozen: boolean;
 }
 
 const OV_NONE = 0;
@@ -145,10 +183,14 @@ export class EnemyLayer extends Container {
   private clock = 0;
   private seq = 0;
 
+  /**
+   * @param iceTex 얼음 상자 텍스처 (fxTextures().iceBlock) — 없으면 빙하기에 얼음 덮개만
+   */
   constructor(
     private readonly defs: Record<string, EnemyDef>,
     private readonly renderer: Renderer,
     private readonly emitter: StatusEmitter,
+    private readonly iceTex: Texture | null = null,
   ) {
     super();
     this.eventMode = 'none';
@@ -170,6 +212,12 @@ export class EnemyLayer extends Container {
       let v = this.views.get(e.id);
       if (!v) v = this.create(e);
       v.stamp = stamp;
+      // 옆으로 움직였다 = RC카가 미끄러지는 중 (하강·보스 기어 내려오기는 세로뿐)
+      const sdx = e.x - v.x;
+      if (sdx > SLIDE_EPS || sdx < -SLIDE_EPS) {
+        v.slideDir = sdx > 0 ? 1 : -1;
+        v.slideT = SLIDE_SETTLE_TIME;
+      }
       v.x = e.x;
       v.y = e.y;
       v.w = e.w;
@@ -188,6 +236,14 @@ export class EnemyLayer extends Container {
         flashing++;
       }
 
+      // 얼림(빙하기): 얼음 상자 + 진한 덮개, 풀리는 순간 얼음 조각
+      const frozen = e.frozen > 0;
+      if (frozen || v.frozenA > 0) {
+        v.frozenA = approach(v.frozenA, frozen ? 1 : 0, (frozen ? STATUS_FADE * 1.6 : STATUS_FADE) * dt);
+        this.applyIce(v, e);
+      }
+      if (v.wasFrozen && !frozen && e.alive) this.emitter.iceShatter(cx, cy, v.size);
+      v.wasFrozen = frozen;
       if (v.overlay) {
         v.frost = approach(v.frost, e.chillTime > 0 ? 1 : 0, STATUS_FADE * dt);
         v.burn = approach(v.burn, e.burnTime > 0 ? 1 : 0, STATUS_FADE * dt);
@@ -217,6 +273,30 @@ export class EnemyLayer extends Container {
             this.emitter.frostEmit(cx, cy, e.w, e.h);
           }
         } else v.frostEmitT = 0;
+        // 폭탄병 심지: 얼어 있지 않으면 계속 타들어 간다
+        if (v.fuse && !frozen) {
+          v.fuseT -= dt;
+          if (v.fuseT <= 0) {
+            v.fuseT += FUSE_EMIT_INTERVAL * (0.7 + 0.6 * this.jitter());
+            const s = v.size;
+            this.emitter.fuseEmit(cx + v.kx + s * FUSE_DX * v.actor.scale.x, cy + v.ky + s * FUSE_DY * v.actor.scale.y);
+          }
+        }
+        // RC카 바퀴 먼지 (미끄러지는 동안)
+        if (v.slideT >= SLIDE_SETTLE_TIME - 1e-6) {
+          v.dustT -= dt;
+          if (v.dustT <= 0) {
+            v.dustT += SLIDE_DUST_INTERVAL;
+            this.emitter.slideDust(cx - v.slideDir * e.w * 0.38, e.y + e.h - 2, v.slideDir);
+          }
+        } else v.dustT = 0;
+      }
+      // 미끄러지는 동안 뒤로 젖힘(앞바퀴가 들림), 멈추면 SLIDE_SETTLE_TIME 동안 돌아온다
+      if (v.slideT > 0 || v.lean !== 0) {
+        const want = v.slideT >= SLIDE_SETTLE_TIME - 1e-6 ? -v.slideDir * SLIDE_LEAN : 0;
+        v.lean = approach(v.lean, want, (SLIDE_LEAN / 0.08) * dt);
+        if (v.slideT > 0) v.slideT = Math.max(0, v.slideT - dt);
+        v.actor.rotation = v.lean;
       }
 
       if (v.hopT < v.hopDur) {
@@ -232,7 +312,8 @@ export class EnemyLayer extends Container {
       }
       if (v.springing) stepSpring(v, dt);
       this.applyPose(v, cx, cy);
-      v.actor.update(dt);
+      // 꽁꽁 얼면 숨쉬기(코드 애니메이션)도 멈춘다
+      if (v.frozenA < 0.5) v.actor.update(dt);
     }
     this.flashing = flashing;
 
@@ -321,6 +402,8 @@ export class EnemyLayer extends Container {
       return;
     }
     v.flashT = ENEMY_FLASH_TIME;
+    v.flashTint = 0xffffff;
+    v.flashDur = ENEMY_FLASH_TIME;
     const kb = ENEMY_KNOCKBACK * strength * (v.big ? 0.45 : 1);
     const lim = ENEMY_KNOCKBACK * 1.6;
     v.kx = clampAbs(v.kx + dx * kb, lim);
@@ -328,6 +411,19 @@ export class EnemyLayer extends Container {
     v.sq = Math.max(v.sq, strength * (v.big ? 0.4 : 1));
     v.sqv = 0;
     v.sqAxis = Math.abs(dy) >= Math.abs(dx) ? 0 : 1;
+    v.springing = true;
+  }
+
+  /** 치유병에게 회복받음: 연두 번쩍임 + 옆으로 살짝 부풀었다 출렁 (피격 스로틀과 무관) */
+  onHeal(enemyId: number): void {
+    const v = this.views.get(enemyId);
+    if (!v || !v.overlay) return;
+    v.flashT = HEAL_FLASH_TIME;
+    v.flashTint = HEAL_FLASH_TINT;
+    v.flashDur = HEAL_FLASH_TIME;
+    v.sq = Math.min(v.sq, -0.5);
+    v.sqv = 0;
+    v.sqAxis = 0;
     v.springing = true;
   }
 
@@ -367,6 +463,11 @@ export class EnemyLayer extends Container {
   onKill(enemyId: number): number {
     const v = this.views.get(enemyId);
     if (!v) return 0;
+    // 언 채로 깨지면 얼음 상자 조각도 같이
+    if (v.frozenA > 0.3) {
+      this.emitter.iceShatter(v.x + v.w / 2, v.y + v.h / 2, v.size);
+      if (v.ice) v.ice.visible = false;
+    }
     this.startDie(v);
     return v.size;
   }
@@ -426,8 +527,13 @@ export class EnemyLayer extends Container {
       o.tint = mode === OV_BURN ? BURN_OVERLAY_COLOR : 0xffffff;
     }
     if (mode === OV_FLASH) {
-      const a = 0.25 + 0.7 * (v.flashT / ENEMY_FLASH_TIME);
-      if (v.frost > 0.01) {
+      const heal = v.flashTint !== 0xffffff;
+      const a = heal ? 0.12 + 0.5 * (v.flashT / v.flashDur) : 0.25 + 0.7 * (v.flashT / v.flashDur);
+      if (heal) {
+        if (o.texture !== ov.white) o.texture = ov.white;
+        if (o.tint !== v.flashTint) o.tint = v.flashTint;
+        o.alpha = a;
+      } else if (v.frost > 0.01) {
         // 얼어 있는 적: 하늘빛 흰 번쩍임, 냉기 덮개 알파 아래로는 내려가지 않음 — 번쩍임 끝에 원래 색(빨강·크림)이
         // 비쳐 '파랑 → 분홍 → 파랑'으로 깜빡이던 것을 막는다
         if (o.tint !== FROST_FLASH_TINT) o.tint = FROST_FLASH_TINT;
@@ -438,10 +544,33 @@ export class EnemyLayer extends Container {
         o.alpha = a;
       }
     } else if (mode === OV_FROST) {
-      o.alpha = v.frostAlpha * v.frost * (0.92 + 0.08 * Math.sin(this.clock * 5 + v.id));
+      // 얼림(빙하기)은 냉기보다 진하게 — 꽁꽁 언 얼음 색
+      const base = Math.max(v.frostAlpha * v.frost, FROZEN_OVERLAY_ALPHA * v.frozenA);
+      o.alpha = base * (0.92 + 0.08 * Math.sin(this.clock * 5 + v.id));
     } else if (mode === OV_BURN) {
       o.alpha = BURN_OVERLAY_ALPHA * v.burn * (0.65 + 0.35 * Math.sin(this.clock * 13 + v.id * 1.7));
     }
+  }
+
+  /** 얼음 상자: 처음 얼 때 한 번 만들고(액터 자식 — 피격 스쿼시를 같이 탄다), 진하기만 바꾼다 */
+  private applyIce(v: EnemyView, e: EnemyEntity): void {
+    if (!this.iceTex) return;
+    let ice = v.ice;
+    if (!ice) {
+      if (v.frozenA <= 0) return;
+      ice = new Sprite(this.iceTex);
+      ice.anchor.set(0.5);
+      v.actor.addChild(ice);
+      v.ice = ice;
+    }
+    const a = v.frozenA;
+    ice.visible = a > 0.01;
+    if (!ice.visible) return;
+    // 얼어붙는 순간 살짝 크게 → 제 크기 ('쩡')
+    const pop = 1 + 0.12 * (1 - a);
+    ice.width = e.w * ICE_BLOCK_SCALE * pop;
+    ice.height = e.h * ICE_BLOCK_SCALE * pop;
+    ice.alpha = ICE_BLOCK_ALPHA * a;
   }
 
   /** 이 에셋 키의 덮개 텍스처를 미리 굽는다 (인트로 동안 — 처음 나타날 때 끊기지 않게) */
@@ -540,6 +669,17 @@ export class EnemyLayer extends Container {
       hopDur: 0,
       hopDx: 0,
       hopDy: 0,
+      flashTint: 0xffffff,
+      flashDur: ENEMY_FLASH_TIME,
+      fuse: def?.deathBlast !== undefined,
+      fuseT: FUSE_EMIT_INTERVAL * this.jitter(),
+      lean: 0,
+      slideDir: 1,
+      slideT: 0,
+      dustT: 0,
+      frozenA: 0,
+      ice: null,
+      wasFrozen: false,
     };
     this.views.set(e.id, v);
     this.live.push(v);

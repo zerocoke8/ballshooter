@@ -3,7 +3,7 @@ import { initAudio } from './audio';
 import type { GameApp } from './core/app';
 import { SceneManager } from './core/scene';
 import { GAME_DATA } from './data';
-import { clampRunHp, clearRun, isBossTestRun, loadRun, newBossTestRun, newRun, saveRun } from './logic/run';
+import { clampRunHp, clearRun, isBossTestRun, loadRun, newBossTestRun, newRun, runLevel, saveRun } from './logic/run';
 import { randomSeed } from './logic/rng';
 import type { GameData, LostReason, RunState, RunStats, Tier } from './types';
 import { BossResultScene } from './scenes/BossResultScene';
@@ -30,6 +30,8 @@ export interface RunResult {
   stageIndex: number;
   characterId: string;
   stats: RunStats;
+  /** 도달 레벨 (레벨업). 없으면 toResult가 지금 런에서 채운다 */
+  level?: number;
 }
 
 /** 보스 테스트 한 판의 결과 (보스 결과 화면이 그대로 보여 준다) */
@@ -52,6 +54,8 @@ export interface BossTestResult {
   /** 도달한 페이즈(1부터) / 페이즈 수 */
   phase: number;
   phases: number;
+  /** 도달 레벨 (졸개 처치 경험치 — 보스 테스트도 레벨이 오른다). 없으면 표시하지 않음 */
+  level?: number;
 }
 
 export interface Game {
@@ -59,6 +63,11 @@ export interface Game {
   readonly data: GameData;
   readonly scenes: SceneManager;
   run: RunState | null;
+  /**
+   * 측정 도구 전용(tools/*.mjs — 조준·이동 검사가 갑자기 뜬 레벨업 창에 끊기지 않게): true면 전투가 레벨업 창을 띄우지 않는다.
+   * 대기 레벨업은 런에 그대로 쌓이고, false로 돌리면 다음 프레임에 뜬다. 게임 코드는 바꾸지 않는다 (기본 false)
+   */
+  debugHoldLevelUps: boolean;
   hasSave(): boolean;
   toTitle(): void;
   /** mode 'bossTest' = 보스 테스트용 캐릭터 선택 (시작하면 startBossTest) */
@@ -94,6 +103,7 @@ export function initGame(gameApp: GameApp): Game {
     data,
     scenes,
     run: null,
+    debugHoldLevelUps: false,
     hasSave: () => loadRun(data) !== null,
     toTitle() {
       // 보스 테스트를 그만두고 나가면 그 런은 버린다 (저장된 적이 없다)
@@ -140,10 +150,11 @@ export function initGame(gameApp: GameApp): Game {
       scenes.goto(new ShopScene());
     },
     toResult(result) {
+      const level = result.level ?? (g.run ? runLevel(g.run) : undefined);
       // 보스 테스트 런이 여기로 오면 세이브를 지우지 않는다 (clearRun(run)도 무시하지만 명시적으로)
       if (!isBossTestRun(g.run)) clearRun(g.run);
       g.run = null;
-      scenes.goto(new ResultScene(result));
+      scenes.goto(new ResultScene(level === undefined ? result : { ...result, level }));
     },
     toBossResult(result) {
       g.run = null;

@@ -1,14 +1,19 @@
 // 투사체 / 적 탄 스프라이트 풀. 엔티티 id → 스프라이트, 매 프레임 stamp로 사라진 것을 회수한다.
 // 꼬리: 투사체마다 최근 위치 링 버퍼 → 길이를 고정 길이 마디 TRAIL_SEGMENTS개로 다시 나눠, 마디마다 가늘어지는
 // 띠 파티클 하나(굵기·알파가 TRAIL_TAPER 배씩 → 이어 붙인 자리가 끊기지 않음). ParticleContainer 한 개 = 드로우콜 1.
+// 꼬리 모양은 무기 uid별(setStyle — 씬이 loadout으로 채운다): 유도 리본 공 = 길고 진한 분홍 리본, 털뭉치 폭풍(스킬) 공 = 연보라.
+// 공 그림 크기는 늘 충돌 반경 기준(거대화 버섯·분열 씨앗 자식도 그대로 커지고 작아진다).
 import { Container, Particle, ParticleContainer, Sprite, type Texture } from 'pixi.js';
 import { ELEMENT_COLORS, FIELD_H } from '../../config';
 import { tex } from '../../render/assets';
+import { mixColor } from '../../render/color';
 import type { Element, EnemyShotEntity, ProjectileEntity } from '../../types';
 import { TRAIL_TEX_H, TRAIL_TEX_W } from './fxTextures';
 import {
   ENEMY_SHOT_GLOW,
   PROJ_VISUAL_SCALE,
+  RIBBON_COLOR,
+  RIBBON_TRAIL_LEN_MUL,
   SHOT_GLOW_SCALE,
   SHOT_TRAIL_ALPHA,
   SHOT_TRAIL_LEN,
@@ -16,6 +21,7 @@ import {
   SPIN_SPEED,
   SPINNING_SHOTS,
   SPRITE_FACING,
+  STORM_TRAIL_COLOR,
   TRAIL_ALPHA,
   TRAIL_COLOR,
   TRAIL_FALL_ALPHA,
@@ -71,6 +77,13 @@ const SHOT_TRAIL_WIDTH = 0.95;
  */
 const VANISH_BOTTOM_MARGIN = 48;
 
+/** 꼬리 모양 비트 (setStyle): 유도 리본(맞닿은 유도 리본 돌) / 스킬 공(털뭉치 폭풍) */
+export const PROJ_STYLE_HOMING = 1;
+export const PROJ_STYLE_SKILL = 2;
+/** 리본 꼬리 알파 (속성 꼬리보다 진하게 — 휘는 궤적이 보이게) */
+const RIBBON_TRAIL_ALPHA = 0.9;
+const STORM_TRAIL_ALPHA = 0.85;
+
 function facingOf(sprite: string): { mode: 1 | 2; facing: number } {
   const f = SPRITE_FACING[sprite];
   if (f === null) return { mode: UPRIGHT, facing: 0 };
@@ -107,6 +120,8 @@ export class ProjectileLayer {
   private readonly shotBodies = new Container();
   private stamp = 0;
   private clock = 0;
+  /** 무기 uid → 꼬리 모양 비트 (PROJ_STYLE_*). 새 투사체 뷰를 잡을 때만 읽는다 (프레임마다 아님) */
+  private readonly styles = new Map<number, number>();
 
   /**
    * @param projLayer 플레이어 투사체 부모
@@ -216,6 +231,16 @@ export class ProjectileLayer {
     liveS.length = w;
   }
 
+  /** 무기 uid별 꼬리 모양을 다시 정한다 (가방이 바뀔 때 — 씬). 이미 나는 공은 그대로 */
+  setStyle(uid: number, style: number): void {
+    if (style) this.styles.set(uid, style);
+    else this.styles.delete(uid);
+  }
+
+  clearStyles(): void {
+    this.styles.clear();
+  }
+
   /**
    * 뷰 풀을 미리 채운다 (인트로 동안) — 첫 발사 프레임에 스프라이트·꼬리 파티클 생성이 몰리지 않게
    * (측정: 첫 발사 프레임 22 ms @ CPU 4배 감속, 뷰 15개 생성 + 텍스처 첫 업로드)
@@ -297,6 +322,16 @@ export class ProjectileLayer {
     const el: Element | undefined = p.elements[0];
     v.trailColor = el ? ELEMENT_COLORS[el] : TRAIL_COLOR;
     v.trailA = el ? ELEMENT_TRAIL_ALPHA : TRAIL_ALPHA;
+    const style = this.styles.size > 0 ? (this.styles.get(p.weaponUid) ?? 0) : 0;
+    if (style & PROJ_STYLE_HOMING) {
+      // 유도 리본: 길고 진한 분홍 리본 (속성 공이면 속성 색과 섞어 속성도 읽히게)
+      v.trailColor = el ? mixColor(v.trailColor, RIBBON_COLOR, 0.55) : RIBBON_COLOR;
+      v.trailA = RIBBON_TRAIL_ALPHA;
+      v.trailLen = Math.min(TRAIL_LEN_MAX * RIBBON_TRAIL_LEN_MUL, v.trailLen * RIBBON_TRAIL_LEN_MUL);
+    } else if (style & PROJ_STYLE_SKILL && !el) {
+      v.trailColor = STORM_TRAIL_COLOR;
+      v.trailA = STORM_TRAIL_ALPHA;
+    }
     v.fall = p.vy > 0 ? TRAIL_FALL_ALPHA : 1;
     for (const s of v.segs) s.tint = v.trailColor;
     return v;

@@ -18,6 +18,11 @@
 //   3. 가방 오버레이(HUD 가방 버튼 탭): 유자 탭 → 선택 + 툴팁에 이름,
 //      보관함 → 가방 빈 칸으로 드래그 → run.bag 변경, 유자 선택 후 '★ 합성' 탭 → ★2 유자 1개,
 //      '계속하기' 탭 → 오버레이 닫힘 + 전투 무기 목록 갱신
+//   3b. 액티브 스킬(카피 온천 타임, 게이지는 디버그 채우기 debugFillSkill): 반쯤 찬 게이지 탭 → 안 나감, 가득 → 버튼 탭 → 발동
+//      (횟수 +1·게이지 0·효과 중), Space → 발동, 버튼에서 시작한 드래그 → 이동만(스킬 안 나감)
+//      레벨업(앞 검사들 동안은 Game.debugHoldLevelUps로 보류): 보류 해제 → 쌓인 것 고르기 → 경험치로 두 레벨 → 창이 전투를 멈추고
+//      카드 3장(+1 대기) → 카드 탭 → 런에 적용 + 다음 선택지 → 키 2 → 닫힘 + 전투 재개(sim 시간 흐름) + 무기 목록 = 가방 무기
+//      → 승리하면 마지막 처치로 오른 레벨업을 클리어 화면 전에 고른다(카드 탭)
 //   4. 상점: 카드 탭 → 툴팁 미리보기, 가방 아이템 탭 → 툴팁, 보관함 → 가방 드래그 → run.bag 변경
 //   5. 보스 테스트 (일반 런 세이브가 있는 채로, 실제 탭): 타이틀 '보스 테스트' → 펭구 카드 → '보스전!' → 보스 착지 →
 //      HUD 가방 → '그만두기' → 타이틀 (세이브 그대로) → 다시 보스 테스트 → 승리 → 결과 '다시 도전' → 같은 캐릭터 → 패배 →
@@ -862,6 +867,244 @@ async function combatAimChecks() {
   });
 }
 
+// ── 레벨업 · 액티브 스킬 ─────────────────────────────────────
+
+/** 측정 도구용 레벨업 보류 (Game.debugHoldLevelUps): true면 전투가 레벨업 창을 띄우지 않는다 */
+async function setLevelUpHold(on) {
+  await page.waitForFunction(() => !!window.__game?.game, null, { timeout: 30000 });
+  await page.evaluate((v) => {
+    window.__game.game.debugHoldLevelUps = v;
+  }, on);
+}
+
+async function levelUpState() {
+  return page.evaluate(() => {
+    const s = window.__game.game.scenes.current;
+    const st = s?.debugState?.();
+    return st ? { ...st.levelUp, time: st.time, scene: window.__game.scene() } : { scene: window.__game.scene() };
+  });
+}
+
+/** 열린 레벨업 창 i번째 카드 가운데 (CSS px) */
+async function levelUpCardCenter(i) {
+  return page.evaluate((i) => {
+    const o = window.__game.game.scenes.current?.levelUp;
+    const c = o?.cards?.[i];
+    if (!c) return null;
+    const b = c.root.getBounds();
+    return { x: b.x + b.width / 2, y: b.y + b.height / 2, w: b.width, h: b.height };
+  }, i);
+}
+
+/** 카드를 받을 때까지 기다렸다가 i번째 카드를 실제 터치로 탭 */
+async function tapLevelUpCard(i, timeoutMs = 4000) {
+  const ok = await waitFor(() => window.__game.game.scenes.current?.debugState?.()?.levelUp?.armed === true, null, timeoutMs, 'level-up cards armed');
+  if (!ok) return false;
+  const p = await levelUpCardCenter(i);
+  if (!p) return false;
+  await page.touchscreen.tap(p.x, p.y);
+  return true;
+}
+
+/** 전투 씬에서 레벨업 창이 뜨는 대로 첫 카드를 탭하며 scene이 될 때까지. 고른 수 */
+async function pickLevelUpsUntil(sceneName, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let picks = 0;
+  while (Date.now() < deadline) {
+    const st = await levelUpState();
+    if (st.scene === sceneName) return picks;
+    if (st.open && st.armed) {
+      const before = st.pending;
+      if (await tapLevelUpCard(0, 1500)) {
+        await page
+          .waitForFunction((n) => (window.__game.game.scenes.current?.debugState?.()?.levelUp?.pending ?? 0) < n, before, { timeout: 2000, polling: 50 })
+          .catch(() => {});
+        picks++;
+      }
+    }
+    await sleep(120);
+  }
+  fail(`[levelup] timed out picking level-ups waiting for ${sceneName} (picked ${picks})`);
+  return picks;
+}
+
+async function skillState() {
+  return page.evaluate(() => window.__game.game.scenes.current.debugState().skill);
+}
+
+/** 스킬 버튼 가운데 (CSS px) */
+async function skillButtonCenter() {
+  return page.evaluate(() => {
+    const btn = window.__game.game.scenes.current.skillBtn;
+    if (!btn) return null;
+    const p = btn.toGlobal({ x: 0, y: 0 });
+    return { x: p.x, y: p.y };
+  });
+}
+
+async function fillSkill(frac) {
+  return page.evaluate((f) => window.__game.game.scenes.current.debugFillSkill(f), frac);
+}
+
+/** 액티브 스킬: 버튼 탭(덜 찼으면 안 됨 / 가득이면 발동), Space, 버튼에서 시작한 드래그는 이동 (카피 — 온천 타임) */
+async function skillChecks() {
+  const btn = await skillButtonCenter();
+  const s0 = await skillState();
+  check('skill: the combat has a skill button and a skill gauge (capybara hot spring)', !!btn && s0?.id === 'hot_spring', { button: btn, skill: s0 });
+  if (!btn || !s0) return;
+
+  // 반쯤 찬 게이지: 탭해도 발동하지 않는다
+  const filledHalf = await fillSkill(0.5);
+  await sleep(120);
+  await page.touchscreen.tap(btn.x, btn.y);
+  await sleep(250);
+  const s1 = await skillState();
+  check('skill: tapping the button with a half gauge does nothing', filledHalf && s1.uses === s0.uses && !s1.ready, { filledHalf, before: s0, after: s1 });
+  await shot('skill-half');
+
+  // 가득 (디버그 채우기) → 준비 → 탭 → 발동 (게이지 0, 효과 시간)
+  const filled = await fillSkill(1);
+  await waitFor(() => window.__game.game.scenes.current.debugState().skill?.usable === true, null, 3000, 'skill usable after debug fill');
+  await sleep(300);
+  await shot('skill-ready');
+  const s2 = await skillState();
+  await page.touchscreen.tap(btn.x, btn.y);
+  await sleep(200);
+  const s3 = await skillState();
+  check('skill: when full, tapping the button activates it (uses +1, gauge reset, effect running)', filled && s2.ready && s3.uses === s2.uses + 1 && s3.charge < 0.5 && s3.active > 0 && !s3.ready, {
+    filled,
+    before: s2,
+    after: s3,
+  });
+  await shot('skill-active');
+
+  // Space: 효과가 끝나고(온천 4초) 다시 가득이면 발동
+  await waitFor(() => (window.__game.game.scenes.current.debugState().skill?.active ?? 1) <= 0, null, 8000, 'hot spring effect over');
+  await fillSkill(1);
+  await waitFor(() => window.__game.game.scenes.current.debugState().skill?.usable === true, null, 3000, 'skill usable again');
+  const s4 = await skillState();
+  await page.keyboard.press('Space');
+  await sleep(200);
+  const s5 = await skillState();
+  check('skill: Space activates the skill when full', s5.uses === s4.uses + 1 && s5.active > 0, { before: s4, after: s5 });
+
+  // 버튼에서 시작한 드래그는 이동 (하단 바 = 이동 패드), 스킬은 안 나간다. 왼쪽으로 끌 자리가 있게 먼저 캐릭터를 오른쪽으로
+  await waitFor(() => (window.__game.game.scenes.current.debugState().skill?.active ?? 1) <= 0, null, 8000, 'hot spring effect over (2)');
+  const px = await page.evaluate(() => window.__game.game.scenes.current.debugState().playerX);
+  if (px < 420) {
+    const barY = VIEWPORT.height * 0.9;
+    await touchDrag({ x: 80, y: barY }, { x: 80 + Math.min(200, (480 - px) * 0.55), y: barY });
+    await sleep(800);
+  }
+  await fillSkill(1);
+  await waitFor(() => window.__game.game.scenes.current.debugState().skill?.usable === true, null, 3000, 'skill usable (drag check)');
+  const before = await page.evaluate(() => {
+    const st = window.__game.game.scenes.current.debugState();
+    return { x: st.playerX, uses: st.skill.uses };
+  });
+  await touchDrag({ x: btn.x, y: btn.y }, { x: btn.x - 120, y: btn.y }, { steps: 12, holdMs: 250 });
+  await sleep(800);
+  const after = await page.evaluate(() => {
+    const st = window.__game.game.scenes.current.debugState();
+    return { x: st.playerX, uses: st.skill.uses, dragging: st.dragging, pointers: st.pointers };
+  });
+  check('skill: a drag that starts on the skill button moves the player and does not cast', before.x - after.x > 100 && after.uses === before.uses && !after.dragging && after.pointers === 0, {
+    before,
+    after,
+  });
+}
+
+/** 레벨업 3지선다: 보류를 풀고 경험치로 레벨 둘 → 창이 전투를 멈춤, 카드 탭 적용 → 다음 선택지, 키 2로 마지막 → 전투 재개 */
+async function levelUpChecks() {
+  await setLevelUpHold(false);
+  // 그동안(보류 중) 실제 처치로 쌓인 레벨업이 있으면 지금 뜬다 — 다 고르고 시작
+  await sleep(300);
+  const pre = await levelUpState();
+  let prePicks = 0;
+  if (pre.pending > 0) {
+    while ((await levelUpState()).pending > 0 && prePicks < 12) {
+      if (await tapLevelUpCard(0)) prePicks++;
+      await sleep(600);
+    }
+  }
+  await waitFor(() => window.__game.game.scenes.current.debugState().levelUp.open === false, null, 4000, 'level-up overlay closed (pre)');
+
+  // 경험치로 정확히 두 레벨 (한 번에 — 그 사이 프레임이 없어 창은 대기 2로 열린다. 곡선은 게임 값을 읽는다)
+  const gained = await page.evaluate(() => {
+    const s = window.__game.game.scenes.current;
+    const a = s.debugState().levelUp;
+    let n = s.debugGrantXp(a.need - a.xp);
+    const b = s.debugState().levelUp;
+    n += s.debugGrantXp(b.need - b.xp);
+    return n;
+  });
+  const opened = await waitFor(() => window.__game.game.scenes.current.debugState().levelUp.armed === true, null, 4000, 'level-up overlay');
+  const l0 = await levelUpState();
+  await sleep(400);
+  const l0b = await levelUpState();
+  check('levelup: gaining two levels pauses combat and shows 3 cards (+1 queued)', gained === 2 && opened && l0.open && l0.choices === 3 && l0.pending === 2 && l0b.time === l0.time, {
+    prePicks,
+    gained,
+    state: l0,
+    timeAfter400ms: l0b.time,
+  });
+  await shot('levelup-open');
+
+  // 카드 1 탭 → 런에 적용(대기 1 감소, 선택지 지움) → 다음 선택지가 이어서
+  const run0 = await page.evaluate(() => {
+    const r = window.__game.game.run;
+    return { offer: r.levelOffer, items: r.bag.items.length, stash: r.bag.stash.length, boons: { ...(r.boons ?? {}) }, tiers: r.bag.items.map((i) => i.tier), gold: r.gold };
+  });
+  await tapLevelUpCard(0);
+  await waitFor(() => window.__game.game.scenes.current.debugState().levelUp.pending === 1, null, 3000, 'first pick applied');
+  const run1 = await page.evaluate(() => {
+    const r = window.__game.game.run;
+    return { items: r.bag.items.length, stash: r.bag.stash.length, boons: { ...(r.boons ?? {}) }, tiers: r.bag.items.map((i) => i.tier), gold: r.gold };
+  });
+  const c0 = run0.offer?.[0];
+  const applied =
+    c0?.kind === 'item'
+      ? run1.items + run1.stash > run0.items + run0.stash || run1.gold > run0.gold
+      : c0?.kind === 'boon'
+        ? (run1.boons[c0.boon] ?? 0) === (run0.boons[c0.boon] ?? 0) + 1
+        : run1.tiers.reduce((a, b) => a + b, 0) === run0.tiers.reduce((a, b) => a + b, 0) + 1;
+  await waitFor(() => window.__game.game.scenes.current.debugState().levelUp.armed === true, null, 4000, 'second level-up cards');
+  const l1 = await levelUpState();
+  check('levelup: tapping a card applies it and the queued level-up shows next', applied && l1.open && l1.pending === 1 && l1.choices === 3, {
+    choice: c0,
+    before: run0,
+    after: run1,
+    state: l1,
+  });
+  await shot('levelup-second');
+
+  // 키 2 → 마지막 → 창 닫힘 + 전투 재개 (sim 시간이 흐른다)
+  await page.keyboard.press('Digit2');
+  await waitFor(() => window.__game.game.scenes.current.debugState().levelUp.open === false, null, 4000, 'level-up overlay closed');
+  const l2 = await levelUpState();
+  await sleep(500);
+  const l3 = await levelUpState();
+  const loadoutOk = await page.evaluate(() => {
+    const s = window.__game.game.scenes.current;
+    const st = s.debugState();
+    const bagWeapons = window.__game.game.run.bag.items.filter((i) => window.__game.game.data.items[i.defId].kind === 'weapon').length;
+    return st.weaponUids.length === bagWeapons;
+  });
+  check('levelup: key 2 picks the last card, the overlay closes and combat resumes with the new loadout', !l2.open && l2.pending === 0 && l3.time > l2.time && loadoutOk, {
+    afterClose: l2,
+    timeLater: l3.time,
+    loadoutOk,
+  });
+  await shot('levelup-after');
+
+  // 스테이지 끝 검사를 위해: 다음 처치 하나면 레벨이 오르게 (마지막 처치들의 레벨업은 클리어 화면 전에 고른다)
+  await page.evaluate(() => {
+    const s = window.__game.game.scenes.current;
+    const lu = s.debugState().levelUp;
+    if (lu.need - lu.xp > 1) s.debugGrantXp(lu.need - lu.xp - 1);
+  });
+}
+
 // ── 메인 ─────────────────────────────────────────────────────
 
 async function run() {
@@ -890,6 +1133,8 @@ async function run() {
     page.on('framenavigated', (frame) => {
       if (frame === page.mainFrame()) fail(`[reload] page navigated/reloaded mid-run (${frame.url()})`);
     });
+    // 조준·이동·가방 검사가 처치 경험치로 갑자기 뜬 레벨업 창에 끊기지 않게 — 레벨업 검사(7)에서만 푼다
+    await setLevelUpHold(true);
     const T = await page.evaluate(async () => {
       const { T } = await import('/src/i18n/ko/index.ts');
       return {
@@ -1052,8 +1297,19 @@ async function run() {
     await sleep(300);
     await shot('combat-after-bag');
 
-    // 4) 상점 (승리 → 스테이지 클리어 → 탭 '상점으로')
+    // 3b) 액티브 스킬 버튼 (탭·Space·버튼에서 시작한 드래그) + 레벨업 3지선다 (탭·키 2·여러 번 쌓임)
+    await skillChecks();
+    await levelUpChecks();
+
+    // 4) 상점 (승리 → 남은 레벨업은 클리어 화면 전에 고르기 → 스테이지 클리어 → 탭 '상점으로')
     await page.evaluate(() => window.__game.debug.winStage());
+    const endPicks = await pickLevelUpsUntil('StageClearScene', 20000);
+    const runAfterWin = await page.evaluate(() => ({ levelUps: window.__game.game.run?.levelUps ?? 0, level: window.__game.game.run?.level ?? 1 }));
+    check('levelup: level-ups earned by the last kills are offered before the stage clear screen', endPicks >= 1 && runAfterWin.levelUps === 0, {
+      picksAtStageEnd: endPicks,
+      run: runAfterWin,
+    });
+    await setLevelUpHold(true);
     await waitFor(() => window.__game.scene() === 'StageClearScene', null, 12000, 'StageClearScene');
     await sleep(800);
     // 첫 탭은 연출 건너뛰기, 그다음 버튼

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BACK_ATTACK_MUL,
   BOSS_REHIT_DAMAGE_MUL,
   BOSS_REHIT_WINDOW,
   BURN_DURATION,
@@ -470,10 +471,10 @@ describe('CombatSim projectiles', () => {
     expect(angles[2] - angles[0]).toBeCloseTo(60, 6);
     expect(angles[1]).toBeCloseTo(-90, 6);
 
-    // 부모가 천장을 찍고 돌아와 다시 맞혀도 더 분열하지 않는다
+    // 부모가 천장을 찍고 돌아와 다시 맞혀도 더 분열하지 않는다 (위에서 떨어져 윗면을 치므로 백어택 — 피해 × BACK_ATTACK_MUL)
     const later = run(sim, 240);
     expect(ofType(later, 'split')).toHaveLength(0);
-    expect(ofType(later, 'hit').filter((h) => h.enemyId === e.id && h.damage === 20).length).toBeGreaterThan(0);
+    expect(ofType(later, 'hit').filter((h) => h.enemyId === e.id && h.back === true && h.damage === Math.round(20 * BACK_ATTACK_MUL)).length).toBeGreaterThan(0);
   });
 
   it('never gets stuck oscillating when wedged between two enemies', () => {

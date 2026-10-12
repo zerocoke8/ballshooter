@@ -10,6 +10,14 @@ const LEGEND: Record<string, string> = {
   o: 'balloon',
   T: 'teddy', // 2×2
   B: 'boss_robot', // 4×3
+  // 행동하는 적 (st2부터 조금씩, RC카는 st4부터 — 병정 자리를 대신해 대형 모양·공격형 비율은 그대로)
+  k: 'shield', // 방패병: 정면(아래)에서 맞으면 튕겨 냄
+  h: 'healer', // 치유병: 둘레 회복
+  x: 'bomber', // 폭탄병: 죽으면 둘레 적에게 큰 피해
+  a: 'armored', // 장갑병: 관통 아닌 공은 30%
+  g: 'splitter', // 젤리: 죽으면 꼬마 젤리 둘
+  l: 'splitling', // 꼬마 젤리 (보통은 젤리에서 나온다)
+  c: 'shifter', // RC카: 옆 빈 칸으로 미끄러짐
 };
 
 /**
@@ -32,7 +40,15 @@ const GAP = '........';
 //   운으로만 들어간다 → 지그재그 모양은 '곧은 통로 + 좌우로 번갈아 붙은 주머니'로 만든다.
 // - 웨이브 사이에는 빈 줄 3~4개.
 // - 공격형(다트총·로봇·깜짝 상자)은 초반 ~8%, 후반 ~15% 이하. 곰인형(2×2)은 st3부터 엘리트.
+// - 행동하는 적은 병정 자리를 대신한다(모양·통로·공격형 비율 그대로): st2 방패·폭탄·젤리 → st3 + 장갑·치유 → st4 + RC카.
+//   방패병은 주로 앞줄 가장자리·벽 통로 옆(정면을 막아 비스듬히·뒤로 치게), 치유병은 뒷줄(틈·백어택으로 먼저 잡을 적),
+//   폭탄병은 빽빽한 가운데(연쇄), RC카는 옆에 빈칸이 있는 자리(통로를 막았다 열었다 한다 — 린트는 처음 모양만 본다).
 // 아래 배열은 화면 그대로: 위쪽 웨이브가 나중에 내려온다. 각 웨이브의 맨 아래 줄이 그 웨이브의 앞줄.
+//
+// 네 번째 난이도 조정 — 재미 기능(백어택·행동하는 적·시너지·레벨업·액티브 스킬) 뒤 (docs/DESIGN.md '네 번째 난이도 조정'):
+// 레벨업(전투 중 무료 아이템·★ + 1·런 보너스)으로 프로브 빌드의 초당 피해가 st2~st5에서 2~2.7배가 되어 모든 스테이지가 100%였다 →
+// HP 배수 st2 2 → 3.6 · st3 3.1 → 9.1 · st4 4 → 12.2 · st5 6.2 → 14.9 (대왕 로봇은 따로 — data/enemies.ts),
+// 공격 배수 st3 1.9 → 2.6 · st4 1.8 → 2.4 (가만히 서 있으면 진다), st5 하강 25 → 23 (보스전이 하강 시계보다 톱니 소모로 갈리게). st1은 그대로.
 
 export const STAGES: StageDef[] = [
   {
@@ -72,152 +88,153 @@ export const STAGES: StageDef[] = [
     id: 'st2',
     name: '블록 탑 공사장',
     descentSpeed: 27,
-    hpMul: 2,
+    hpMul: 3.6,
     dmgMul: 1.2,
     clearGold: 16,
     background: 'bg_toyroom',
     legend: LEGEND,
     rows: fromTop([
-      // W3: 오른쪽 벽 통로 + 가운데 주머니
+      // W3: 오른쪽 벽 통로 + 가운데 주머니. 앞줄 양끝 방패, 젤리·폭탄 하나씩
       'ssbs.sb.',
-      'sbos.ss.',
+      'sbos.sg.',
       'sdss.sb.',
-      'ssr.sss.',
-      'sbs.sbs.',
+      'ssr.sxs.',
+      'kbs.sbk.',
       GAP,
       GAP,
       GAP,
-      // W2: 오른쪽 아래 → 왼쪽 위 대각선 균열 (폭 2칸이 끝까지 — 오른쪽 벽 반사로 노린다)
+      // W2: 오른쪽 아래 → 왼쪽 위 대각선 균열 (폭 2칸이 끝까지 — 오른쪽 벽 반사로 노린다). 젤리·폭탄 하나씩
       's..sosss',
-      'sb..ssbs',
+      'sb..sgbs',
       'sjs..sbs',
-      'ssbs..ss',
+      'sxbs..ss',
       'sdbss..s',
       GAP,
       GAP,
       GAP,
-      // W1: 블록 기둥 두 개 사이 곧은 통로 + 옆 주머니·뒤 주머니
+      // W1: 블록 기둥 두 개 사이 곧은 통로 + 옆 주머니·뒤 주머니. 첫 방패병(왼쪽 앞)·첫 폭탄병(가운데)
       'sb.ss.bs',
       'sb..sobs',
-      'sb.sssbs',
-      'sb.srsbs',
+      'sb.sxsbs',
+      'kb.srsbs',
     ]),
   },
   {
     id: 'st3',
     name: '깜짝 상자 소동',
     descentSpeed: 32,
-    hpMul: 3.1,
-    dmgMul: 1.9,
+    hpMul: 9.1,
+    dmgMul: 2.6,
     clearGold: 20,
     background: 'bg_toyroom',
     legend: LEGEND,
     rows: fromTop([
-      // W3: 곰인형(엘리트) 옆 통로 + 곰인형 밑 주머니
-      'ss.sssos',
+      // W3: 곰인형(엘리트) 옆 통로 + 곰인형 밑 주머니. 뒷줄 치유병, 곰인형 옆 폭탄병
+      'ss.shsos',
       'ss...sbs',
-      'sj.T.sss',
-      'ss..sjss',
-      'bs.sdbs.',
+      'sj.T.sxs',
+      'sa..sjss',
+      'bs.kdbg.',
       GAP,
       GAP,
       GAP,
-      // W2: 양쪽 벽을 타고 올라가는 통로
-      '.sbsjss.',
-      '.ssosbs.',
-      '.sbssss.',
-      '.ssdsjs.',
+      // W2: 양쪽 벽을 타고 올라가는 통로. 왼쪽 통로 옆 방패, 뒷줄 치유병
+      '.sbsjhs.',
+      '.sxosba.',
+      '.sbgsss.',
+      '.ksdsjs.',
       GAP,
       GAP,
       GAP,
-      // W1: 곧은 통로(좌우 주머니로 지그재그 모양) + 왼쪽 앞 주머니
-      'ssss.sbs',
+      // W1: 곧은 통로(좌우 주머니로 지그재그 모양) + 왼쪽 앞 주머니. 첫 장갑병·첫 치유병(뒷줄)
+      'shss.sbs',
       'sbs..sos',
-      'ssjs.sss',
-      'sbss..bs',
-      'sr.s.ssb',
+      'ssjs.sxs',
+      'sbsa..bs',
+      'kr.s.ssb',
     ]),
   },
   {
     id: 'st4',
     name: '곰인형 반란',
     descentSpeed: 34,
-    hpMul: 4,
-    dmgMul: 1.8,
+    hpMul: 12.2,
+    dmgMul: 2.4,
     clearGold: 26,
     background: 'bg_toyroom',
     legend: LEGEND,
     rows: fromTop([
-      // W4: 곰인형 둘 사이로 곧은 통로
-      'ssd..dss',
-      's...s..s',
+      // W4: 곰인형 둘 사이로 곧은 통로. 곰인형 사이 폭탄병
+      'ssd..dhs',
+      's...x..s',
       'oT..sT.o',
-      'bsj.ssjb',
-      'sbs.sbs.',
+      'baj.sgjb',
+      'kbs.kbs.',
       GAP,
       GAP,
       GAP,
-      // W3: 왼쪽 아래 → 오른쪽 위 대각선 균열 (폭 2칸이 끝까지)
-      'ssss..sb',
-      'sbs..sss',
-      'sj..srss',
-      's..sdsbs',
-      '..sbsjss',
+      // W3: 왼쪽 아래 → 오른쪽 위 대각선 균열 (폭 2칸이 끝까지). 균열 옆 RC카
+      'shss..sb',
+      'sbs..sxs',
+      'sj..crss',
+      's..adsbs',
+      '..kbsjsk',
       GAP,
       GAP,
       GAP,
-      // W2: 가운데 곰인형 + 그 왼쪽 곧은 통로 + 오른쪽 앞 주머니
-      'ss.ssoss',
+      // W2: 가운데 곰인형 + 그 왼쪽 곧은 통로 + 오른쪽 앞 주머니. 통로 옆 RC카
+      'ss.shoss',
       'sb...sbs',
-      'sd.T.sds',
-      'ss..sjss',
-      'bs.ssbs.',
+      'sd.T.xds',
+      'sa..cjss',
+      'bk.sgbs.',
       GAP,
       GAP,
       GAP,
-      // W1: 가운데 곧은 통로(옆 주머니로 지그재그 모양) + 왼쪽 앞 주머니
-      'ssr..rss',
-      'sbss.sbs',
-      'sjs..sbs',
-      's.ss.sjs',
-      's.bs.sbs',
+      // W1: 가운데 곧은 통로(옆 주머니로 지그재그 모양) + 왼쪽 앞 주머니. 첫 RC카(주머니 옆)
+      'shr..rss',
+      'sbxs.sbs',
+      'sjc..sbs',
+      's.sa.sjs',
+      'k.bs.kbs',
     ]),
   },
   {
     id: 'st5',
     name: '대왕 로봇 출동',
-    descentSpeed: 25,
-    hpMul: 6.2,
+    descentSpeed: 23,
+    hpMul: 14.9,
     // 3.4 → 4.0: 보스 톱니를 약하게 한 대신 앞 웨이브(다트총·깜짝 상자·곰인형) 탄을 세게 — 피하지 않으면(가만히) 진다
     dmgMul: 4.0,
     clearGold: 0,
     background: 'bg_toyroom',
     legend: LEGEND,
     rows: fromTop([
-      // W3 (보스): 대왕 로봇 양옆은 비워 두고, 앞의 호위 줄 통로가 그 옆으로 이어진다
+      // W3 (보스): 대왕 로봇 양옆은 비워 두고, 앞의 호위 줄 통로가 그 옆으로 이어진다.
+      // 호위 줄 가운데 폭탄병 둘(터지면 바로 위 대왕 로봇도 휘말림), 앞줄 방패
       'o......o',
       '........',
       '..B.....',
-      'r.ssss.r',
-      'b.sbbs.b',
+      'r.sxxs.r',
+      'b.kbbk.b',
       GAP,
       GAP,
       GAP,
-      // W2: 곰인형 왼쪽 곧은 통로(뒤까지 뚫림) + 오른쪽 주머니
-      'sj.ssbjs',
-      'sb..ssbs',
-      'ss....rs',
+      // W2: 곰인형 왼쪽 곧은 통로(뒤까지 뚫림) + 오른쪽 주머니. 주머니를 오가는 RC카
+      'sj.hsbjs',
+      'sb..xsbs',
+      'sc....rs',
       'sd.T..ds',
-      'bs.sb.sb',
+      'bk.sb.kb',
       GAP,
       GAP,
       GAP,
       // W1: 오른쪽 아래 → 왼쪽 위 대각선 균열 (폭 2칸이 끝까지)
-      's..ssjsb',
-      'sd..sbss',
-      'bss..sbs',
-      'sjbs..ss',
-      'ssbsb..s',
+      's..shjsb',
+      'sd..xbss',
+      'bsa..sbs',
+      'sjbc..ss',
+      'kgbsb..k',
     ]),
   },
 ];

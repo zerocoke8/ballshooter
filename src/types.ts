@@ -29,6 +29,11 @@ export interface SplitSpec {
   /** 자식 투사체 스프라이트 에셋 키 */
   sprite: string;
   radius: number;
+  /**
+   * 분열 씨앗(시너지 돌)이 준 분열이면 true: 자식 수명 SEED_CHILD_MAX_AGE, 살아있는 투사체가 SYNERGY_PROJECTILE_CAP 이상이면
+   * 분열하지 않는다(밀도 상한). 무기 고유 분열(고무오리 등)은 생략
+   */
+  seed?: boolean;
 }
 
 export interface ProjectileSpec {
@@ -75,6 +80,27 @@ export interface StoneEffect {
   projectileCountAdd?: number;
   /** 관통 + (★배수 적용 후 내림) */
   pierceAdd?: number;
+  // ── 시너지 돌 (docs/DESIGN.md '시너지 아이템'). boolean 필드는 ★와 무관(scaledStone이 그대로 둔다) ──
+  /** 탄성 고무: 그 무기 공이 반사할 때마다(벽·적·트램펄린) 데미지 + 이 값 (반사 수 × 값, 합 상한 RUBBER_BONUS_CAP) */
+  bounceDamage?: number;
+  /** 뒤통수 망치: 백어택 직접 피해 × (1 + 이 값) — BACK_ATTACK_MUL 위에 곱해진다 */
+  backAttackBonus?: number;
+  /** 분열 씨앗: 분열이 없는 무기가 첫 적중에 SEED_SPLIT_COUNT개로 갈라진다. 자식 1개 데미지 = 부모 × 이 값 (합 상한 SEED_SPLIT_DAMAGE_MAX) */
+  seedSplit?: number;
+  /** 번개 코일: 연쇄 대상 + (★배수 적용 후 합산 내림, 전체 CHAIN_TARGETS_MAX까지) */
+  chainTargetsAdd?: number;
+  /** 번개 코일: 연쇄 피해 × (1 + 이 값) */
+  chainDamageAdd?: number;
+  /** 번개 코일: 연쇄로 맞은 적에서 번개가 한 번 더 튄다 (★·개수와 무관) */
+  chainHop?: boolean;
+  /** 거대화 버섯: 공 반경(분열 자식 포함) × (1 + 합), 합 상한 PROJ_RADIUS_BONUS_MAX */
+  radiusMul?: number;
+  /** 거대화 버섯(-)·가속 바퀴(+): 공 속도 × (1 + 합), 합은 PROJ_SPEED_BONUS_MIN..MAX */
+  speedMul?: number;
+  /** 전염 성냥: 이 무기로 붙은 불이 타는 적이 죽으면 반경(px, 중심 ↔ 충돌 박스) 안 적에게 불이 옮는다 (여러 개면 가장 큰 값) */
+  burnSpread?: number;
+  /** 유도 리본: 공이 가장 가까운 적 쪽으로 초당 이 각도(도)까지 휜다 (합 상한 HOMING_MAX_DEG) */
+  homingDeg?: number;
 }
 
 /** 장비: 가방 안에 있으면 전역 패시브 (★1 기준, ★에 따라 TIER_EFFECT_MUL 배) */
@@ -87,6 +113,15 @@ export interface GearEffect {
   goldMul?: number;
   /** 0.1 → 모든 무기 데미지 +10% */
   damageMul?: number;
+  // ── 시너지 장비 (docs/DESIGN.md '시너지 아이템'). boolean 필드는 ★와 무관 ──
+  /** 증기 주전자: 불타는 적을 얼음으로 / 냉기 걸린 적을 불로 직접 맞히면 그 직접 피해 × 이 값의 증기 폭발 (STEAM_RADIUS) */
+  steamMul?: number;
+  /** 폭죽 심지: 처치한 적(보스 제외)이 최대 HP × 이 값만큼 주변 적에게 터진다 (합 상한 KILL_BURST_MAX) */
+  killBurst?: number;
+  /** 트램펄린: 모든 공이 바닥에서 한 번 위로 튕긴다 (★·개수와 무관) */
+  trampoline?: boolean;
+  /** 뒤통수 동전: 백어택으로 처치하면 골드 + 이 값 (골드 배수 적용 전에 더함) */
+  backKillGold?: number;
 }
 
 export interface ItemDef {
@@ -146,6 +181,45 @@ export interface EnemyAttack {
   radius: number;
 }
 
+/**
+ * 치유병: 공격 타이머처럼(화면에 들어와야, 냉기면 느리게) 흐르는 타이머가 다 차면, 반경 안의 다친 다른 적을 회복한다.
+ * 다친 적이 없으면 찬 채로 기다렸다가 생기는 순간 회복(그다음 interval초 쉼). 보스는 회복하지 않는다.
+ */
+export interface EnemyHealSpec {
+  /** 회복 사이 간격(초) */
+  interval: number;
+  /** 첫 회복까지 추가 지연 랜덤 범위(초) — 처음엔 interval + rng × jitter */
+  jitter: number;
+  /** 반경(px): 치유병 중심 ↔ 대상 중심 거리 */
+  radius: number;
+  /** 대상 최대 HP 대비 회복량 (최대 HP를 넘지 않음) */
+  frac: number;
+}
+
+/** 폭탄병: 죽으면(어떤 이유로든) 그 자리에서 터져 반경 안의 다른 적에게 피해 — 플레이어는 맞지 않는다. 폭탄병끼리 연쇄 */
+export interface EnemyBlastSpec {
+  /** 반경(px): 폭탄병 중심 ↔ 대상 충돌 박스 */
+  radius: number;
+  /** 휘말린 적 하나에 주는 피해 (stage.hpMul이 곱해진다 — 적 체력과 함께 커짐) */
+  damage: number;
+}
+
+/** 젤리: 죽으면 자기 칸·옆 칸(빈 칸만) 중에 작은 적 count마리로 갈라진다 */
+export interface EnemySplitSpec {
+  /** 나오는 적 id (1×1, splitOnDeath 없음 — 데이터 검증 테스트가 확인) */
+  into: string;
+  count: number;
+}
+
+/** RC카: interval초마다 옆 칸(왼쪽·오른쪽, 빈 칸만)으로 speed px/s로 미끄러진다 — 틈을 막거나 연다. 플레이어 쪽으로는 움직이지 않는다 */
+export interface EnemyShiftSpec {
+  interval: number;
+  /** 첫 이동까지·이동마다 추가 지연 랜덤 범위(초) */
+  jitter: number;
+  /** px/s (한 칸 CELL을 CELL / speed초에) */
+  speed: number;
+}
+
 export interface EnemyDef {
   id: string;
   name: string;
@@ -159,9 +233,26 @@ export interface EnemyDef {
   gold: number;
   /** 아이템 드롭 확률 0..1 */
   dropChance: number;
+  /**
+   * 처치 경험치 (런 레벨업 — docs/DESIGN.md '레벨업'). 없으면 기본값: 보스 0, 그 밖은 칸 수(w × h — 1칸 1, 곰인형 4).
+   * 계산은 logic/run.ts enemyXp
+   */
+  xp?: number;
   // 몸에 닿으면 피해가 아니라 즉시 패배(CombatSim lostReason 'contact') — 적마다 정하는 접촉 피해 수치는 없다
   attack?: EnemyAttack;
   boss?: boolean;
+  // ── 특수 행동 (docs/DESIGN.md '행동하는 적') — 없으면 일반 적 ──
+  /**
+   * 방패병: 아랫면(정면 — 플레이어 쪽)에서 맞은 투사체 직접 적중은 피해 0 + 늘 반사(관통 공도 — 관통 횟수를 쓰지 않음),
+   * 분열·폭발·연쇄·상태이상도 없다('blocked' 이벤트). 옆·윗면 적중과 폭발·연쇄·화상은 그대로 들어간다
+   */
+  shield?: boolean;
+  /** 장갑: 관통하지 않는(반사하는) 투사체 직접 적중의 피해 × 이 값(0 < armor < 1, 'hit'에 armor: true). 관통 적중·폭발·연쇄·화상은 그대로 */
+  armor?: number;
+  heal?: EnemyHealSpec;
+  deathBlast?: EnemyBlastSpec;
+  splitOnDeath?: EnemySplitSpec;
+  shift?: EnemyShiftSpec;
 }
 
 export interface StageDef {
@@ -424,6 +515,102 @@ export interface AssetManifest {
   anims: Record<string, Partial<Record<AnimState, { sheet: string; fps: number; loop: boolean }>>>;
 }
 
+// ─────────────────────────────────────────────────────────────
+// 레벨업 보너스 · 캐릭터 스킬 (src/data/boons.ts, src/data/skills.ts — docs/DESIGN.md '레벨업'·'액티브 스킬')
+// ─────────────────────────────────────────────────────────────
+
+/** 런 보너스(레벨업 선택지 'boon') id */
+export type BoonId = 'power' | 'haste' | 'swift' | 'vitality' | 'multishot' | 'backstab';
+
+/** 런 보너스 1번(1중첩)의 효과. 중첩 수만큼 더해진다 (logic/stats.ts boonBonus) */
+export interface BoonEffect {
+  /** 0.1 → 모든 무기 데미지 +10% (PlayerStats.damageMul에 더함) */
+  damageMul?: number;
+  /** -0.08 → 모든 무기 쿨타임 -8% (PlayerStats.cooldownMul에 더함 — 무기 쿨타임 하한 COOLDOWN_FLOOR_MUL은 그대로) */
+  cooldownMul?: number;
+  /** 0.12 → 이동 속도 +12% */
+  moveSpeedMul?: number;
+  /** 최대 HP + (캐릭터 패시브 배수 뒤에 더함 — 정확히 이만큼) */
+  maxHpAdd?: number;
+  /** 고르는 순간 HP 회복 (전투 중이면 setLoadout의 최대 HP 증가분 회복이 같은 일을 한다 — logic/run.ts applyLevelUpChoice) */
+  heal?: number;
+  /** 가장 빨리 쏘는(쿨타임이 가장 짧은) 무기의 발사 수 + (logic/stats.ts computeLoadout) */
+  extraShots?: number;
+  /** 백어택 직접 피해 × (1 + 합) — PlayerStats.backAttackBonus (무기별 뒤통수 망치와 더해진다) */
+  backAttackBonus?: number;
+}
+
+export interface BoonDef {
+  id: BoonId;
+  /** 한국어 이름 / 효과를 말하는 한 줄 설명 */
+  name: string;
+  desc: string;
+  /** 아이콘 에셋 키 (assets.json — 지금은 비슷한 아이템 아이콘을 빌린다) */
+  icon: string;
+  /** 같은 보너스를 고를 수 있는 최대 횟수 (다 차면 선택지에 안 나온다) */
+  maxStacks: number;
+  /** 선택지 뽑기 가중치 */
+  weight: number;
+  effect: BoonEffect;
+}
+
+/** 런 보너스 중첩 수 (RunState.boons) — 없는 키 = 0 */
+export type BoonStacks = Partial<Record<BoonId, number>>;
+
+export type SkillKind = 'freeze' | 'spring' | 'storm';
+
+/** 펭구 '빙하기': 보이는 적 전부 duration초 냉기 + 얼림(공격·치유·옆걸음 타이머 정지). 보스는 얼지 않고 냉기만(느려짐) */
+export interface SkillFreezeSpec {
+  duration: number;
+}
+
+/** 카피 '온천 타임': 최대 HP × healFrac 회복 + duration초 동안 플레이어 중심 반경 radius 안에 들어온 적 탄을 없앤다 */
+export interface SkillSpringSpec {
+  healFrac: number;
+  duration: number;
+  radius: number;
+}
+
+/**
+ * 냥냥 '털뭉치 폭풍': duration초 동안 count발을 조준 방향 중심 spreadDeg 부채꼴로 쓸며 쏜다(왼→오→왼).
+ * 1발 피해 = max(minDamage × PlayerStats.damageMul, 가장 센 무기(초당 피해) 1발 피해 × damageMul), 속성 = 그 무기의 속성, 관통 pierce.
+ * 공 모양은 sprite·radius·speed, 수명 life초
+ */
+export interface SkillStormSpec {
+  count: number;
+  duration: number;
+  spreadDeg: number;
+  damageMul: number;
+  minDamage: number;
+  pierce: number;
+  sprite: string;
+  radius: number;
+  speed: number;
+  life: number;
+}
+
+interface SkillBase {
+  id: string;
+  /** 캐릭터 id (GameData.skills의 키와 같다) */
+  character: string;
+  name: string;
+  desc: string;
+  /** 스킬 버튼 아이콘 에셋 키 (skill_<캐릭터>) */
+  icon: string;
+  /**
+   * 게이지가 차는 데 필요한 피해량 (스테이지 HP 배수 1 기준 — sim이 stage.hpMul을 곱한다: 적 체력과 함께 커져
+   * 스테이지마다 비슷한 횟수). 백어택 직접 적중은 SKILL_BACK_CHARGE_MUL배로 찬다
+   */
+  charge: number;
+}
+
+export type SkillDef = SkillBase &
+  (
+    | { kind: 'freeze'; freeze: SkillFreezeSpec }
+    | { kind: 'spring'; spring: SkillSpringSpec }
+    | { kind: 'storm'; storm: SkillStormSpec }
+  );
+
 export interface GameData {
   items: Record<string, ItemDef>;
   recipes: RecipeDef[];
@@ -434,6 +621,10 @@ export interface GameData {
   bosses: Record<string, BossDef>;
   /** 보스 테스트 모드: 스테이지 + 캐릭터별 프리셋 가방 */
   bossTest: BossTestDef;
+  /** 레벨업 런 보너스 (id → 정의, 선택지 뽑기는 이 순서) */
+  boons: Record<BoonId, BoonDef>;
+  /** 캐릭터 액티브 스킬 (캐릭터 id → 스킬) */
+  skills: Record<string, SkillDef>;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -492,6 +683,19 @@ export interface PlayerStats {
   damageMul: number;
   /** 모든 무기에 곱해지는 전역 쿨타임 배수 (1.0 = 기본) */
   cooldownMul: number;
+  // ── 시너지 장비 (가방 안 장비의 합, scaledGear 뒤). 0이면 키가 없다 — 없음 = 0 ──
+  /** 증기 주전자: 증기 폭발 = 직접 피해 × 이 값 */
+  steamMul?: number;
+  /** 폭죽 심지: 처치한 적 최대 HP × 이 값 (상한 KILL_BURST_MAX) */
+  killBurst?: number;
+  /** 트램펄린: 공 하나가 바닥에서 튕길 수 있는 횟수 (있으면 1) */
+  trampoline?: number;
+  /** 뒤통수 동전: 백어택 처치 골드 + */
+  backKillGold?: number;
+  /** 모든 무기의 백어택 직접 피해 × (1 + 이 값) — 무기별 뒤통수 망치와 더해진다 (런 보너스 '뒤통수 전문가'가 채운다. 장비는 쓰지 않는다) */
+  backAttackBonus?: number;
+  /** 런 보너스 '한 발 더': 가장 빨리 쏘는 무기의 발사 수 + (computeLoadout이 그 무기 count에 더한다). 0이면 키가 없다 */
+  extraShots?: number;
 }
 
 /** 전투가 쓰는 무기 1개의 최종 스탯 */
@@ -512,6 +716,21 @@ export interface WeaponLoadout {
   split: SplitSpec | null;
   sprite: string;
   spin: boolean;
+  // ── 시너지 (맞닿은 시너지 돌 + 전역 보너스). 없으면 undefined(= 0) — computeWeapon은 키를 늘 쓰고 값만 비운다 ──
+  /** 탄성 고무: 반사마다 데미지 + 이 값 (반사 수 × 값, 상한 RUBBER_BONUS_CAP) */
+  bounceDamage?: number;
+  /** 뒤통수 망치(+ PlayerStats.backAttackBonus): 백어택 직접 피해 × (1 + 이 값) */
+  backAttackBonus?: number;
+  /** 번개 코일: 연쇄 대상 + (정수) */
+  chainTargetsAdd?: number;
+  /** 번개 코일: 연쇄 피해 × (1 + 이 값) */
+  chainDamageAdd?: number;
+  /** 번개 코일: 연쇄가 한 번 더 튀는 횟수 (0 또는 1) */
+  chainHops?: number;
+  /** 전염 성냥: 불 옮김 반경(px) */
+  burnSpread?: number;
+  /** 유도 리본: 회전 속도(라디안/초) */
+  homing?: number;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -567,6 +786,11 @@ export interface EnemyEntity {
   attackTimer: number;
   /** 렌더용: 최근 피격 후 남은 플래시 시간 */
   flash: number;
+  /**
+   * 얼림(펭구 스킬 '빙하기')에 남은 시간(초). 0보다 크면 공격·치유·옆걸음 타이머가 멈추고 미끄러지던 RC카도 선다
+   * (냉기 chillTime도 함께 걸려 받는 피해 +25%). 보스는 얼지 않는다(늘 0). 렌더는 얼음 덮개
+   */
+  frozen: number;
 }
 
 export interface ProjectileEntity {
@@ -613,14 +837,38 @@ export interface WeaponRuntime {
 }
 
 export type CombatEvent =
+  /** 무기 발사. weaponUid = SKILL_WEAPON_UID(-1)이면 스킬(털뭉치 폭풍)이 쏜 털뭉치 1발 (count 1) */
   | { type: 'fire'; weaponUid: number; x: number; y: number; count: number }
-  | { type: 'hit'; enemyId: number; x: number; y: number; damage: number; element: Element | null }
-  | { type: 'kill'; enemyId: number; defId: string; x: number; y: number; boss: boolean }
-  /** element = 폭발이 옮기는 상태이상 속성(불/얼음, 휘말린 적 hit의 element와 같음) 또는 null — 연출 전용 */
-  | { type: 'explode'; x: number; y: number; radius: number; element: Element | null }
+  /**
+   * 피해. back = 투사체 직접 적중이 적의 윗면(공이 적보다 위 — 접촉 법선이 위로 45° 안)에 맞은 '백어택'(피해 × BACK_ATTACK_MUL 적용 뒤).
+   * armor = 장갑병에게 관통하지 않는 직접 적중이라 줄어든 피해(EnemyDef.armor). 둘 다 없으면 생략
+   */
+  | { type: 'hit'; enemyId: number; x: number; y: number; damage: number; element: Element | null; back?: boolean; armor?: boolean }
+  /** back = 백어택 직접 적중으로 처치 (없으면 생략) */
+  | { type: 'kill'; enemyId: number; defId: string; x: number; y: number; boss: boolean; back?: boolean }
+  /**
+   * element = 폭발이 옮기는 상태이상 속성(불/얼음, 휘말린 적 hit의 element와 같음) 또는 null — 연출 전용.
+   * fromEnemy = 죽으면서 터진 적 id(폭탄병 EnemyDef.deathBlast · 폭죽 심지 — 이 'kill' 바로 뒤). 투사체 폭발이면 생략.
+   * cause = 시너지 장비 폭발: 'steam'(증기 주전자 — 직접 적중 'hit' 뒤, x/y = 적중점) / 'firecracker'(폭죽 심지 — 처치된 적 중심). 그 밖은 생략
+   */
+  | { type: 'explode'; x: number; y: number; radius: number; element: Element | null; fromEnemy?: number; cause?: 'steam' | 'firecracker' }
+  /** 전염 성냥: 불타던 적(sourceId, fromX/fromY = 중심)이 죽으며 다른 적(enemyId, x/y = 중심)에게 불이 옮음 — 옮은 적마다 하나, 그 'kill' 뒤 */
+  | { type: 'burnSpread'; enemyId: number; sourceId: number; fromX: number; fromY: number; x: number; y: number }
+  /** 방패병 정면(아랫면)이 투사체를 막음 — 피해 없이 반사. x, y = 막은 자리(방패 아랫변 위의 점) */
+  | { type: 'blocked'; enemyId: number; x: number; y: number }
+  /** 치유병(sourceId, fromX/fromY = 중심)이 다른 적(enemyId, x/y = 중심)을 amount 회복 — 회복한 적마다 하나 */
+  | { type: 'heal'; enemyId: number; sourceId: number; x: number; y: number; fromX: number; fromY: number; amount: number }
+  /**
+   * 적이 죽으며 새 적이 생김(젤리 → 꼬마 젤리, EnemyDef.splitOnDeath): 부모(parentId, fromX/fromY = 부모 중심)의 'kill' 바로 뒤.
+   * 새 적(x, y = 충돌 박스 중심)은 이미 sim.enemies에 있다 — 'summon'처럼 SUMMON_LAND_TIME 동안은 몸에 닿아도 패배가 아니다(튀어나오는 연출 시간)
+   */
+  | { type: 'enemySpawn'; enemyId: number; defId: string; parentId: number; fromX: number; fromY: number; x: number; y: number }
+  /** RC카(EnemyDef.shift)가 옆 칸으로 미끄러지기 시작 (fromX → toX = 충돌 박스 중심 x, y = 지금 중심 y, duration = 걸리는 초 — 멈춰 기다리지 않을 때) */
+  | { type: 'shift'; enemyId: number; fromX: number; toX: number; y: number; duration: number }
   | { type: 'chain'; fromX: number; fromY: number; toX: number; toY: number }
   | { type: 'split'; x: number; y: number; count: number }
-  | { type: 'bounce'; x: number; y: number; wall: boolean }
+  /** floor = 트램펄린(바닥에서 위로 튕김 — x, y = 바닥 위의 점, wall false). 없으면 생략 */
+  | { type: 'bounce'; x: number; y: number; wall: boolean; floor?: boolean }
   /** sprite = 보스 행동 탄의 그림 키 (보스는 EnemyDef.attack이 없다 — 효과음 고르기용). 일반 적 탄에는 없다 */
   | { type: 'enemyShoot'; enemyId: number; x: number; y: number; sprite?: string }
   /**
@@ -644,8 +892,36 @@ export type CombatEvent =
   | { type: 'hazardWarn'; hazardId: number; kind: HazardKind; x: number; y: number; warn: number }
   /** 위험 지역 발동 — 이제부터 activeTime초 동안 피해. x, y = 중심, hitPlayer = 이 순간 플레이어가 맞았나 */
   | { type: 'hazardImpact'; hazardId: number; kind: HazardKind; x: number; y: number; hitPlayer: boolean }
+  /**
+   * 액티브 스킬 발동 (CombatSim.activateSkill). x, y = 플레이어, duration = 효과 시간(초 — 얼림·온천 기운·폭풍 쏘는 시간),
+   * heal = 온천 타임이 실제로 회복한 HP (그 밖은 생략). 얼림이면 이 뒤에 'freeze'들
+   */
+  | { type: 'skill'; skill: string; kind: SkillKind; x: number; y: number; duration: number; heal?: number }
+  /** 빙하기에 걸린 적 하나 (x, y = 중심). resisted = 보스라 얼지 않고 냉기만(느려짐) */
+  | { type: 'freeze'; enemyId: number; x: number; y: number; duration: number; resisted: boolean }
+  /** 온천 기운이 적 탄을 없앰 (x, y = 탄 자리) */
+  | { type: 'shotBlocked'; x: number; y: number }
   | { type: 'won' }
   | { type: 'lost'; reason: LostReason };
+
+/**
+ * 액티브 스킬 상태 (sim.skill — 스킬이 없으면 null). 렌더·HUD용, sim이 매 스텝 제자리에서 갱신한다(같은 객체).
+ * 게이지는 전투마다 0에서 시작한다(런에 이어지지 않음)
+ */
+export interface SkillState {
+  /** SkillDef id / 종류 */
+  id: string;
+  kind: SkillKind;
+  /** 게이지 0..1 (1 = 가득) */
+  charge: number;
+  /** 지금 activateSkill()이 받아 주는가 (가득 + 효과가 끝남 + 전투 중) */
+  ready: boolean;
+  /** 지금 효과에 남은 시간(초, 0 = 없음) / 그 효과의 전체 시간 (얼림·온천 기운·폭풍 쏘는 시간 중 가장 긴 것) */
+  active: number;
+  duration: number;
+  /** 이번 전투에서 쓴 횟수 */
+  uses: number;
+}
 
 /** 보스 위험 지역 종류: 깜짝 상자 내려찍기(열 사각형) / 구슬 비(원) */
 export type HazardKind = 'slam' | 'marble';
@@ -757,9 +1033,40 @@ export interface RunState {
    * 일반 런 세이브를 절대 건드리지 않는다.
    */
   mode?: RunMode;
+  // ── 레벨업 (docs/DESIGN.md '레벨업') — 모두 선택 필드: 없으면 기본값이라 예전 세이브가 그대로 열린다(SAVE_VERSION 그대로).
+  //    newRun은 쓰지 않는다(처음 경험치를 얻을 때 생김). 읽기는 logic/run.ts runLevel/runXp/pendingLevelUps/runBoons ──
+  /** 레벨 (없으면 1) */
+  level?: number;
+  /** 지금 레벨에서 모은 경험치 (없으면 0) — 다음 레벨까지 xpToNext(level) */
+  xp?: number;
+  /** 아직 고르지 않은 레벨업 수 (없으면 0). 여러 번 쌓일 수 있다 — 화면이 하나씩 보여 주고 고른다 */
+  levelUps?: number;
+  /** 지금 보여 주는 레벨업 선택지 (굴렸지만 아직 안 고름 — 다시 열어도 같은 선택지). 없으면 levelUpOffer가 굴린다 */
+  levelOffer?: LevelUpChoice[];
+  /** 고른 런 보너스 중첩 수 (없으면 없음) */
+  boons?: BoonStacks;
 }
 
 export type RunMode = 'normal' | 'bossTest';
+
+/**
+ * 레벨업 선택지 하나 (logic/run.ts levelUpOffer가 시드로 3개를 뽑는다 — 같은 선택지는 두 번 나오지 않는다).
+ * - item: 새 아이템(★1, 스테이지 희귀도·등장 규칙 = 상점과 같음). 가방에 들어갈 자리가 있으면 자동 배치, 없으면 보관함, 보관함도 가득이면 판매가 골드
+ * - upgrade: 가방 안 아이템(uid, 지금 defId·★ tier < 3) ★ + 1
+ * - boon: 런 보너스 하나 더 (data/boons.ts)
+ */
+export type LevelUpChoice =
+  | { kind: 'item'; defId: string; tier: Tier }
+  | { kind: 'upgrade'; uid: number; defId: string; tier: Tier }
+  | { kind: 'boon'; boon: BoonId };
+
+/** applyLevelUpChoice 결과 — 화면이 '어디에 들어갔는지' 알려 준다 */
+export type LevelUpResult =
+  | { kind: 'item'; defId: string; tier: Tier; where: 'bag'; uid: number; x: number; y: number; rot: Rot }
+  | { kind: 'item'; defId: string; tier: Tier; where: 'stash'; uid: number }
+  | { kind: 'item'; defId: string; tier: Tier; where: 'gold'; gold: number }
+  | { kind: 'upgrade'; uid: number; defId: string; tier: Tier }
+  | { kind: 'boon'; boon: BoonId; stacks: number; healed: number };
 
 /** 적 처치 보상 처리 결과 */
 export interface KillReward {

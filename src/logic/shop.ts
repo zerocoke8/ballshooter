@@ -15,7 +15,7 @@ import {
 import type { GameData, ItemDef, Rarity, RunState, ShopSlot, Tier } from '../types';
 import { addToStash, expandBag, findByUid, removeByUid } from './bag';
 import { Rng } from './rng';
-import { computePlayerStats, itemPrice, sellPrice } from './stats';
+import { boonBonus, computePlayerStats, itemPrice, sellPrice } from './stats';
 
 /** SHOP_RARITY_WEIGHTS의 열 순서 */
 const RARITIES: readonly Rarity[] = ['common', 'rare', 'epic', 'legendary'];
@@ -52,7 +52,8 @@ function canAfford(run: RunState, cost: number): boolean {
 function maxHpOf(data: GameData, run: RunState): number {
   const character = data.characters[run.characterId];
   if (!character) throw new Error(`shop: unknown character '${run.characterId}'`);
-  return computePlayerStats(character, run.bag, data.items).maxHp;
+  // 런 보너스(레벨업 '꿀잠 베개' 최대 HP)까지 — run.ts runPlayerStats와 같은 값 (run.ts를 import 하면 순환이라 여기서 직접)
+  return computePlayerStats(character, run.bag, data.items, boonBonus(data.boons, run.boons)).maxHp;
 }
 
 export function rollShop(data: GameData, run: RunState, keepLocked = true): void {

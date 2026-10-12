@@ -223,6 +223,10 @@ try {
 
   await page.goto(BASE_URL, { waitUntil: 'load' });
   await page.waitForFunction(() => typeof window.__game?.scene === 'function', null, { timeout: 30000 });
+  // 레벨업 창 보류 (Game.debugHoldLevelUps): 처치 경험치로 뜬 3지선다 창이 측정을 멈추지 않게 — 대기 레벨업은 런에만 쌓인다
+  await page.evaluate(() => {
+    window.__game.game.debugHoldLevelUps = true;
+  });
   await page.evaluate((c) => window.__game.game.startRun(c), CHAR);
   await page.waitForFunction(() => window.__game.game.scenes.current?.debugState?.()?.phase === 'fight', null, { timeout: 15000, polling: 50 });
 

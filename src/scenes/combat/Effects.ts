@@ -4,14 +4,21 @@
 // - 번개: 마디마다 빛·몸통·심이 구워진 'beam' 파티클 (전용 ParticleContainer). 예전엔 Graphics 획 3겹(둥근 이음)을
 //   매 프레임 다시 그려서, 측정해 보니 전투 중 JS 할당의 대부분(둥근 이음 삼각형 분할)이 여기서 나왔다.
 // 매 프레임 할당 없음 (숫자 문자열 갱신 정도).
-import { BitmapText, Container, Particle, ParticleContainer } from 'pixi.js';
+import { BitmapText, Container, Particle, ParticleContainer, Sprite } from 'pixi.js';
 import { ELEMENT_COLORS, UI_COLORS } from '../../config';
 import { Rng } from '../../logic/rng';
 import type { Element } from '../../types';
 import { BEAM_TEX_H, BEAM_TEX_W, BEAM_WORLD_W, NUM_FONT, type FxAtlas, type FxFrame } from './fxTextures';
 import type { StatusEmitter } from './EnemyLayer';
 import {
+  ARMOR_DAMAGE_COLOR,
+  ARMOR_NUMBER_SCALE,
+  BACK_DAMAGE_COLOR,
+  BACK_NUMBER_SCALE,
   DAMAGE_COLOR,
+  HEAL_COLOR,
+  SPRING_AURA_COLOR,
+  TRAMPOLINE_COLOR,
   DAMAGE_MERGE_WINDOW,
   DAMAGE_NUMBER_LIFE,
   DOT_MERGE_WINDOW,
@@ -61,6 +68,21 @@ const DEBRIS: readonly FxFrame[] = ['bolt', 'spring', 'sparkle', 'gear', 'sparkl
 const DEBRIS_TINT = [0xc9bfb4, 0xd8b8b0, 0xffffff, 0xd2c6a8, 0xffffff, 0xffe9b8, 0xfff6e0];
 /** 보스 소환 반짝임·구슬 조각 색 (장난감 블록 색) */
 const CONFETTI_TINTS = [0xff6b6b, 0xffd23f, 0x5ee07a, 0x6fb8ff, 0xff9ad5];
+/** 백어택 반짝 (분홍·노랑) / 방패 불꽃 (흰·연노랑·쇳빛) / 젤리 방울 / 김 */
+const BACK_SPARK_TINTS = [0xff8ccf, 0xffe066, 0xffffff];
+const BLOCK_SPARK_TINTS = [0xffffff, 0xfff0a8, 0xd6ecff];
+const GOO_TINT = 0x8ee07a;
+const STEAM_TINT = 0xf6f3ee;
+const STORM_TINT = 0xe6dcff;
+
+/** 피해 숫자 모양: 보통 / 백어택(진분홍·크게·별 딱지) / 장갑(회색·작게) */
+export type NumStyle = 0 | 1 | 2;
+export const NUM_NORMAL: NumStyle = 0;
+export const NUM_BACK: NumStyle = 1;
+export const NUM_ARMOR: NumStyle = 2;
+/** 백어택 숫자 별 딱지: 크기(px, 숫자 배율 1 기준), 숫자 글자 하나 폭 어림(비트맵 폰트 34px) */
+const BADGE_SIZE = 30;
+const NUM_CHAR_W = 17;
 
 interface Fx {
   p: Particle;
@@ -105,10 +127,15 @@ interface Num {
   lastAdd: number;
   /** 화상 틱만 모인 작은 숫자 (직접 타격이 합쳐지면 보통 크기로) */
   small: boolean;
+  /** 백어택 숫자 (별 딱지를 왼쪽 위에 붙인다) / 딱지 스프라이트 (숫자마다 하나, 미리 만듦) / 글자 수 (딱지 자리 어림) */
+  back: boolean;
+  badge: Sprite;
+  len: number;
 }
 
 interface Bolt {
   active: boolean;
+  /** age < 0 = 아직 시작 전 (늦게 뻗는 번개 — 번개 코일의 두 번째 줄기) */
   x1: number;
   y1: number;
   x2: number;
@@ -212,8 +239,29 @@ export class Effects implements StatusEmitter {
       const t = new BitmapText({ text: '0', style: { fontFamily: NUM_FONT, fontSize: NUM_SIZE } });
       t.anchor.set(0.5);
       t.visible = false;
-      this.numLayer.addChild(t);
-      this.nums.push({ t, active: false, enemyId: -1, sum: 0, x: 0, y: 0, vx: 0, vy: 0, age: 0, life: 0, pop: 0, scale: 1, lastAdd: 0, small: false });
+      const badge = new Sprite(atlas.sparkle);
+      badge.anchor.set(0.5);
+      badge.visible = false;
+      this.numLayer.addChild(t, badge);
+      this.nums.push({
+        t,
+        active: false,
+        enemyId: -1,
+        sum: 0,
+        x: 0,
+        y: 0,
+        vx: 0,
+        vy: 0,
+        age: 0,
+        life: 0,
+        pop: 0,
+        scale: 1,
+        lastAdd: 0,
+        small: false,
+        back: false,
+        badge,
+        len: 1,
+      });
     }
     for (let i = 0; i < MAX_BOLTS; i++) {
       this.bolts.push({
@@ -236,35 +284,45 @@ export class Effects implements StatusEmitter {
 
   /**
    * 적 피해 숫자. 같은 적이 DAMAGE_MERGE_WINDOW 안에 또 맞으면 그 숫자에 더해 다시 튄다.
-   * dot = 화상 틱: 더 긴 창(DOT_MERGE_WINDOW)으로 합치고, 혼자면 작은 숫자 — 다시 튀지도 않는다
+   * dot = 화상 틱: 더 긴 창(DOT_MERGE_WINDOW)으로 합치고, 혼자면 작은 숫자 — 다시 튀지도 않는다.
+   * style = NUM_BACK(백어택: 진분홍·크게·별 딱지 — 합쳐진 숫자도 백어택이 하나라도 있으면 백어택 모양) / NUM_ARMOR(장갑: 회색·작게)
    */
-  damageNumber(enemyId: number, x: number, y: number, amount: number, element: Element | null, dot = false): void {
+  damageNumber(enemyId: number, x: number, y: number, amount: number, element: Element | null, dot = false, style: NumStyle = NUM_NORMAL): void {
     if (!(amount > 0)) return;
-    const color = element ? ELEMENT_COLORS[element] : DAMAGE_COLOR;
+    const color =
+      style === NUM_BACK ? BACK_DAMAGE_COLOR : style === NUM_ARMOR ? ARMOR_DAMAGE_COLOR : element ? ELEMENT_COLORS[element] : DAMAGE_COLOR;
     const prev = this.numByEnemy.get(enemyId);
     const window = dot ? DOT_MERGE_WINDOW : DAMAGE_MERGE_WINDOW;
     if (prev && prev.active && prev.enemyId === enemyId && this.clock - prev.lastAdd <= window) {
       prev.sum += amount;
-      prev.t.text = String(prev.sum);
+      const text = String(prev.sum);
+      prev.t.text = text;
+      prev.len = text.length;
       prev.lastAdd = this.clock;
       if (!dot) {
         prev.small = false;
-        prev.t.tint = color;
+        if (style === NUM_BACK && !prev.back) {
+          prev.back = true;
+          prev.badge.visible = true;
+        }
+        prev.t.tint = prev.back ? BACK_DAMAGE_COLOR : color;
         prev.pop = 0;
         // 합쳐질수록 살짝 위로 다시 튀어오름
         prev.vy = Math.min(prev.vy, -90);
       }
-      prev.scale = this.numScale(prev.sum) * (prev.small ? DOT_NUMBER_SCALE : 1);
+      prev.scale = this.numScale(prev.sum) * (prev.small ? DOT_NUMBER_SCALE : prev.back ? BACK_NUMBER_SCALE : 1);
       prev.life = Math.max(prev.life, prev.age + DAMAGE_NUMBER_LIFE * 0.85);
       return;
     }
+    const mul = dot ? DOT_NUMBER_SCALE : style === NUM_BACK ? BACK_NUMBER_SCALE : style === NUM_ARMOR ? ARMOR_NUMBER_SCALE : 1;
     // 옆 칸 적의 숫자와 겹치지 않게 위아래로도 살짝 흩는다
+    const text = String(amount);
     const n = this.number(
       x + this.rng.range(-14, 14),
       y - 10 - this.rng.range(0, 18),
-      String(amount),
+      text,
       color,
-      this.numScale(amount) * (dot ? DOT_NUMBER_SCALE : 1),
+      this.numScale(amount) * mul,
       this.rng.range(-55, 55),
       dot ? this.rng.range(-150, -110) : this.rng.range(-230, -170),
     );
@@ -272,7 +330,19 @@ export class Effects implements StatusEmitter {
     n.sum = amount;
     n.lastAdd = this.clock;
     n.small = dot;
+    n.len = text.length;
+    if (style === NUM_BACK) {
+      n.back = true;
+      n.badge.visible = true;
+      n.badge.rotation = this.rng.range(-0.4, 0.4);
+    }
     this.numByEnemy.set(enemyId, n);
+  }
+
+  /** 회복 숫자 '+N' (초록, 치유병에게 회복받은 적·온천 타임) — 피해 숫자와 합치지 않는다 */
+  healNumber(x: number, y: number, amount: number, scale = 0.85): void {
+    if (!(amount > 0)) return;
+    this.number(x + this.rng.range(-10, 10), y - 34, `+${amount}`, HEAL_COLOR, scale, this.rng.range(-20, 20), -150);
   }
 
   playerDamage(x: number, y: number, amount: number): void {
@@ -943,6 +1013,539 @@ export class Effects implements StatusEmitter {
     }
   }
 
+  // ── 백어택 · 행동하는 적 ─────────────────────────────────────
+
+  /** 백어택 직접 타격 덤: 분홍 고리 + 위로 튀는 분홍·노랑 별 (뒤에서 '퍽') */
+  backSpark(x: number, y: number): void {
+    const ring = this.spawn('ring', x, y, 14, 78, 0.24, BACK_SPARK_TINTS[0]);
+    if (ring) {
+      ring.a0 = 0.85;
+      ring.fadeStart = 0.35;
+    }
+    for (let i = 0; i < 3; i++) {
+      if (!this.roomFor(true)) break;
+      const a = -Math.PI / 2 + (i - 1) * 0.7 + this.rng.range(-0.25, 0.25);
+      const sp = this.rng.range(260, 380);
+      const f = this.spawn('star', x, y, 8, 24, this.rng.range(0.3, 0.4), BACK_SPARK_TINTS[i]);
+      if (!f) break;
+      f.curve = C_POP;
+      f.popFrac = 0.3;
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.drag = 6;
+      f.grav = 420;
+      f.vr = this.rng.range(-9, 9);
+      f.fadeStart = 0.45;
+    }
+  }
+
+  /**
+   * 방패병 정면이 공을 막음 (x, y = 방패 아랫변 위의 점): 흰 섬광 + 납작한 쇳빛 고리 + 아래로 튀는 불꽃.
+   * 피해가 없으므로 타격 별(impact)은 쓰지 않는다 — '튕겨 냈다'가 보이게
+   */
+  blockSpark(x: number, y: number): void {
+    const glow = this.spawn('soft', x, y, 22, 74, 0.14, 0xffffff);
+    if (glow) glow.a0 = 0.95;
+    const ring = this.spawn('ring', x, y + 2, 16, 96, 0.22, BLOCK_SPARK_TINTS[2]);
+    if (ring) {
+      ring.aspect = 0.42;
+      ring.a0 = 0.95;
+      ring.fadeStart = 0.3;
+    }
+    for (let i = 0; i < 5; i++) {
+      if (!this.roomFor(true)) break;
+      const a = Math.PI / 2 + this.rng.range(-1.25, 1.25);
+      const sp = this.rng.range(240, 430);
+      const f = this.spawn('star', x, y + 4, 6, 18, this.rng.range(0.22, 0.32), BLOCK_SPARK_TINTS[i % BLOCK_SPARK_TINTS.length]);
+      if (!f) break;
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.drag = 5;
+      f.grav = 700;
+      f.vr = this.rng.range(-14, 14);
+      f.fadeStart = 0.4;
+    }
+  }
+
+  /** 장갑에 튕긴 적중: 쇳빛 불꽃 몇 개가 맞은 면 바깥으로 (회색 숫자·'깡' 소리와 함께) */
+  armorSpark(x: number, y: number, nx: number, ny: number): void {
+    const base = Math.atan2(ny, nx);
+    for (let i = 0; i < 3; i++) {
+      if (!this.roomFor(true)) break;
+      const a = base + this.rng.range(-0.9, 0.9);
+      const sp = this.rng.range(300, 460);
+      const f = this.spawn('star', x, y, 5, 15, this.rng.range(0.18, 0.26), i === 0 ? 0xffffff : 0xcfe0f0);
+      if (!f) break;
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.drag = 6;
+      f.grav = 500;
+      f.vr = this.rng.range(-16, 16);
+      f.fadeStart = 0.4;
+    }
+    const s = this.spawn('sparkle', x, y, 10, 26, 0.12, 0xdfe8f2);
+    if (s) {
+      s.curve = C_POP;
+      s.p.rotation = this.rng.range(0, Math.PI);
+    }
+  }
+
+  /** 치유병이 회복 (치유병 중심): 초록 고리가 회복 반경까지 + 은은한 빛 + 머리 위 더하기 그림 */
+  healPulse(x: number, y: number, radius: number): void {
+    const ring = this.spawn('ring', x, y, 20, radius * 2.1, 0.55, HEAL_COLOR);
+    if (ring) {
+      ring.a0 = 0.95;
+      ring.fadeStart = 0.3;
+    }
+    const ring2 = this.spawn('ring', x, y, 10, radius * 1.4, 0.45, 0xd8ffd8);
+    if (ring2) {
+      ring2.delay = 0.08;
+      ring2.a0 = 0.6;
+    }
+    const glow = this.spawn('soft', x, y, 30, 120, 0.4, HEAL_COLOR);
+    if (glow) glow.a0 = 0.55;
+    const h = this.spawn('heal', x, y - 34, 12, 48, 0.7, 0xffffff);
+    if (h) {
+      h.curve = C_POP;
+      h.popFrac = 0.3;
+      h.vy = -50;
+      h.drag = 1.5;
+      h.fadeStart = 0.55;
+    }
+  }
+
+  /** 회복받은 적 (x, y = 중심): 치유병에서 날아오는 초록 빛방울 + 피어오르는 더하기 + 초록 반짝 */
+  healTarget(x: number, y: number, fromX: number, fromY: number): void {
+    if (this.roomFor(false)) {
+      const T = 0.22;
+      const orb = this.spawn('soft', fromX, fromY, 30, 22, T, HEAL_COLOR);
+      if (orb) {
+        orb.vx = (x - fromX) / T;
+        orb.vy = (y - fromY) / T;
+        orb.a0 = 0.9;
+        orb.fadeStart = 0.8;
+      }
+    }
+    const h = this.spawn('heal', x + this.rng.range(-12, 12), y - 6, 10, 36, 0.75, 0xffffff);
+    if (h) {
+      h.delay = 0.18;
+      h.curve = C_POP;
+      h.popFrac = 0.3;
+      h.vy = -80;
+      h.drag = 1.2;
+      h.fadeStart = 0.5;
+    }
+    for (let i = 0; i < 2; i++) {
+      if (!this.roomFor(false)) break;
+      const f = this.spawn('star', x + this.rng.range(-26, 26), y + this.rng.range(-20, 16), 4, 16, 0.4, 0xc8ffc8);
+      if (!f) break;
+      f.delay = 0.18 + i * 0.06;
+      f.curve = C_POP;
+      f.vy = -60;
+      f.vr = 5;
+    }
+  }
+
+  /** 폭탄병 심지 불꽃 (x, y = 심지 끝): 튀는 노란 별 + 가끔 작은 불씨 — EnemyLayer가 간격마다 부른다 */
+  fuseEmit(x: number, y: number): void {
+    if (!this.roomFor(false)) return;
+    const f = this.spawn('star', x, y, 5, 15, this.rng.range(0.18, 0.26), this.rng.chance(0.5) ? 0xffd36a : 0xffffff);
+    if (!f) return;
+    f.curve = C_POP;
+    f.popFrac = 0.3;
+    f.vx = this.rng.range(-70, 70);
+    f.vy = this.rng.range(-150, -60);
+    f.grav = 420;
+    f.vr = this.rng.range(-12, 12);
+    if (this.rng.chance(0.35)) {
+      const g = this.spawn('flame', x, y + 2, 12, 5, 0.2, 0xffffff);
+      if (g) {
+        g.curve = C_SWELL;
+        g.vy = -40;
+      }
+    }
+  }
+
+  /** RC카 바퀴 먼지 (x, y = 뒤쪽 바닥, dir = 가는 쪽 ±1) */
+  slideDust(x: number, y: number, dir: number): void {
+    if (!this.roomFor(false)) return;
+    const f = this.spawn('dust', x, y, 14, 32, 0.32, 0xffffff);
+    if (!f) return;
+    f.vx = -dir * this.rng.range(40, 90);
+    f.vy = this.rng.range(-30, -10);
+    f.drag = 5;
+    f.a0 = 0.85;
+    f.fadeStart = 0.35;
+  }
+
+  /** 젤리가 갈라짐 (부모 중심): 초록 젤리 방울이 튀고 연기 펑 — 꼬마 젤리는 EnemyLayer.hop으로 튀어나온다 */
+  jellySplat(x: number, y: number): void {
+    const puff = this.spawn('puff', x, y, 24, 84, 0.32, 0xd2f7c4);
+    if (puff) {
+      puff.curve = C_POP;
+      puff.popFrac = 0.3;
+      puff.a0 = 0.85;
+      puff.fadeStart = 0.35;
+    }
+    const ring = this.spawn('ring', x, y, 16, 110, 0.24, GOO_TINT);
+    if (ring) {
+      ring.aspect = 0.6;
+      ring.a0 = 0.8;
+    }
+    for (let i = 0; i < 6; i++) {
+      if (!this.roomFor(false)) break;
+      const a = -Math.PI / 2 + this.rng.range(-1.6, 1.6);
+      const sp = this.rng.range(200, 360);
+      const f = this.spawn('soft', x, y, this.rng.range(16, 24), 8, this.rng.range(0.4, 0.55), GOO_TINT);
+      if (!f) break;
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.grav = 900;
+      f.drag = 1;
+      f.a0 = 0.95;
+      f.fadeStart = 0.6;
+    }
+  }
+
+  /**
+   * 폭탄병이 터짐: 큰 폭발(explosion)에 검은 연기·흰 섬광을 더한다. delay = 연쇄 순서만큼 늦게(초) — 같은 묶음의 폭발이
+   * 한꺼번에 덮이지 않고 차례로 '펑-펑-펑'. 겹침 축소(EXPLODE_STACK_*)는 쓰지 않는다(연쇄는 다 보여야 재미)
+   */
+  bombBlast(x: number, y: number, radius: number, delay: number): void {
+    const d = radius * 2;
+    const flash = this.spawn('soft', x, y, d * 0.3, d * 1.05, 0.16, 0xffffff);
+    if (flash) {
+      flash.delay = delay;
+      flash.a0 = 0.95;
+    }
+    const boom = this.spawn('boom', x, y, d * 0.35, d * 1.0, 0.46, 0xffffff);
+    if (boom) {
+      boom.delay = delay;
+      boom.curve = C_POP;
+      boom.popFrac = 0.26;
+      boom.fadeStart = 0.5;
+      boom.p.rotation = this.rng.range(-0.4, 0.4);
+      boom.vr = this.rng.range(-0.8, 0.8);
+    }
+    const ring = this.spawn('ring', x, y, d * 0.3, d * 1.25, 0.32, RING_TINT);
+    if (ring) {
+      ring.delay = delay;
+      ring.a0 = 0.95;
+      ring.fadeStart = 0.3;
+    }
+    // 검은 폭탄 연기: 위로 피어오름
+    for (let i = 0; i < 4; i++) {
+      if (!this.roomFor(false)) break;
+      const a = this.rng.range(0, Math.PI * 2);
+      const f = this.spawn('puff', x + Math.cos(a) * radius * 0.3, y + Math.sin(a) * radius * 0.3, radius * 0.3, radius * 0.7, 0.6, 0x6b6470);
+      if (!f) break;
+      f.delay = delay + 0.12;
+      f.vx = Math.cos(a) * 70;
+      f.vy = Math.sin(a) * 40 - 80;
+      f.drag = 2.5;
+      f.a0 = 0.75;
+      f.fadeStart = 0.3;
+      f.p.rotation = this.rng.range(-0.4, 0.4);
+    }
+    this.debris(x, y, 5, radius * 0.4, 1.2, delay);
+  }
+
+  // ── 시너지 아이템 ────────────────────────────────────────────
+
+  /** 증기 주전자 (적중점): 하얀 김이 사방으로 '푸슉' + 흰 빛 + 옅은 고리 — 주황 폭발 구름은 쓰지 않는다 */
+  steam(x: number, y: number, radius: number): void {
+    const glow = this.spawn('soft', x, y, radius * 0.6, radius * 1.7, 0.26, 0xffffff);
+    if (glow) glow.a0 = 0.65;
+    const ring = this.spawn('ring', x, y, radius * 0.3, radius * 2.15, 0.3, 0xffffff);
+    if (ring) {
+      ring.a0 = 0.6;
+      ring.fadeStart = 0.3;
+    }
+    const n = 7;
+    for (let i = 0; i < n; i++) {
+      if (!this.roomFor(i < 4)) break;
+      const a = (i / n) * Math.PI * 2 + this.rng.range(-0.3, 0.3);
+      const f = this.spawn('puff', x, y, radius * 0.3, radius * 0.78, this.rng.range(0.5, 0.65), STEAM_TINT);
+      if (!f) break;
+      f.curve = C_POP;
+      f.popFrac = 0.35;
+      f.vx = Math.cos(a) * radius * 3.4;
+      f.vy = Math.sin(a) * radius * 3.4 - 30;
+      f.drag = 6;
+      f.grav = -60;
+      f.a0 = 0.9;
+      f.fadeStart = 0.35;
+      f.p.rotation = this.rng.range(-0.5, 0.5);
+    }
+  }
+
+  /** 폭죽 심지 (처치된 적 중심): 작은 '팡' + 알록달록 불꽃 — 처치마다 터지므로 작게, 연기·흔들림 없이 */
+  firecracker(x: number, y: number, radius: number): void {
+    const boom = this.spawn('boom', x, y, radius * 0.25, radius * 0.75, 0.26, 0xffffff);
+    if (boom) {
+      boom.curve = C_POP;
+      boom.popFrac = 0.3;
+      boom.fadeStart = 0.45;
+      boom.p.rotation = this.rng.range(-0.5, 0.5);
+    }
+    const ring = this.spawn('ring', x, y, radius * 0.25, radius * 1.4, 0.22, 0xfff0c0);
+    if (ring) ring.a0 = 0.75;
+    for (let i = 0; i < 6; i++) {
+      if (!this.roomFor(false)) break;
+      const a = (i / 6) * Math.PI * 2 + this.rng.range(-0.3, 0.3);
+      const sp = this.rng.range(220, 380);
+      const f = this.spawn('star', x, y, 6, 18, this.rng.range(0.32, 0.42), CONFETTI_TINTS[i % CONFETTI_TINTS.length]);
+      if (!f) break;
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.drag = 4;
+      f.grav = 520;
+      f.vr = this.rng.range(-10, 10);
+      f.curve = C_POP;
+      f.fadeStart = 0.5;
+    }
+  }
+
+  /** 트램펄린 (바닥 위의 점): 납작한 파란 고리가 퍼지고 흰 반짝이 위로 — '통!' */
+  trampoline(x: number, y: number): void {
+    if (!this.roomFor(true)) return;
+    const ring = this.spawn('ring', x, y - 6, 14, 92, 0.28, TRAMPOLINE_COLOR);
+    if (ring) {
+      ring.aspect = 0.28;
+      ring.a0 = 0.95;
+      ring.fadeStart = 0.3;
+    }
+    const glow = this.spawn('soft', x, y - 8, 24, 70, 0.2, TRAMPOLINE_COLOR);
+    if (glow) glow.a0 = 0.6;
+    for (let i = 0; i < 2; i++) {
+      const f = this.spawn('star', x + (i === 0 ? -10 : 10), y - 8, 6, 18, 0.3, 0xffffff);
+      if (!f) break;
+      f.vx = (i === 0 ? -1 : 1) * this.rng.range(40, 110);
+      f.vy = -this.rng.range(240, 340);
+      f.drag = 4;
+      f.curve = C_POP;
+      f.vr = 8;
+    }
+  }
+
+  /** 번개 코일의 두 번째 줄기: 조금 늦게(BOLT 지연) 가늘게 한 번 더 튄다 + 출발점에 하늘빛 반짝 */
+  chainHop(x1: number, y1: number, x2: number, y2: number): void {
+    const delay = 0.06;
+    this.bolt(x1, y1, x2, y2, 0.2, 0.72, 13, delay);
+    const s = this.spawn('star', x1, y1, 8, 30, 0.2, 0xd6f2ff);
+    if (s) {
+      s.delay = delay;
+      s.curve = C_POP;
+      s.vr = 10;
+    }
+    const glow = this.spawn('soft', x2, y2, 26, 64, 0.18, LIGHTNING_COLOR);
+    if (glow) {
+      glow.delay = delay;
+      glow.a0 = 0.7;
+    }
+  }
+
+  /** 전염 성냥: 불이 (fromX, fromY)에서 (x, y)로 포물선을 그리며 옮겨붙고, 닿는 순간 불길이 확 */
+  burnSpread(fromX: number, fromY: number, x: number, y: number): void {
+    const T = 0.24;
+    const G = 900;
+    for (let i = 0; i < 2; i++) {
+      if (!this.roomFor(i === 0)) break;
+      const f = this.spawn('flame', fromX, fromY - 6, 24, 18, T, 0xffffff);
+      if (!f) break;
+      const t = T * (1 - i * 0.12);
+      f.life = t;
+      f.vx = (x - fromX) / t;
+      f.vy = (y - fromY) / t - 0.5 * G * t;
+      f.grav = G;
+      f.fadeStart = 0.85;
+      // 불꽃 끝(그림 위쪽)이 날아가는 반대쪽으로 끌리게
+      f.align = true;
+      f.rot0 = -Math.PI / 2;
+    }
+    for (let i = 0; i < 2; i++) {
+      const f = this.spawn('flame', x + (i === 0 ? -12 : 12), y + 4, 36, 14, 0.42, 0xffffff);
+      if (!f) break;
+      f.delay = T;
+      f.curve = C_SWELL;
+      f.vy = -110;
+      f.fadeStart = 0.5;
+    }
+    const glow = this.spawn('soft', x, y, 30, 90, 0.22, ELEMENT_COLORS.fire);
+    if (glow) {
+      glow.delay = T;
+      glow.a0 = 0.6;
+    }
+  }
+
+  // ── 액티브 스킬 ──────────────────────────────────────────────
+
+  /** 빙하기 발동 (플레이어): 화면을 가로지르는 서리 파도(얼음 고리 두 겹) + 플레이어에서 사방으로 튀는 얼음 결정 */
+  frostWave(x: number, y: number): void {
+    const glow = this.spawn('soft', x, y, 60, 320, 0.4, 0xd6f2ff);
+    if (glow) glow.a0 = 0.8;
+    const ring = this.spawn('ring', x, y, 40, 2400, 1.25, ELEMENT_COLORS.ice);
+    if (ring) {
+      ring.curve = C_LIN;
+      ring.a0 = 0.9;
+      ring.fadeStart = 0.45;
+    }
+    const ring2 = this.spawn('ring', x, y, 20, 1900, 1.15, 0xffffff);
+    if (ring2) {
+      ring2.curve = C_LIN;
+      ring2.delay = 0.06;
+      ring2.a0 = 0.7;
+      ring2.fadeStart = 0.35;
+    }
+    const n = 12;
+    for (let i = 0; i < n; i++) {
+      if (!this.roomFor(true)) break;
+      const a = (i / n) * Math.PI * 2 + this.rng.range(-0.2, 0.2);
+      const sp = this.rng.range(560, 900);
+      const f = this.spawn('ice', x + Math.cos(a) * 30, y + Math.sin(a) * 30, 14, 40, this.rng.range(0.45, 0.6), 0xffffff);
+      if (!f) break;
+      f.curve = C_POP;
+      f.popFrac = 0.25;
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.drag = 4;
+      f.p.rotation = a + Math.PI / 2;
+      f.fadeStart = 0.55;
+    }
+  }
+
+  /** 빙하기에 걸린 적 (중심, delay = 파도가 닿는 시간): 얼음 결정이 박히며 '쩡' + 반짝. resisted = 보스 (냉기만 — 작게) */
+  freezeHit(x: number, y: number, size: number, delay: number, resisted: boolean): void {
+    const s = Math.max(56, size);
+    const ring = this.spawn('ring', x, y, s * 0.3, s * (resisted ? 0.9 : 1.3), 0.3, ELEMENT_COLORS.ice);
+    if (ring) {
+      ring.delay = delay;
+      ring.a0 = 0.85;
+    }
+    const n = resisted ? 3 : 5;
+    for (let i = 0; i < n; i++) {
+      if (!this.roomFor(i < 2)) break;
+      const a = (i / n) * Math.PI * 2 + this.rng.range(-0.3, 0.3);
+      const f = this.spawn('ice', x + Math.cos(a) * s * 0.22, y + Math.sin(a) * s * 0.22, s * 0.12, s * 0.34, this.rng.range(0.4, 0.55), 0xffffff);
+      if (!f) break;
+      f.delay = delay;
+      f.curve = C_POP;
+      f.popFrac = 0.3;
+      f.vx = Math.cos(a) * s * 1.6;
+      f.vy = Math.sin(a) * s * 1.6;
+      f.drag = 8;
+      f.p.rotation = a + Math.PI / 2;
+      f.fadeStart = 0.55;
+    }
+    const st = this.spawn('star', x + this.rng.range(-0.2, 0.2) * s, y - s * 0.25, 6, 30, 0.4, 0xe6f8ff);
+    if (st) {
+      st.delay = delay + 0.05;
+      st.curve = C_POP;
+      st.vr = 6;
+    }
+  }
+
+  /** 얼림이 풀림 (중심): 얼음 상자 조각이 떨어져 나간다 */
+  iceShatter(x: number, y: number, size: number): void {
+    const s = Math.max(48, size);
+    for (let i = 0; i < 4; i++) {
+      if (!this.roomFor(false)) break;
+      const a = -Math.PI / 2 + this.rng.range(-1.4, 1.4);
+      const sp = this.rng.range(120, 240);
+      const f = this.spawn('shard', x + this.rng.range(-0.3, 0.3) * s, y + this.rng.range(-0.3, 0.3) * s, s * 0.16, s * 0.1, 0.45, 0xd6f2ff);
+      if (!f) break;
+      f.vx = Math.cos(a) * sp;
+      f.vy = Math.sin(a) * sp;
+      f.grav = 900;
+      f.vr = this.rng.range(-10, 10);
+      f.fadeStart = 0.4;
+    }
+  }
+
+  /** 온천 타임 발동 (플레이어): 따뜻한 고리 + 둘레에서 피어오르는 김 + 초록 더하기들 */
+  springBurst(x: number, y: number, radius: number): void {
+    const glow = this.spawn('soft', x, y, 60, radius * 2.4, 0.45, SPRING_AURA_COLOR);
+    if (glow) glow.a0 = 0.55;
+    const ring = this.spawn('ring', x, y, 40, radius * 2.3, 0.4, SPRING_AURA_COLOR);
+    if (ring) {
+      ring.a0 = 0.9;
+      ring.fadeStart = 0.4;
+    }
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 + this.rng.range(-0.2, 0.2);
+      const r = this.rng.range(40, 70);
+      const h = this.spawn('heal', x + Math.cos(a) * r, y + Math.sin(a) * r * 0.7 - 10, 10, 34, 0.75, 0xffffff);
+      if (!h) break;
+      h.delay = i * 0.05;
+      h.curve = C_POP;
+      h.popFrac = 0.3;
+      h.vy = -110;
+      h.drag = 1.2;
+      h.fadeStart = 0.5;
+    }
+    for (let i = 0; i < 6; i++) {
+      if (!this.roomFor(false)) break;
+      const a = (i / 6) * Math.PI * 2 + 0.3;
+      this.auraWisp(x + Math.cos(a) * radius * 0.85, y + Math.sin(a) * radius * 0.85);
+    }
+  }
+
+  /** 온천 기운의 김 한 줄기 (원 둘레의 한 점): 하얗게 피어올라 사라짐 — SkillFx가 간격마다 부른다 */
+  auraWisp(x: number, y: number): void {
+    if (!this.roomFor(false)) return;
+    const f = this.spawn('puff', x, y, 14, 38, this.rng.range(0.55, 0.75), 0xfff3e6);
+    if (!f) return;
+    f.vx = this.rng.range(-14, 14);
+    f.vy = this.rng.range(-90, -55);
+    f.drag = 1;
+    f.a0 = 0.5;
+    f.fadeStart = 0.3;
+    f.p.rotation = this.rng.range(-0.5, 0.5);
+  }
+
+  /** 온천 기운에 녹은 적 탄 (탄 자리): 하얀 김 '치익' + 반짝 */
+  dissolve(x: number, y: number): void {
+    const f = this.spawn('puff', x, y, 14, 46, 0.32, 0xffffff);
+    if (f) {
+      f.curve = C_POP;
+      f.popFrac = 0.3;
+      f.vy = -50;
+      f.a0 = 0.9;
+      f.fadeStart = 0.35;
+      f.p.rotation = this.rng.range(-0.5, 0.5);
+    }
+    const g = this.spawn('soft', x, y, 18, 50, 0.18, SPRING_AURA_COLOR);
+    if (g) g.a0 = 0.7;
+    const s = this.spawn('sparkle', x, y, 10, 24, 0.16, 0xffffff);
+    if (s) {
+      s.curve = C_POP;
+      s.p.rotation = this.rng.range(0, Math.PI);
+    }
+  }
+
+  /** 털뭉치 폭풍 발동 (플레이어): 둘레로 휘몰아치는 털 구름 + 연보라 고리 */
+  stormBurst(x: number, y: number): void {
+    const ring = this.spawn('ring', x, y, 30, 260, 0.36, STORM_TINT);
+    if (ring) {
+      ring.a0 = 0.85;
+      ring.fadeStart = 0.35;
+    }
+    const n = 12;
+    for (let i = 0; i < n; i++) {
+      if (!this.roomFor(i < 6)) break;
+      const a = (i / n) * Math.PI * 2;
+      const f = this.spawn('puff', x + Math.cos(a) * 40, y + Math.sin(a) * 40 - 20, 18, 42, this.rng.range(0.4, 0.5), STORM_TINT);
+      if (!f) break;
+      // 바깥 + 시계 방향 접선 → 휘감으며 퍼짐
+      f.vx = Math.cos(a) * 160 - Math.sin(a) * 360;
+      f.vy = Math.sin(a) * 160 + Math.cos(a) * 360;
+      f.drag = 3.5;
+      f.vr = 6;
+      f.a0 = 0.85;
+      f.fadeStart = 0.35;
+    }
+  }
+
   // ── 매 프레임 ───────────────────────────────────────────────
 
   update(dt: number): void {
@@ -1014,6 +1617,7 @@ export class Effects implements StatusEmitter {
       if (n.age >= n.life) {
         n.active = false;
         n.t.visible = false;
+        n.badge.visible = false;
         if (this.numByEnemy.get(n.enemyId) === n) this.numByEnemy.delete(n.enemyId);
         continue;
       }
@@ -1032,8 +1636,18 @@ export class Effects implements StatusEmitter {
       const q = Math.min(1, n.pop / 0.2);
       const pop = 1.6 - 0.6 * outBack(q);
       n.t.position.set(n.x, n.y);
-      n.t.scale.set(n.scale * pop);
-      n.t.alpha = k < 0.62 ? 1 : 1 - (k - 0.62) / 0.38;
+      const ns = n.scale * pop;
+      n.t.scale.set(ns);
+      const na = k < 0.62 ? 1 : 1 - (k - 0.62) / 0.38;
+      n.t.alpha = na;
+      if (n.back) {
+        // 별 딱지: 숫자 왼쪽 위, 숫자와 같이 튀고 천천히 돈다
+        const b = n.badge;
+        b.position.set(n.x - (n.len * NUM_CHAR_W * 0.5 + 8) * ns, n.y - 14 * ns);
+        b.scale.set((BADGE_SIZE * ns * (0.9 + 0.25 * (1 - q))) / Math.max(1, b.texture.width));
+        b.rotation += dt * 2.2;
+        b.alpha = na;
+      }
     }
 
     // 번개
@@ -1047,6 +1661,7 @@ export class Effects implements StatusEmitter {
         b.active = false;
         continue;
       }
+      if (b.age < 0) continue;
       b.jitter -= dt;
       if (b.jitter <= 0) {
         b.jitter = BOLT_REJITTER;
@@ -1081,6 +1696,36 @@ export class Effects implements StatusEmitter {
     this.killBurst(x, y, 80, 1, 0);
     this.splitPuff(x, y, 3);
     this.fizzle(x, y, 24);
+    // 재미 기능 연출 (백어택·행동하는 적·시너지·스킬) — 같은 이유로 한 번씩
+    this.backSpark(x, y);
+    this.blockSpark(x, y);
+    this.armorSpark(x, y, 0, 1);
+    this.healPulse(x, y, 134);
+    this.healTarget(x + 80, y, x, y);
+    this.fuseEmit(x, y);
+    this.slideDust(x, y, 1);
+    this.jellySplat(x, y);
+    this.bombBlast(x + 800, y, 134, 0);
+    this.steam(x, y, 90);
+    this.firecracker(x, y, 96);
+    this.trampoline(x, y);
+    this.chainHop(x, y, x + 80, y);
+    this.burnSpread(x, y, x + 80, y);
+    this.iceShatter(x, y, 72);
+    this.freezeHit(x, y, 72, 0, false);
+    this.dissolve(x, y);
+    this.auraWisp(x, y);
+    // (숫자는 미리 띄우지 않는다 — 위쪽 한계(numTop)로 끌려와 인트로 화면에 보인다. 비트맵 폰트·딱지 텍스처는 이미 올라가 있다)
+    this.update(0);
+  }
+
+  /** 스킬 발동 연출 (화면 큰 고리·결정) — 그 캐릭터의 스킬만, 인트로 동안 화면 밖에서 한 번 */
+  prewarmSkill(kind: 'freeze' | 'spring' | 'storm'): void {
+    const x = 300;
+    const y = -1400;
+    if (kind === 'freeze') this.frostWave(x, y);
+    else if (kind === 'spring') this.springBurst(x, y, 140);
+    else this.stormBurst(x, y);
     this.update(0);
   }
 
@@ -1119,6 +1764,9 @@ export class Effects implements StatusEmitter {
     n.active = true;
     n.enemyId = -1;
     n.small = false;
+    n.back = false;
+    n.badge.visible = false;
+    n.len = text.length;
     n.x = x;
     n.y = y;
     n.vx = vx;
@@ -1132,8 +1780,8 @@ export class Effects implements StatusEmitter {
     n.t.alpha = 1;
     n.t.position.set(x, y);
     n.t.scale.set(scale * 1.6);
-    // 최신 숫자가 위에 오도록
-    this.numLayer.addChild(n.t);
+    // 최신 숫자가 위에 오도록 (딱지는 숫자 위)
+    this.numLayer.addChild(n.t, n.badge);
     return n;
   }
 
@@ -1180,7 +1828,7 @@ export class Effects implements StatusEmitter {
     return f;
   }
 
-  private bolt(x1: number, y1: number, x2: number, y2: number, life: number, width: number, amp: number): void {
+  private bolt(x1: number, y1: number, x2: number, y2: number, life: number, width: number, amp: number, delay = 0): void {
     let slot: Bolt | null = null;
     let oldest: Bolt | null = null;
     for (const b of this.bolts) {
@@ -1196,7 +1844,7 @@ export class Effects implements StatusEmitter {
     b.y1 = y1;
     b.x2 = x2;
     b.y2 = y2;
-    b.age = 0;
+    b.age = -delay;
     b.life = life;
     b.width = width;
     b.amp = amp;

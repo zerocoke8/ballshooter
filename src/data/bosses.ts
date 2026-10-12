@@ -48,11 +48,13 @@ const BOSS_LIST: BossDef[] = [
         enterSummon: 6,
         minionCap: 12,
         creep: 0,
+        // 행동하는 적은 2페이즈부터: 폭탄병(터지면 둘레 졸개와 바로 위 보스도 휘말림)
         minions: [
-          { enemy: 'soldier', weight: 6 },
+          { enemy: 'soldier', weight: 5 },
           { enemy: 'balloon', weight: 2 },
           { enemy: 'dartgun', weight: 1 },
           { enemy: 'robot', weight: 1 },
+          { enemy: 'bomber', weight: 1 },
         ],
       },
       {
@@ -64,11 +66,20 @@ const BOSS_LIST: BossDef[] = [
         enterSummon: 6,
         minionCap: 14,
         creep: 3,
+        // + 방패병·장갑병·치유병(졸개만 회복 — 보스는 회복하지 않는다)·젤리·RC카(옆 통로로 미끄러져 백어택 길을 막기도 한다), 폭탄병 2.
+        // 방패병은 보스 아래 줄에서는 정면(아래)밖에 안 보여 잘 안 죽는다 — 2페이즈부터 넣거나 폭탄병을 1로 두면 졸개가 쌓여
+        // 오래 걸린 판(130초 넘게)에서 이상적인 회피도 갇혔다(프로브 boss test, 시드 12개: 접촉 1·피할 수 없는 피해 2). 폭탄병 2가 그 벽을 연다
         minions: [
-          { enemy: 'soldier', weight: 6 },
-          { enemy: 'balloon', weight: 2 },
+          { enemy: 'soldier', weight: 4 },
+          { enemy: 'balloon', weight: 1 },
           { enemy: 'dartgun', weight: 1 },
           { enemy: 'robot', weight: 2 },
+          { enemy: 'bomber', weight: 2 },
+          { enemy: 'shield', weight: 1 },
+          { enemy: 'armored', weight: 1 },
+          { enemy: 'healer', weight: 1 },
+          { enemy: 'splitter', weight: 1 },
+          { enemy: 'shifter', weight: 1 },
         ],
       },
     ],

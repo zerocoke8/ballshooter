@@ -215,7 +215,8 @@ describe('보스 데이터 (src/data/bosses.ts)', () => {
 });
 
 describe('보스 테스트 프리셋 (src/data/bossTest.ts)', () => {
-  it.each(CHARACTER_IDS)('%s: 가방에 들어가고, 무기 4~6(진화 1+, ★2 있음)·버프 돌 2~3(무기에 맞닿음)·장비 1~2, 합성 거리 없음', (id) => {
+  // 장비는 1~3: 밸런스 조정(백어택·레벨업·스킬 뒤)에서 펭구·냥냥은 냄비를 하나씩 더 껴 체력을 맞췄다 (docs/DESIGN.md '보스 테스트 모드 — 조정')
+  it.each(CHARACTER_IDS)('%s: 가방에 들어가고, 무기 4~6(진화 1+, ★2 있음)·버프 돌 2~3(무기에 맞닿음)·장비 1~3, 합성 거리 없음', (id) => {
     const preset = data.bossTest.presets[id];
     expect(preset, `${id} 프리셋`).toBeDefined();
     expect(preset.cols >= 1 && preset.cols <= BAG_MAX_COLS && preset.rows >= 1 && preset.rows <= BAG_MAX_ROWS).toBe(true);
@@ -241,7 +242,7 @@ describe('보스 테스트 프리셋 (src/data/bossTest.ts)', () => {
       expect(buffs, `${s.defId} 버프할 무기`).toBe(true);
     }
     expect(gear.length).toBeGreaterThanOrEqual(1);
-    expect(gear.length).toBeLessThanOrEqual(2);
+    expect(gear.length).toBeLessThanOrEqual(3);
     expect(findMerges(run.bag, data), '시작하자마자 합성 가능 표시').toEqual([]);
   });
 });

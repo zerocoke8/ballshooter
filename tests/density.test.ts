@@ -12,11 +12,16 @@ import {
   FIELD_W,
   PLAYER_START_Y,
   PROJECTILE_MAX_AGE,
+  SEED_CHILD_MAX_AGE,
   SIM_DT,
   SPLIT_CHILD_MAX_AGE,
+  SYNERGY_PROJECTILE_CAP,
+  TRAMPOLINE_AFTER_LIFE,
 } from '../src/config';
 import { GAME_DATA } from '../src/data/index';
+import { addNewToBag, createBag } from '../src/logic/bag';
 import { CombatSim, FIRE_OFFSET_Y, traceAim, type AimTrace } from '../src/logic/combat/sim';
+import { combatSeed, newRun, runLoadout, runPlayerStats } from '../src/logic/run';
 import type { EnemyDef, ItemDef, PlayerStats, ProjectileEntity, StageDef, WeaponLoadout } from '../src/types';
 
 const TOUGH_PLAYER: PlayerStats = { maxHp: 1e9, moveSpeed: 0, regenPerSec: 0, goldMul: 1, damageMul: 1, cooldownMul: 1 };
@@ -276,5 +281,79 @@ describe('틈으로 들어간 공 (멀쩡한 웨이브, 정지)', () => {
     // 뒤로 들어간 공은 평균 RATTLE_MIN번 이상 뒤에서 때리고, 수명을 줄여도 예전(8초)의 RATTLE_KEEP 이상이 남는다
     expect(now).toBeGreaterThanOrEqual(RATTLE_MIN);
     expect(now).toBeGreaterThanOrEqual(RATTLE_KEEP * old);
+  });
+});
+
+// ── 시너지 아이템: 씨앗 + 거울 + 트램펄린이 밀도 목표를 넘기지 않는다 ─────────────
+// 트램펄린은 모든 공에 두 번째 기회를, 분열 씨앗은 분열 없는 무기에 자식 2개를 준다. 둘 다 시너지 밀도 상한
+// (SYNERGY_PROJECTILE_CAP — 그 이상이면 쉰다)과 짧은 수명(TRAMPOLINE_AFTER_LIFE, SEED_CHILD_MAX_AGE)으로 묶인다.
+// 상한이 없을 때 스트레스 빌드 + 트램펄린 = 평균 44 → 74, 최대 57 → 99 (docs/DESIGN.md '시너지 아이템').
+
+type Layout = { defId: string; x: number; y: number }[];
+
+/** 밸런스 프로브의 스트레스 빌드와 같은 배치 (7×6, 무기 10종 + 거울·태엽 — tests/balance.probe.test.ts STRESS_LAYOUT) */
+const STRESS: Layout = [
+  { defId: 'w_sock_gatling', x: 0, y: 0 }, { defId: 's_haste', x: 1, y: 0 }, { defId: 'w_yuzu_molotov', x: 2, y: 0 },
+  { defId: 's_mirror', x: 3, y: 0 }, { defId: 'w_static_hairball', x: 4, y: 0 }, { defId: 's_haste', x: 5, y: 0 },
+  { defId: 'w_yuzu', x: 6, y: 0 }, { defId: 's_mirror', x: 0, y: 1 }, { defId: 's_power', x: 1, y: 1 },
+  { defId: 'w_hairball', x: 2, y: 1 }, { defId: 'w_flame_toaster', x: 0, y: 2 }, { defId: 'w_melon_bingsu', x: 2, y: 2 },
+  { defId: 'w_mama_duck', x: 4, y: 2 }, { defId: 'w_methane_bomb', x: 5, y: 2 }, { defId: 'w_tuna_missile', x: 5, y: 3 },
+  { defId: 'g_bandage', x: 0, y: 4 }, { defId: 'g_potlid', x: 1, y: 4 },
+];
+/** + 분열 씨앗 4개(털뭉치·정전기 털뭉치(거울)·메탄(무한 관통)·유자 옆 — 빈 칸 y1) + 트램펄린: 가장 나쁜 경우 */
+const STRESS_SYNERGY: Layout = [
+  ...STRESS,
+  { defId: 's_seed', x: 3, y: 1 }, { defId: 's_seed', x: 4, y: 1 }, { defId: 's_seed', x: 5, y: 1 }, { defId: 's_seed', x: 6, y: 1 },
+  { defId: 'g_trampoline', x: 2, y: 4 },
+];
+
+/** 그 가방(고양이)으로 90초까지: 좌우로 걸으며 조준을 흔든다 — 살아있는 투사체 평균·최대 */
+function liveProjectiles(layout: Layout, stage: StageDef, stageIndex: number): { avg: number; peak: number } {
+  const run = newRun(GAME_DATA, 'cat', 7);
+  run.bag = createBag(7, 6);
+  for (const it of layout) if (!addNewToBag(run.bag, GAME_DATA.items, it.defId, 1, it.x, it.y, 0)) throw new Error(`layout: ${it.defId}`);
+  run.stageIndex = stageIndex;
+  const ps = runPlayerStats(GAME_DATA, run);
+  const sim = new CombatSim({
+    stage, stageIndex, enemies: GAME_DATA.enemies, bosses: GAME_DATA.bosses, loadout: runLoadout(GAME_DATA, run),
+    player: { ...ps, maxHp: 1e6 }, hp: 1e6, seed: combatSeed(run),
+  });
+  let peak = 0;
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i < 90 / SIM_DT && sim.status === 'running'; i++) {
+    sim.step(SIM_DT, { targetX: 336 + 250 * Math.sin(i / 29), targetY: 840, aimAngle: -Math.PI / 2 + 1.1 * Math.sin(i / 41) });
+    sim.drainEvents();
+    peak = Math.max(peak, sim.projectiles.length);
+    sum += sim.projectiles.length;
+    n++;
+  }
+  return { avg: sum / Math.max(1, n), peak };
+}
+
+/** 스트레스 빌드 최대 목표 (docs/DESIGN.md '무기 수치와 투사체 밀도') */
+const STRESS_PEAK_MAX = 60;
+/**
+ * 네 번째 난이도 조정(레벨업에 맞춰 적 체력 ~3배 — docs/DESIGN.md) 뒤 st5의 스트레스 빌드 자체(시너지 없음)가 이 90초 측정에서 한순간 64까지 오른다
+ * (평균 43으로 그대로 — 대형·보스가 더 오래 버텨 무기가 쉬지 않고 쏘는 순간이 겹친다. st5 하강 25 → 23 뒤로: 57 → 64, 하강 24면 58이지만
+ * 그때는 보스가 방어선 직전까지 내려와 이상적인 회피의 '안 맞는 자리가 없던' 순간이 수십 번 생겼다). 시너지 검사는 '스트레스 빌드보다
+ * 최대를 올리지 않는다'로, 스트레스 빌드 자체의 최대는 이 상한으로 본다
+ */
+const STRESS_PEAK_MAX_LATE = 65;
+/** 시너지를 얹어도 평균은 스트레스 빌드의 이 배수 이하 */
+const SYNERGY_AVG_RATIO_MAX = 1.15;
+
+describe('시너지 아이템 밀도 (씨앗 + 거울 + 트램펄린)', () => {
+  it(`스트레스 빌드 + 씨앗 4 + 트램펄린: 최대 ≤ max(${STRESS_PEAK_MAX}, 스트레스 빌드 최대 ≤ ${STRESS_PEAK_MAX_LATE}), 평균은 스트레스 빌드의 ${SYNERGY_AVG_RATIO_MAX}배 이하 (st5, 보스 테스트)`, () => {
+    const lines: string[] = [];
+    for (const [stage, si] of [[GAME_DATA.stages[GAME_DATA.stages.length - 1], GAME_DATA.stages.length - 1], [GAME_DATA.bossTest.stage, 0]] as const) {
+      const base = liveProjectiles(STRESS, stage, si);
+      const syn = liveProjectiles(STRESS_SYNERGY, stage, si);
+      lines.push(`  ${stage.id.padEnd(9)} stress avg ${base.avg.toFixed(1)} peak ${base.peak}  ·  + 4 seeds + trampoline avg ${syn.avg.toFixed(1)} peak ${syn.peak}`);
+      expect(base.peak, `${stage.id} stress`).toBeLessThanOrEqual(STRESS_PEAK_MAX_LATE);
+      expect(syn.peak, stage.id).toBeLessThanOrEqual(Math.max(STRESS_PEAK_MAX, base.peak));
+      expect(syn.avg, stage.id).toBeLessThanOrEqual(base.avg * SYNERGY_AVG_RATIO_MAX);
+    }
+    console.log(`\n[density] synergy (cap ${SYNERGY_PROJECTILE_CAP}, trampoline after-life ${TRAMPOLINE_AFTER_LIFE}s, seed child ${SEED_CHILD_MAX_AGE}s)\n${lines.join('\n')}\n`);
   });
 });

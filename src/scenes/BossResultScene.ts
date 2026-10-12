@@ -40,6 +40,8 @@ const RETRY_COLOR = 0x4cc96b;
 const CHANGE_COLOR = 0x7a4fc4;
 const CONFETTI_INTERVAL = 0.45;
 const STAR_COLOR = 0xffe14a;
+/** 도달 레벨 숫자 색 (HUD 경험치 막대와 같은 하늘색) */
+const LEVEL_COLOR = 0x5ec8ff;
 
 interface StatRow {
   body: Container;
@@ -155,6 +157,8 @@ export class BossResultScene extends Scene {
       { label: T.menu.backAttacks, value: result.backAttacks, fmt: (n) => String(n), color: 0xff9ad5 },
       { label: T.menu.minionKills, value: result.minionKills, fmt: (n) => String(n), color: UI_COLORS.text },
       { label: T.menu.phaseReached, value: result.phase, fmt: (n) => T.menu.phaseOf(n, result.phases), color: UI_COLORS.good },
+      // 도달 레벨 (졸개 처치 경험치)
+      ...(result.level !== undefined ? [{ label: T.menu.levelReached, value: result.level, fmt: (n: number) => T.menu.levelOf(n), color: LEVEL_COLOR }] : []),
     ];
     this.panelH = ROW_PAD * 2 + ROW_H * rows.length;
     this.panel = new Panel(PANEL_W, this.panelH, { radius: 30 });

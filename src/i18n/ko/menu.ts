@@ -73,6 +73,12 @@ export const menu = {
   /** 강화석이 무기 옆에 있을 때 */
   stoneTeaser: (stone: string): string => `${josa(stone, '은', '는')} 맞닿은 무기를 더 세게 만들어요.`,
   teaserTitle: '팁',
+  /** 액티브 스킬 줄: 딱지 + 스킬 이름 + 한 줄 효과 (수치는 SkillDef에서 — scenes/skillText.ts) */
+  skill: '스킬',
+  skillFreeze: (seconds: number): string => `화면의 적을 ${seconds}초 동안 꽁꽁 얼려요`,
+  skillSpring: (healPct: number, seconds: number): string => `HP ${healPct}% 회복 + ${seconds}초 동안 적 탄 녹이기`,
+  skillStorm: (count: number): string => `털뭉치 ${count}개를 부채꼴로 퍼부어요`,
+  skillHint: '게이지가 차면 스킬 버튼 (Space)',
 
   // ── 스테이지 클리어 ───────────────────────────────────────
   stageClear: '스테이지 클리어!',
@@ -97,6 +103,9 @@ export const menu = {
   reachedStageLabel: '도달 스테이지',
   stagesCleared: '클리어한 스테이지',
   killsCount: '처치 수',
+  /** 결과 화면: 도달 레벨 (레벨업) */
+  levelReached: '도달 레벨',
+  levelOf: (n: number): string => `Lv ${n}`,
   stageOf: (n: number, total: number): string => `${n} / ${total}`,
   toTitle: '타이틀로',
   retry: '다시 하기',

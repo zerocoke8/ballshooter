@@ -1,5 +1,6 @@
-// '백어택!' 콤보 글자 (필드 좌표, topLayer). 공이 틈으로 들어가 웨이브 뒤·위에서 적을 때리면 그 근처에
+// '백어택!' 콤보 글자 (필드 좌표, topLayer). sim이 백어택(윗면 직접 적중 — 'hit'의 back)이라고 한 적중마다 그 근처에
 // "백어택!" → 이어지면 "백어택 x3!"처럼 배수가 붙고 콤보가 클수록 크고 뜨거운 색이 된다.
+// 피할 자리(setAvoid — 보스 입 둘레: 다음 공격 예고 빛이 뜨는 곳)에는 겹치지 않게 위(자리가 없으면 아래)로 비켜 선다.
 // COMBO_TIMEOUT 동안 백어택가 없으면 사라진다. 글자 갱신은 COMBO_REFRESH 간격으로 묶어서(연타에도 깜빡이지 않게).
 // 한글 글자(Text)는 처음에 한 번만 래스터화하고, 바뀌는 배수는 숫자 비트맵 폰트로 그린다 → 갱신 비용 없음.
 import { BitmapText, Container, Text, TextStyle } from 'pixi.js';
@@ -26,6 +27,10 @@ const LIFT_BELOW = 50;
 const HOT_AT = 6;
 /** 이 콤보부터는 오래 떠 있으므로 살짝 투명하게 (뒤의 적이 비쳐 보이게) */
 const LONG_AT = 12;
+/** 피할 자리 판정용 글자 상자 반폭·반높이 (가장 긴 "백어택 x12!" 크기 정도, 넉넉히) / 비켜 설 때 여백 */
+const BOX_HALF_W = 130;
+const BOX_HALF_H = 32;
+const AVOID_GAP = 8;
 
 /**
  * 글자 스타일 하나를 같이 쓴다 — pixi 8의 글자 텍스처 캐시 키가 TextStyle 인스턴스라서, 그래야 미리 그린 글자(warmupTexts)와
@@ -51,6 +56,12 @@ export class ComboLabel extends Container {
   private tx = 0;
   private ty = 0;
   private clock = 0;
+  /** 피할 자리 (필드 좌표 사각형). 없으면 avoidOn false */
+  private avoidOn = false;
+  private ax0 = 0;
+  private ay0 = 0;
+  private ax1 = 0;
+  private ay1 = 0;
 
   constructor() {
     super();
@@ -85,6 +96,23 @@ export class ComboLabel extends Container {
     return this.best;
   }
 
+  /**
+   * 글자가 겹치면 안 되는 자리 (필드 좌표 사각형) — 보스전에서 보스 입 둘레(행동 예고 빛). 매 프레임 불러도 된다(할당 없음).
+   * 보스가 기어 내려오면 자리도 따라 바뀐다
+   */
+  setAvoid(x0: number, y0: number, x1: number, y1: number): void {
+    this.avoidOn = true;
+    this.ax0 = x0;
+    this.ay0 = y0;
+    this.ax1 = x1;
+    this.ay1 = y1;
+    if (this.combo > 0) this.ty = this.avoidY(this.tx, this.ty);
+  }
+
+  clearAvoid(): void {
+    this.avoidOn = false;
+  }
+
   /** 백어택 적중 1회 (필드 좌표) */
   hit(x: number, y: number): void {
     const fresh = this.combo === 0;
@@ -93,7 +121,7 @@ export class ComboLabel extends Container {
     this.sinceHit = 0;
     this.tx = clamp(x, EDGE_X, FIELD_W - EDGE_X);
     // 위쪽 끝 근처면 적중점 아래에 — 위로 밀어 넣으면 그 자리에서 올라오는 피해 숫자와 겹친다
-    this.ty = y - LIFT >= TOP_Y ? y - LIFT : y + LIFT_BELOW;
+    this.ty = this.avoidY(this.tx, y - LIFT >= TOP_Y ? y - LIFT : y + LIFT_BELOW);
     if (fresh) {
       this.position.set(this.tx, this.ty);
       this.sinceRefresh = Infinity;
@@ -156,6 +184,15 @@ export class ComboLabel extends Container {
     this.scale.set(grow * popS);
     this.rotation = Math.sin(this.pop * 30) * 0.12 * (1 - q) + (n >= HOT_AT ? Math.sin(this.clock * 9) * 0.03 : 0);
     this.alpha = alpha * (n >= LONG_AT ? 0.8 : 0.94);
+  }
+
+  /** 글자 상자가 피할 자리와 겹치면 그 위로 (위에 자리가 없으면 아래로) 비켜 선 y */
+  private avoidY(tx: number, ty: number): number {
+    if (!this.avoidOn) return ty;
+    const nearX = tx < this.ax0 ? this.ax0 - tx : tx > this.ax1 ? tx - this.ax1 : 0;
+    if (nearX >= BOX_HALF_W || ty + BOX_HALF_H <= this.ay0 || ty - BOX_HALF_H >= this.ay1) return ty;
+    const above = this.ay0 - BOX_HALF_H - AVOID_GAP;
+    return above >= TOP_Y ? above : this.ay1 + BOX_HALF_H + AVOID_GAP;
   }
 
   private show(n: number): void {

@@ -1,9 +1,17 @@
 // 툴팁에 보여줄 내용을 런 상태에서 계산한다 (그리기는 TooltipPanel). 수치는 전부 logic/stats에서 온다.
-import { ELEMENT_COLORS } from '../../config';
+import {
+  CELL,
+  ELEMENT_COLORS,
+  KILL_BURST_MAX,
+  RUBBER_BONUS_CAP,
+  SEED_SPLIT_COUNT,
+  SEED_SPLIT_DAMAGE_MAX,
+  UI_COLORS,
+} from '../../config';
 import { T } from '../../i18n/ko';
 import { addNewToBag, createBag, findByUid, mergesFor, neighbors } from '../../logic/bag';
 import { runPlayerStats } from '../../logic/run';
-import { computeWeapon, scaledGear, scaledStone, stoneBuffsFor } from '../../logic/stats';
+import { computeLoadout, computeWeapon, scaledGear, scaledStone, stoneBuffsFor } from '../../logic/stats';
 import type { Element, GameData, GearEffect, ItemDef, MergeOption, RunState, StoneEffect, Tier } from '../../types';
 
 /** 이 값 이상이면 관통 ∞ 표시 */
@@ -63,7 +71,7 @@ function floorEps(n: number): number {
   return Math.floor(n + FLOOR_EPS);
 }
 
-/** 강화석 효과 문장들 (★ 반영 후) */
+/** 강화석 효과 문장들 (★ 반영 후). 시너지 돌(탄성 고무 …)의 효과도 — docs/DESIGN.md '시너지 아이템' */
 export function stoneEffectChips(effect: StoneEffect): StatChip[] {
   const out: StatChip[] = [];
   if (effect.element) {
@@ -73,6 +81,21 @@ export function stoneEffectChips(effect: StoneEffect): StatChip[] {
   if (effect.cooldownMul) out.push({ label: T.bag.stoneCooldown(effect.cooldownMul), value: '', boosted: true });
   if (effect.projectileCountAdd) out.push({ label: T.bag.stoneCount(floorEps(effect.projectileCountAdd)), value: '', boosted: true });
   if (effect.pierceAdd) out.push({ label: T.bag.stonePierce(floorEps(effect.pierceAdd)), value: '', boosted: true });
+  // ── 시너지 돌 ──
+  if (effect.bounceDamage) out.push({ label: T.bag.stoneBounce(effect.bounceDamage, RUBBER_BONUS_CAP), value: '', boosted: true });
+  if (effect.backAttackBonus) out.push({ label: T.bag.stoneBackAttack(effect.backAttackBonus), value: '', boosted: true });
+  if (effect.seedSplit) {
+    out.push({ label: T.bag.stoneSeed(SEED_SPLIT_COUNT, Math.min(SEED_SPLIT_DAMAGE_MAX, effect.seedSplit)), value: '', boosted: true });
+  }
+  if (effect.chainTargetsAdd && floorEps(effect.chainTargetsAdd) > 0) {
+    out.push({ label: T.bag.stoneChainTargets(floorEps(effect.chainTargetsAdd)), value: '', boosted: true });
+  }
+  if (effect.chainDamageAdd) out.push({ label: T.bag.stoneChainDamage(effect.chainDamageAdd), value: '', boosted: true });
+  if (effect.chainHop) out.push({ label: T.bag.stoneChainHop, value: '', boosted: true });
+  if (effect.radiusMul) out.push({ label: T.bag.stoneRadius(effect.radiusMul), value: '', boosted: true });
+  if (effect.speedMul) out.push({ label: T.bag.stoneSpeed(effect.speedMul), value: '', boosted: effect.speedMul > 0 });
+  if (effect.burnSpread) out.push({ label: T.bag.stoneBurnSpread(fmtNum(effect.burnSpread / CELL)), value: '', color: ELEMENT_COLORS.fire });
+  if (effect.homingDeg) out.push({ label: T.bag.stoneHoming(effect.homingDeg), value: '', boosted: true });
   return out;
 }
 
@@ -89,6 +112,11 @@ export function gearEffectChips(effect: GearEffect): StatChip[] {
   if (effect.regenPerSec) out.push({ label: T.bag.gearRegen(effect.regenPerSec), value: '', boosted: true });
   if (effect.goldMul) out.push({ label: T.bag.gearGold(effect.goldMul), value: '', boosted: true });
   if (effect.damageMul) out.push({ label: T.bag.gearDamage(effect.damageMul), value: '', boosted: true });
+  // ── 시너지 장비 ──
+  if (effect.steamMul) out.push({ label: T.bag.gearSteam(effect.steamMul), value: '', boosted: true });
+  if (effect.killBurst) out.push({ label: T.bag.gearKillBurst(Math.min(KILL_BURST_MAX, effect.killBurst)), value: '', boosted: true });
+  if (effect.trampoline) out.push({ label: T.bag.gearTrampoline, value: '', boosted: true });
+  if (effect.backKillGold) out.push({ label: T.bag.gearBackKillGold(fmtNum(effect.backKillGold)), value: '', color: UI_COLORS.gold });
   return out;
 }
 
@@ -164,13 +192,18 @@ export function buildItemTooltip(
   }
 
   if (def.kind === 'weapon' && def.weapon) {
-    const w = inBag && target.uid !== null
-      ? computeWeapon(bag, data.items, target.uid, runPlayerStats(data, run))
-      : standaloneWeapon(data, run, def.id, target.tier);
-    const buffs = inBag && target.uid !== null ? stoneBuffsFor(bag, data.items, target.uid) : null;
+    // 가방 안 무기는 computeLoadout 기준 — 런 보너스 '한 발 더'(가장 빠른 무기 발사 수 +1)는 computeWeapon 하나로는 안 보인다
+    const uid = inBag ? target.uid : null;
+    const player = runPlayerStats(data, run);
+    const w =
+      uid !== null
+        ? (computeLoadout(bag, data.items, player).find((l) => l.uid === uid) ?? computeWeapon(bag, data.items, uid, player))
+        : standaloneWeapon(data, run, def.id, target.tier);
+    const buffs = uid !== null ? stoneBuffsFor(bag, data.items, uid) : null;
     if (w) {
       const dmg = fmtNum(w.damage) + (w.count > 1 ? ` ${T.bag.times(w.count)}` : '');
-      stats.push({ label: T.bag.statDamage, value: dmg, boosted: !!buffs && (buffs.damageMul > 0 || buffs.countAdd > 0) });
+      const moreShots = w.count > def.weapon.projectile.count;
+      stats.push({ label: T.bag.statDamage, value: dmg, boosted: (!!buffs && buffs.damageMul > 0) || moreShots });
       stats.push({ label: T.bag.statCooldown, value: T.bag.seconds(w.cooldown), boosted: !!buffs && buffs.cooldownMul < 0 });
       if (w.pierce > 0) {
         stats.push({
@@ -185,6 +218,8 @@ export function buildItemTooltip(
       for (const el of w.elements as Element[]) {
         stats.push({ label: T.common.element[el], value: '', color: ELEMENT_COLORS[el] });
       }
+      // 백어택 보너스 (맞닿은 뒤통수 망치 + 런 보너스 '뒤통수 전문가')
+      if (w.backAttackBonus) stats.push({ label: T.bag.statBackAttack, value: T.bag.backAttackValue(w.backAttackBonus), boosted: true });
     }
     if (buffs && buffs.sourceUids.length > 0) {
       const parts: string[] = [];

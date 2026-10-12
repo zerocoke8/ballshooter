@@ -1,6 +1,8 @@
 // 전투 씬: CombatSim(고정 스텝) 구동 + 렌더러들 + 입력 + 흐름(인트로 → 전투 → 클리어/패배) + 가방 오버레이.
 // 게임 규칙은 전부 sim/run 로직에 있고, 여기서는 이벤트를 연출로 옮기기만 한다.
 // 보스전(stage.boss): 보스 연출은 BossFx(자세·입 빛·위험 지역 예고), 페이즈 배너·번쩍임은 여기.
+// 재미 기능 연출: 백어택(sim 'hit'.back — 분홍 숫자·별 딱지·콤보), 행동하는 적(막음·치유·폭탄 연쇄·장갑·젤리·RC카),
+// 시너지(증기·폭죽·트램펄린·코일 두 번째 줄기·불 옮김·리본 꼬리), 액티브 스킬(SkillFx + 발동 연출), 레벨업 소리.
 // 보스 테스트 런(isBossTestRun): 보상·스테이지 클리어·저장 없이 끝나면 보스 결과 화면(game.toBossResult)으로.
 import {
   Container,
@@ -25,6 +27,7 @@ import {
   FIELD_X,
   HUD_H,
   SIM_DT,
+  SKILL_WEAPON_UID,
   TAP_SLOP,
   UI_COLORS,
 } from '../../config';
@@ -54,12 +57,19 @@ import {
   combatSeed,
   completeStage,
   currentStage,
+  grantKillXp,
+  grantXp,
   isBossTestRun,
+  pendingLevelUps,
   rewardKill,
   runCharacter,
+  runLevel,
   runLoadout,
   runPlayerStats,
+  runSkill,
+  runXp,
   saveRun,
+  xpToNext,
 } from '../../logic/run';
 import type {
   BossDef,
@@ -68,8 +78,10 @@ import type {
   CombatStatus,
   EnemyEntity,
   GameData,
+  LevelUpResult,
   LostReason,
   RunState,
+  SkillDef,
   StageDef,
   Tier,
   WeaponLoadout,
@@ -82,31 +94,46 @@ import { Banner, type BannerKind } from './Banner';
 import { BossBar } from './BossBar';
 import { BossFx } from './BossFx';
 import { ComboLabel } from './ComboLabel';
-import { Effects } from './Effects';
+import { Effects, NUM_ARMOR, NUM_BACK, NUM_NORMAL, type NumStyle } from './Effects';
 import { EnemyLayer, type HitInfo } from './EnemyLayer';
 import { FieldView } from './FieldView';
+import { FloatTags } from './FloatTags';
 import { Flyers } from './Flyers';
 import { FrameView } from './FrameView';
 import { ensureNumberFont, fxAtlas, fxTextures } from './fxTextures';
 import { Hud } from './Hud';
+import { LevelUpOverlay } from './LevelUpOverlay';
 import { PlayerView } from './PlayerView';
-import { ProjectileLayer } from './ProjectileLayer';
+import { PROJ_STYLE_HOMING, PROJ_STYLE_SKILL, ProjectileLayer } from './ProjectileLayer';
+import { SKILL_BUTTON_R, SkillButton } from './SkillButton';
+import { SkillFx } from './SkillFx';
 import { TutorialCallout } from './TutorialCallout';
 import { WeaponBar } from './WeaponBar';
+import { XpBar } from './XpBar';
 import {
   AIM_GUIDE_DEFAULT_RADIUS,
   AIM_TAP_BODY_RADIUS,
   AIM_TAP_MIN_DIST,
+  BLOCK_TAG_COOLDOWN,
+  BOMB_CHAIN_STAGGER,
   CELEBRATE_TIME,
+  COMBO_AVOID_DOWN,
+  COMBO_AVOID_HALF_W,
+  COMBO_AVOID_UP,
   DANGER_RANGE,
   DEFEAT_TIME,
   DEFENSE_RED,
   ENEMY_POP_TIME,
+  FREEZE_FLASH_ALPHA,
+  FREEZE_FLASH_COLOR,
+  FREEZE_FLASH_TIME,
+  FROST_WAVE_SPEED,
   HITSTOP_BOSS,
   HITSTOP_ELITE,
   HITSTOP_PLAYER,
   INTRO_TIME,
   KEY_MOVE_LEAD,
+  MAX_FLOAT_TAGS,
   MAX_STEPS_PER_FRAME,
   PHASE_BANNER_TIME,
   PHASE_BANNER_Y,
@@ -115,12 +142,20 @@ import {
   SUMMON_HOP_TIME,
   SHAKE_DECAY,
   SHAKE_MAX_PX,
+  SPRING_FLASH_ALPHA,
+  SPRING_FLASH_COLOR,
+  SPRING_FLASH_TIME,
+  STORM_FLASH_ALPHA,
+  STORM_FLASH_COLOR,
+  STORM_FLASH_TIME,
   TOP_PAD_MAX,
   TOP_PAD_RATIO,
   TRAIL_TAPER,
   TRAUMA_BOSS_ARRIVE,
   TRAUMA_BOSS_KILL,
   TRAUMA_DEFEAT,
+  TRAUMA_BOMB,
+  TRAUMA_BOMB_CHAIN,
   TRAUMA_BOSS_LAND,
   TRAUMA_ELITE_KILL,
   TRAUMA_EXPLODE_MAX,
@@ -128,7 +163,9 @@ import {
   TRAUMA_PER_EXPLODE_PX,
   TRAUMA_PLAYER_HIT,
   TRAUMA_ROAR,
+  TRAUMA_SKILL,
   TRAUMA_SLAM,
+  TRAUMA_STEAM,
   VIGNETTE_TIME,
   WALL_TOP_H,
 } from './visual';
@@ -171,6 +208,38 @@ const PREWARM_SHOT_VIEWS = 12;
 const BANNER_FIELD_Y = 0.36;
 /** 보스 테스트 승리: 보스 연쇄 폭발을 다 보고 결과로 (CELEBRATE_TIME에 더함) */
 const BOSS_TEST_CELEBRATE_EXTRA = 1.1;
+/** HUD 경험치 막대 자리 (HUD 좌표 — 골드 오른쪽, HP 막대 아래) */
+const XP_BAR_X = 118;
+const XP_BAR_Y = 55;
+/** 스킬 버튼: 하단 바 오른쪽 여백 / 무기 슬롯과의 간격 / 하단 바 위끝에서 버튼 가운데까지 (무기 슬롯 줄 가운데와 같은 높이) */
+const SKILL_SIDE = 26;
+const SKILL_GAP = 14;
+const SKILL_CENTER_Y = 22 + 52;
+/** 스킬 발동음 (종류별 — 연출은 'skill' 이벤트) */
+const SKILL_SFX: Readonly<Record<SkillDef['kind'], SfxId>> = { freeze: 'skill_ice', spring: 'skill_hotspring', storm: 'skill_hairstorm' };
+/**
+ * 레벨업 카드 넘기는 소리: 창이 열리고 이만큼 뒤 첫 장, 그다음 장마다 LevelUpOverlay의 카드 등장 간격(CARD_STAGGER 0.07초)으로.
+ * 고른 뒤 대기 레벨업이 남았으면 고른 카드 연출(LevelUpOverlay PICK_TIME 0.42초)이 끝나는 순간 다음 카드들이 들어온다
+ */
+const CARD_FLIP_START = 0.1;
+const CARD_FLIP_STAGGER = 0.07;
+const LEVEL_UP_NEXT_DEAL = 0.42;
+/** 이벤트 묶음 안에서 한 번만 연출할 것(치유병 고리·젤리 방울) / 코일 두 번째 줄기 판정용 연쇄 도착점 기록 칸 수 */
+const BATCH_IDS = 16;
+const BATCH_POINTS = 24;
+/** 레벨업 결과 알림: 화면 아래쪽(카드 밑, 하단 바 위)에 — 고르는 순간 바로 (전투가 멈춘 동안 글자를 굽는다). 한 번에 둘이면 이 간격(초)으로 */
+const LEVEL_UP_TOAST_BOTTOM = 120;
+const LEVEL_UP_TOAST_GAP = 0.3;
+/**
+ * 스테이지 끝 레벨업을 다 고른 뒤 클리어 화면까지 기다리는 시간(초) — 결과 알림('{이름} → 가방 (x, y)' 등)을 읽을 수 있게.
+ * 없으면 창이 사라지는 0.2초 뒤 바로 화면이 바뀌어 고르는 순간 뜬 알림이 0.6초 만에 잘렸다 (Toast는 약 1.6초)
+ */
+const LEVEL_UP_END_HOLD = 1.1;
+const LEVEL_UP_KEYS = [
+  ['Digit1', 'Numpad1'],
+  ['Digit2', 'Numpad2'],
+  ['Digit3', 'Numpad3'],
+] as const;
 
 export class CombatScene extends Scene {
   readonly sceneName = 'CombatScene';
@@ -208,6 +277,22 @@ export class CombatScene extends Scene {
   private readonly projectiles!: ProjectileLayer;
   private readonly fx!: Effects;
   private readonly combo!: ComboLabel;
+  /** 방패병 '막음!' 꼬리표 */
+  private readonly blockTags!: FloatTags;
+  /** 방패병 id → 마지막 '막음!' 시각(sim 초) — 같은 방패에 공이 몰려도 꼬리표는 BLOCK_TAG_COOLDOWN에 하나 */
+  private readonly blockTagAt = new Map<number, number>();
+  /** 액티브 스킬의 계속되는 연출 (온천 기운 원·폭풍 소용돌이). 스킬이 없으면 null */
+  private readonly skillFx: SkillFx | null = null;
+  /** 직전 프레임 sim.skill.ready (게이지가 가득 차는 순간 소리) */
+  private skillWasReady = false;
+  /** 이벤트 묶음 안 기록 (handleEvents 시작에 비움): 연출한 치유병·젤리 id, 연쇄 도착점(코일 두 번째 줄기), 폭탄 연쇄 순서 */
+  private readonly healSrc = new Int32Array(BATCH_IDS);
+  private healSrcN = 0;
+  private readonly splatSrc = new Int32Array(BATCH_IDS);
+  private splatSrcN = 0;
+  private readonly chainPts = new Float64Array(BATCH_POINTS * 2);
+  private chainPtN = 0;
+  private bombIdx = 0;
   private readonly player!: PlayerView;
   private readonly aimGuide!: AimGuide;
   /** 첫 스테이지 조작 안내 (첫 탭 조준 후 사라지면 null) */
@@ -219,9 +304,11 @@ export class CombatScene extends Scene {
   private readonly bossFx: BossFx | null = null;
   /** 보스 테스트 런: 보상·저장 없음, 끝나면 보스 결과 화면 */
   private readonly bossTest: boolean = false;
-  /** 페이즈 전환 화면 번쩍임 (배너 아래) */
+  /** 화면 번쩍임 (배너 아래): 페이즈 전환·보스 처치(흰색), 스킬 발동(종류 색) — screenFlash */
   private readonly flash = new Sprite(Texture.WHITE);
   private flashT = 0;
+  private flashDur = PHASE_FLASH_TIME;
+  private flashMax = PHASE_FLASH_ALPHA;
   /** 같은 묶음의 소환 연기는 한 번만 (sfx 시계 기준 마지막 연기 시각) */
   private lastSummonPuff = -Infinity;
 
@@ -252,6 +339,14 @@ export class CombatScene extends Scene {
   private learnedMove = false;
   private overlay: BagOverlay | null = null;
   private pendingClose = false;
+  /** 레벨업 3지선다 창 (열려 있으면 전투 정지). 대기 레벨업이 생기면 다음 프레임에 연다 (maybeOpenLevelUp) */
+  private levelUp: LevelUpOverlay | null = null;
+  /** 레벨업 창이 닫히면 할 일 (스테이지 끝에 남은 레벨업 → 클리어 화면으로) */
+  private levelUpDone: (() => void) | null = null;
+  private readonly xpBar: XpBar | null = null;
+  private xpDirty = true;
+  /** 액티브 스킬 버튼 (캐릭터 스킬이 없으면 null) */
+  private readonly skillBtn: SkillButton | null = null;
   private readonly timers: Timer[] = [];
   private ended = false;
   private leaving = false;
@@ -321,6 +416,7 @@ export class CombatScene extends Scene {
     this.stage = stage;
     this.bossTest = isBossTestRun(run);
     this.bossDef = stage.boss ? (data.bosses[stage.boss] ?? null) : null;
+    const skill = runSkill(data, run);
     this.sim = new CombatSim({
       stage,
       stageIndex: run.stageIndex,
@@ -330,6 +426,7 @@ export class CombatScene extends Scene {
       player: runPlayerStats(data, run),
       hp: run.hp,
       seed: combatSeed(run),
+      skill,
     });
 
     const atlas = fxAtlas(renderer, TRAIL_TAPER);
@@ -337,8 +434,9 @@ export class CombatScene extends Scene {
     // 피해 → 이펙트 크기 환산: 스테이지 HP 배수만큼 커지는 숫자를 같은 느낌의 크기로
     this.fx = new Effects(atlas, combatSeed(run) ^ 0x9e37, this.field.fxLayer, this.field.topLayer, 1 / Math.max(1, stage.hpMul));
     this.combo = new ComboLabel();
-    this.field.topLayer.addChild(this.combo);
-    this.enemies = new EnemyLayer(data.enemies, renderer, this.fx);
+    this.blockTags = new FloatTags(T.combat.blocked, BLOCK_TAG_KEY, BLOCK_TAG_FONT, BLOCK_TAG_COLOR, MAX_FLOAT_TAGS, BLOCK_TAG_DRIFT);
+    this.field.topLayer.addChild(this.blockTags, this.combo);
+    this.enemies = new EnemyLayer(data.enemies, renderer, this.fx, fx.iceBlock);
     this.field.enemyLayer.addChild(this.enemies);
     if (this.bossDef) {
       this.bossFx = new BossFx(renderer, fx, this.fx, this.enemies, this.field.hazardLayer, this.field.hazardTopLayer);
@@ -357,6 +455,11 @@ export class CombatScene extends Scene {
     this.aimGuide = new AimGuide(fx);
     this.guideRadius = guideRadius(loadout);
     this.playerLayer.addChild(this.aimGuide, this.player);
+    // 스킬의 계속되는 연출(온천 기운 원·폭풍 소용돌이)은 캐릭터·조준 가이드 아래
+    if (skill) {
+      this.skillFx = new SkillFx(skill, fx, this.fx);
+      this.playerLayer.addChildAt(this.skillFx, 0);
+    }
     if (run.stageIndex === 0 && !this.bossTest) {
       this.tutorial = new TutorialCallout(T.combat.aimTutorial);
       this.playerLayer.addChild(this.tutorial);
@@ -384,6 +487,20 @@ export class CombatScene extends Scene {
     this.hud.setGold(run.gold);
     this.hud.setHp(this.sim.player.hp, this.sim.player.maxHp);
     this.hud.setProgress(0);
+    // 레벨·경험치 막대 (HUD 안, 골드 오른쪽)
+    this.xpBar = new XpBar(fx.soft);
+    this.xpBar.position.set(XP_BAR_X, XP_BAR_Y);
+    this.hud.addChild(this.xpBar);
+    this.refreshXp();
+    // 액티브 스킬 버튼 (하단 바 오른쪽 — 제자리 탭 또는 Space). 하단 바는 이동 드래그 패드라 버튼에서 시작한 드래그는 이동이다
+    if (skill) {
+      const btn = new SkillButton(skill, fx.soft);
+      btn.on('pointerdown', this.onSkillDown);
+      btn.on('pointerup', this.onSkillUp);
+      btn.on('pointerupoutside', this.onSkillUp);
+      btn.on('pointercancel', this.onPointerAbort);
+      this.skillBtn = btn;
+    }
     this.flyers = new Flyers({
       onCoinArrive: () => {
         // 표시 골드는 매 프레임 (run.gold - 날아가는 중) 으로 맞춘다. 소리만: 연달아 도착하면 음이 오른다
@@ -398,6 +515,7 @@ export class CombatScene extends Scene {
     });
     this.weaponBar.rebuild(loadout, data.items);
     this.rebuildFireSfx(loadout);
+    this.rebuildProjStyles(loadout);
     this.heavyHit = HEAVY_HIT_DAMAGE * Math.max(1, stage.hpMul);
 
     this.vignette.eventMode = 'none';
@@ -413,6 +531,7 @@ export class CombatScene extends Scene {
       this.fieldUi,
       this.playerLayer,
       this.weaponBar,
+      ...(this.skillBtn ? [this.skillBtn] : []),
       this.overlayLayer,
       this.hud,
       this.flyers,
@@ -445,6 +564,7 @@ export class CombatScene extends Scene {
     warm('defeat', T.combat.defeat, T.combat.knockedOut);
     warm('defeat', T.combat.defeat, T.combat.crushed);
     this.warmQueue.push(() => ComboLabel.warmupTexts());
+    this.warmQueue.push(() => [FloatTags.warmupText(T.combat.blocked, BLOCK_TAG_KEY, BLOCK_TAG_FONT, BLOCK_TAG_COLOR)]);
     // 적 덮개 실루엣(피격 번쩍임·냉기)도 인트로 동안 한 프레임에 하나씩 미리 굽는다 (처음 보이는 적 종류에서 끊기지 않게)
     const keys = new Set<string>();
     // 투사체·분열 자식·적 탄 그림 (아래에서 GPU에 미리 올린다)
@@ -502,6 +622,7 @@ export class CombatScene extends Scene {
     this.warmQueue.push(() => {
       this.fx.prewarm();
       if (this.bossDef) this.fx.prewarmBoss();
+      if (skill) this.fx.prewarmSkill(skill.kind);
       return [];
     });
   }
@@ -518,6 +639,11 @@ export class CombatScene extends Scene {
     document.addEventListener('visibilitychange', this.onVisibility);
     const kb = (this.keyboard = new Keyboard());
     for (const code of ['KeyB', 'Escape', 'Tab']) kb.onPress(code, () => this.toggleBag());
+    // 액티브 스킬 (버튼과 같은 경로) / 레벨업 카드 1·2·3
+    kb.onPress('Space', () => this.tryActivateSkill());
+    LEVEL_UP_KEYS.forEach((codes, i) => {
+      for (const code of codes) kb.onPress(code, () => void this.levelUp?.pick(i));
+    });
     if (this.bossTest) {
       // 보스 테스트: 인트로부터 보스 배너 (보스는 인트로가 끝나면 위에서 내려온다)
       this.bossAnnouncedIntro = true;
@@ -544,6 +670,8 @@ export class CombatScene extends Scene {
     this.timers.length = 0;
     this.warmQueue.length = 0;
     this.overlay = null;
+    this.levelUp = null;
+    this.levelUpDone = null;
     this.bossFx?.destroy();
   }
 
@@ -576,6 +704,12 @@ export class CombatScene extends Scene {
     this.fieldUi.position.set(FIELD_X, this.fieldY);
     this.frame.layout(this.fieldY, vp.height);
     this.weaponBar.position.set(0, barY);
+    if (this.skillBtn) {
+      // 스킬 버튼: 하단 바 오른쪽, 무기 슬롯 줄 가운데 높이 — 무기 슬롯은 남은 폭 가운데로
+      this.weaponBar.setRightInset(SKILL_SIDE + SKILL_BUTTON_R * 2 + SKILL_GAP);
+      this.skillBtn.position.set(DESIGN_W - SKILL_SIDE - SKILL_BUTTON_R, barY + SKILL_CENTER_Y);
+      this.skillBtn.setLabelVisible(barH >= SKILL_CENTER_Y + SKILL_BUTTON_R + this.skillBtn.labelHeight + 6);
+    }
     this.weaponBar.setHeight(barH);
     this.hud.position.set(0, this.hudY);
     this.hud.setTopExtend(this.hudY);
@@ -585,6 +719,7 @@ export class CombatScene extends Scene {
     this.flash.width = vp.width;
     this.flash.height = vp.height;
     this.overlay?.layout(vp, this.fieldY);
+    this.levelUp?.layout(vp, this.fieldY);
   }
 
   override update(dt: number): void {
@@ -602,8 +737,12 @@ export class CombatScene extends Scene {
     if (this.pendingClose) this.closeBagNow();
     this.stepWarmup();
     this.runTimers(dt);
+    this.maybeOpenLevelUp();
 
-    if (!this.overlay) {
+    if (this.levelUp) {
+      // 레벨업 고르는 중: 전투·필드 연출 정지 (가방 오버레이와 같다)
+      this.levelUp.update(dt);
+    } else if (!this.overlay) {
       if (this.hitStop > 0) {
         // 히트스톱: 시뮬레이션과 필드 연출을 잠깐 멈춘다 (흔들림은 계속 — 멈춘 장면이 떨린다)
         this.hitStop = Math.max(0, this.hitStop - dt);
@@ -623,6 +762,13 @@ export class CombatScene extends Scene {
 
     this.hud.setGold(Math.max(0, this.run.gold - this.flyers.pendingGold()));
     this.hud.update(dt);
+    if (this.xpDirty) this.refreshXp();
+    this.xpBar?.update(dt);
+    this.skillBtn?.sync(this.sim.skill, this.skillUsable(), dt);
+    // 게이지가 가득 차는 순간 '반짝' (버튼은 SkillButton이 톡 튄다)
+    const skillReady = this.sim.skill?.ready === true;
+    if (skillReady && !this.skillWasReady && !this.ended) sfx.play('skill_ready');
+    this.skillWasReady = skillReady;
     this.flyers.update(dt);
     this.banner.update(dt);
     this.updateVignette(dt);
@@ -634,6 +780,8 @@ export class CombatScene extends Scene {
   debugWin(): void {
     if (!this.ready || this.ended) return;
     this.closeBagNow();
+    // 고르던 레벨업은 고르지 않은 채로 (런에 남아 스테이지 끝에 다시 뜬다)
+    this.closeLevelUp();
     this.phase = 'fight';
     this.sim.debugKillAll();
     this.handleEvents(this.sim.drainEvents());
@@ -642,6 +790,7 @@ export class CombatScene extends Scene {
   debugLose(): void {
     if (!this.ready || this.ended) return;
     this.closeBagNow();
+    this.closeLevelUp();
     this.phase = 'fight';
     this.sim.debugLose();
     this.handleEvents(this.sim.drainEvents());
@@ -651,6 +800,25 @@ export class CombatScene extends Scene {
   setSpeed(mul: number): void {
     if (!Number.isFinite(mul) || mul <= 0) return;
     this.speed = Math.min(MAX_SPEED_MUL, mul);
+  }
+
+  /** 디버그(측정 도구): 스킬 게이지를 frac(0..1)만큼 채운다 — 스킬 버튼·Space 검사용 (sim.debugFillSkill). 스킬이 없으면 false */
+  debugFillSkill(frac = 1): boolean {
+    if (!this.ready) return false;
+    return this.sim.debugFillSkill(frac);
+  }
+
+  /** 디버그(측정 도구): 경험치 n — 레벨이 오르면 실제 처치와 같은 경로로 레벨업 창이 뜬다. 오른 레벨 수 */
+  debugGrantXp(n: number): number {
+    if (!this.ready) return 0;
+    const gained = grantXp(this.run, n);
+    this.xpDirty = true;
+    return gained;
+  }
+
+  /** 디버그(측정 도구): 열린 레벨업 창의 i번째 카드 고르기 (탭·키 1/2/3과 같은 경로). 못 고르면 false */
+  debugPickLevelUp(index: number): boolean {
+    return this.levelUp?.pick(index) ?? false;
   }
 
   /** 테스트 도구용 읽기 전용 스냅샷 (smoke.mjs · interaction-check.mjs). 런이 없으면 null */
@@ -720,6 +888,10 @@ export class CombatScene extends Scene {
     bossDamage: number;
     backAttacks: number;
     minionKills: number;
+    /** 레벨업: 런 레벨·경험치·고르지 않은 수, 창이 열렸나·카드를 받나·카드 수 */
+    levelUp: { level: number; xp: number; need: number; pending: number; open: boolean; armed: boolean; choices: number };
+    /** 액티브 스킬 (sim.skill 복사 + 버튼을 지금 누를 수 있나). 스킬이 없으면 null */
+    skill: { id: string; kind: string; charge: number; ready: boolean; active: number; uses: number; usable: boolean } | null;
   } | null {
     if (!this.ready) return null;
     const sim = this.sim;
@@ -781,6 +953,26 @@ export class CombatScene extends Scene {
       bossDamage: this.bossDamage,
       backAttacks: this.bossTopHits,
       minionKills: this.minionKills,
+      levelUp: {
+        level: runLevel(this.run),
+        xp: runXp(this.run),
+        need: xpToNext(runLevel(this.run)),
+        pending: pendingLevelUps(this.run),
+        open: this.levelUp !== null,
+        armed: this.levelUp?.armed ?? false,
+        choices: this.levelUp?.choiceCount ?? 0,
+      },
+      skill: sim.skill
+        ? {
+            id: sim.skill.id,
+            kind: sim.skill.kind,
+            charge: sim.skill.charge,
+            ready: sim.skill.ready,
+            active: sim.skill.active,
+            uses: sim.skill.uses,
+            usable: this.skillUsable(),
+          }
+        : null,
     };
   }
 
@@ -805,6 +997,11 @@ export class CombatScene extends Scene {
       this.handleEvents(sim.drainEvents());
       this.acc -= SIM_DT;
       n++;
+      // 레벨이 올랐다: 여기서 멈추고 다음 프레임에 레벨업 창 (그 사이 전투가 더 흐르지 않게)
+      if (this.levelUpWanted()) {
+        this.acc = 0;
+        break;
+      }
     }
     // 밀린 시간은 버린다 (느린 기기에서 따라잡으려다 더 느려지지 않게)
     if (n >= maxSteps || sim.status !== 'running') this.acc = 0;
@@ -817,6 +1014,10 @@ export class CombatScene extends Scene {
     const blast = this.blast;
     blast.active = false;
     blast.chainX = NaN;
+    this.healSrcN = 0;
+    this.splatSrcN = 0;
+    this.chainPtN = 0;
+    this.bombIdx = 0;
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
       switch (ev.type) {
@@ -832,28 +1033,22 @@ export class CombatScene extends Scene {
           const boss = this.boss;
           if (boss && ev.enemyId === boss.id) {
             this.bossDamage += ev.damage;
-            // 보스 윗면 직접 적중 = 적중점이 충돌 박스 위끝 (공 중심이 보스보다 위 — 양옆 통로로 넘어간 공)
-            if (Math.abs(ev.y - boss.y) < 0.01) this.bossTopHits++;
+            // 보스 윗면 직접 적중 (양옆 통로로 넘어간 공의 백어택) — sim이 'hit'에 back을 단다
+            if (ev.back) this.bossTopHits++;
           }
+          // 틈 쏘기 통계 (debugState — tools/gap-playtest.mjs): 맨 앞 웨이브 뒤쪽 적중 / 윗변 적중 (콤보와는 따로)
           if (front === undefined) front = frontWave(this.sim.enemies);
-          let behind = false;
           if (front) {
-            if (ev.y <= front.top + ENEMY_INSET + 0.5) {
-              this.behindHits++;
-              behind = true;
-            }
+            if (ev.y <= front.top + ENEMY_INSET + 0.5) this.behindHits++;
             // 적중점 = 공 중심을 적 사각형에 clamp → 공이 적보다 위였으면 정확히 그 적의 윗변(모든 적이 같은 칸 격자)
             const d = (((ev.y - front.grid) % CELL) + CELL) % CELL;
-            if (d < 0.01 || d > CELL - 0.01) {
-              this.topHits++;
-              behind = true;
-            }
+            if (d < 0.01 || d > CELL - 0.01) this.topHits++;
           }
-          const direct = this.hitFx(ev);
-          // 백어택: 공이 웨이브 뒤·위에서 직접 때림 (화상·폭발·연쇄 제외).
-          // 보스는 제외 — 보스 옆으로 넘어간 공이 천장과 보스 윗면 사이를 수명 내내 오가며 '백어택'가 끊기지 않아
-          // 보스전 내내 "백어택 x200!" 글자가 보스 머리를 덮고 있었다 (틈을 노리는 재미와도 무관)
-          if (direct && behind && !this.ended && ev.enemyId !== this.boss?.id) {
+          this.hitFx(ev);
+          // 백어택 콤보: sim이 백어택이라고 한 적중만 (윗면 직접 적중 — 화상·폭발·연쇄는 back이 없다).
+          // 보스는 제외 — 보스 옆으로 넘어간 공이 천장과 보스 윗면 사이를 수명 내내 오가며 백어택이 끊기지 않아
+          // 보스전 내내 "백어택 x200!" 글자가 보스 머리를 덮고 있었다 (보스 백어택 수는 bossTopHits로 따로 센다)
+          if (ev.back && !this.ended && ev.enemyId !== this.boss?.id) {
             this.combo.hit(ev.x, ev.y);
             // 콤보가 이어질수록 반음씩 올라간다 (상한)
             sfx.playAt('combo', panAt(ev.x), COMBO_PITCH_STEP ** Math.min(COMBO_PITCH_MAX, this.combo.current - 1));
@@ -864,20 +1059,84 @@ export class CombatScene extends Scene {
           this.onKill(ev);
           break;
         case 'explode':
-          sfx.playAt('explode', panAt(ev.x));
-          this.fx.explosion(ev.x, ev.y, ev.radius, ev.element);
-          this.addTrauma(Math.min(TRAUMA_EXPLODE_MAX, ev.radius * TRAUMA_PER_EXPLODE_PX));
+          this.onExplode(ev);
           blast.active = true;
           blast.x = ev.x;
           blast.y = ev.y;
           break;
-        case 'chain':
-          sfx.playAt('elem_zap', panAt(ev.toX));
-          this.fx.chain(ev.fromX, ev.fromY, ev.toX, ev.toY);
+        case 'chain': {
+          // 번개 코일의 두 번째 줄기: 이번 묶음에서 앞선 연쇄가 닿은 자리(첫 줄기 대상)에서 다시 튄다
+          const pts = this.chainPts;
+          let hop = false;
+          for (let k = 0; k < this.chainPtN; k += 2) {
+            if (pts[k] === ev.fromX && pts[k + 1] === ev.fromY) {
+              hop = true;
+              break;
+            }
+          }
+          if (hop) {
+            sfx.playAt('elem_zap', panAt(ev.toX), 1.25, 0.6);
+            this.fx.chainHop(ev.fromX, ev.fromY, ev.toX, ev.toY);
+          } else {
+            sfx.playAt('elem_zap', panAt(ev.toX));
+            this.fx.chain(ev.fromX, ev.fromY, ev.toX, ev.toY);
+            if (this.chainPtN < pts.length) {
+              pts[this.chainPtN++] = ev.toX;
+              pts[this.chainPtN++] = ev.toY;
+            }
+          }
           blast.chainX = ev.toX;
           blast.chainY = ev.toY;
           blast.chainFromX = ev.fromX;
           blast.chainFromY = ev.fromY;
+          break;
+        }
+        case 'blocked':
+          this.onBlocked(ev);
+          blast.active = false;
+          break;
+        case 'heal':
+          this.onHeal(ev);
+          blast.active = false;
+          break;
+        case 'enemySpawn':
+          // 젤리 → 꼬마 젤리: 부모 자리에서 칸으로 톡 튀어나온다 (sim의 착지 유예 SUMMON_LAND_TIME과 같은 시간). 처치 묶음 안이라 blast는 그대로
+          this.enemies.hop(ev.enemyId, ev.fromX, ev.fromY, SUMMON_HOP_TIME);
+          if (this.batchOnce(this.splatSrc, this.splatSrcN, ev.parentId)) {
+            if (this.splatSrcN < BATCH_IDS) this.splatSrc[this.splatSrcN++] = ev.parentId;
+            this.fx.jellySplat(ev.fromX, ev.fromY);
+            // 젤리 '철퍽' (생선 철썩을 높게)
+            sfx.playAt('fire_fish', panAt(ev.fromX), 1.4, 0.75);
+          }
+          break;
+        case 'shift':
+          // RC카 출발 '부웅' (양말 휙을 낮게) — 미끄러지는 동안의 기울기·먼지는 EnemyLayer
+          sfx.playAt('fire_sock', panAt(ev.fromX), 0.72, 0.45);
+          blast.active = false;
+          break;
+        case 'burnSpread':
+          // 전염 성냥: 불이 옆 적으로 옮겨붙음 (처치 묶음 안 — blast 그대로)
+          this.fx.burnSpread(ev.fromX, ev.fromY, ev.x, ev.y);
+          sfx.playAt('elem_fire', panAt(ev.x), 1.2, 0.55);
+          break;
+        case 'skill':
+          this.onSkillCast(ev);
+          blast.active = false;
+          break;
+        case 'freeze': {
+          // 서리 파도가 닿는 순간 얼어붙는다 (플레이어에서 멀수록 늦게) — 얼음 상자·덮개는 EnemyLayer가 EnemyEntity.frozen으로
+          const pl = this.sim.player;
+          const d = Math.hypot(ev.x - pl.x, ev.y - pl.y);
+          const size = this.enemies.hitInfo(ev.enemyId, ev.x, ev.y, this.hitTmp)?.size ?? CELL;
+          this.fx.freezeHit(ev.x, ev.y, size, d / FROST_WAVE_SPEED, ev.resisted);
+          blast.active = false;
+          break;
+        }
+        case 'shotBlocked':
+          // 온천 기운이 적 탄을 녹임 '치익'
+          this.fx.dissolve(ev.x, ev.y);
+          sfx.playAt('elem_fire', panAt(ev.x), 1.6, 0.35);
+          blast.active = false;
           break;
         case 'split':
           sfx.playAt('split', panAt(ev.x));
@@ -937,6 +1196,10 @@ export class CombatScene extends Scene {
           if (ev.wall) {
             this.fx.wallBounce(ev.x, ev.y, FIELD_W);
             sfx.playAt('bounce_wall', panAt(ev.x));
+          } else if (ev.floor) {
+            // 트램펄린: 바닥에서 '통!' (스프링 소리를 높고 작게)
+            this.fx.trampoline(ev.x, FIELD_H);
+            sfx.playAt('enemy_shoot_spring', panAt(ev.x), 1.25, 0.5);
           }
           blast.active = false;
           break;
@@ -950,9 +1213,11 @@ export class CombatScene extends Scene {
    * 직접 타격이면 true.
    */
   private hitFx(ev: Extract<CombatEvent, { type: 'hit' }>): boolean {
+    // 숫자 모양: 백어택(진분홍·크게·별) / 장갑에 줄어든 적중(회색·작게) / 보통
+    const style: NumStyle = ev.back ? NUM_BACK : ev.armor ? NUM_ARMOR : NUM_NORMAL;
     const info = this.enemies.hitInfo(ev.enemyId, ev.x, ev.y, this.hitTmp);
     if (!info) {
-      this.fx.damageNumber(ev.enemyId, ev.x, ev.y, ev.damage, ev.element);
+      this.fx.damageNumber(ev.enemyId, ev.x, ev.y, ev.damage, ev.element, false, style);
       return false;
     }
     const blast = this.blast;
@@ -967,10 +1232,14 @@ export class CombatScene extends Scene {
       const pan = panAt(ev.x);
       sfx.playAt(ev.damage >= this.heavyHit ? 'hit_heavy' : 'hit_toy', pan);
       if (ev.element) sfx.playAt(ELEMENT_HIT_SFX[ev.element], pan);
-      this.fx.damageNumber(ev.enemyId, ev.x, ev.y, ev.damage, ev.element);
+      // 장갑병: 쇠 '깡' (톱니 대포 대신 볼트 철컥을 높게) + 회색 작은 숫자 + 쇳빛 불꽃
+      if (ev.armor) sfx.playAt('enemy_shoot_bolt', pan, 1.25, 0.7);
+      this.fx.damageNumber(ev.enemyId, ev.x, ev.y, ev.damage, ev.element, false, style);
       // 맞은 면의 바깥 법선 = 공이 온 쪽 → 적은 반대로 밀리고, 반짝이는 공 쪽으로 튄다
-      this.enemies.onHit(ev.enemyId, -info.nx, -info.ny, 1);
+      this.enemies.onHit(ev.enemyId, -info.nx, -info.ny, ev.armor ? 0.45 : 1);
       this.fx.impact(ev.x, ev.y, ev.damage, ev.element, info.nx, info.ny);
+      if (ev.back) this.fx.backSpark(ev.x, ev.y);
+      if (ev.armor) this.fx.armorSpark(ev.x, ev.y, info.nx, info.ny);
       return true;
     }
     if (blast.active) {
@@ -985,12 +1254,121 @@ export class CombatScene extends Scene {
       this.fx.burnTick(ev.x, ev.y);
       return false;
     }
-    // 가장자리가 아닌 적중 (관통 중 등): 작게
+    // 가장자리가 아닌 적중 (관통 중 등): 작게 — 관통하며 윗면을 친 백어택도 있다
     sfx.playAt('hit_toy', panAt(ev.x), 1.1, 0.6);
-    this.fx.damageNumber(ev.enemyId, ev.x, ev.y, ev.damage, ev.element);
+    this.fx.damageNumber(ev.enemyId, ev.x, ev.y, ev.damage, ev.element, false, style);
     this.enemies.onHit(ev.enemyId, 0, -1, 0.5);
     this.fx.splashHit(ev.x, ev.y, ev.damage);
+    if (ev.back) this.fx.backSpark(ev.x, ev.y);
     return false;
+  }
+
+  /**
+   * 'explode' 종류별 연출: 증기 주전자(하얀 김) / 폭죽 심지(작은 알록달록 팡 — 처치마다라 흔들림 없이) /
+   * 폭탄병(큰 폭발 — 같은 묶음의 연쇄는 BOMB_CHAIN_STAGGER씩 늦게 '펑-펑-펑') / 투사체 폭발(예전 그대로)
+   */
+  private onExplode(ev: Extract<CombatEvent, { type: 'explode' }>): void {
+    const pan = panAt(ev.x);
+    if (ev.cause === 'steam') {
+      this.fx.steam(ev.x, ev.y, ev.radius);
+      sfx.playAt('elem_fire', pan, 0.8);
+      this.addTrauma(TRAUMA_STEAM);
+      return;
+    }
+    if (ev.cause === 'firecracker') {
+      this.fx.firecracker(ev.x, ev.y, ev.radius);
+      sfx.playAt('explode', pan, 1.6, 0.45);
+      return;
+    }
+    if (ev.fromEnemy !== undefined) {
+      const k = this.bombIdx++;
+      const delay = k * BOMB_CHAIN_STAGGER;
+      this.fx.bombBlast(ev.x, ev.y, ev.radius, delay);
+      this.addTrauma(k === 0 ? TRAUMA_BOMB : TRAUMA_BOMB_CHAIN);
+      // 연쇄는 소리도 차례로 (조금씩 높게). 폭탄 연쇄는 드물어 타이머(클로저) 몇 개는 괜찮다
+      const rate = 0.85 + 0.05 * Math.min(6, k);
+      if (k === 0) sfx.playAt('explode', pan, rate);
+      else this.after(delay, () => sfx.playAt('explode', pan, rate));
+      return;
+    }
+    sfx.playAt('explode', pan);
+    this.fx.explosion(ev.x, ev.y, ev.radius, ev.element);
+    this.addTrauma(Math.min(TRAUMA_EXPLODE_MAX, ev.radius * TRAUMA_PER_EXPLODE_PX));
+  }
+
+  /** 방패병 정면이 공을 막음: 쇳빛 불꽃 + 방패가 살짝 밀림 + '깡' + '막음!' (같은 방패는 BLOCK_TAG_COOLDOWN에 한 번) */
+  private onBlocked(ev: Extract<CombatEvent, { type: 'blocked' }>): void {
+    this.fx.blockSpark(ev.x, ev.y);
+    this.enemies.onHit(ev.enemyId, 0, -1, 0.35);
+    sfx.playAt('shield_block', panAt(ev.x));
+    const now = this.sim.time;
+    const last = this.blockTagAt.get(ev.enemyId);
+    if (last === undefined || now - last >= BLOCK_TAG_COOLDOWN) {
+      this.blockTagAt.set(ev.enemyId, now);
+      this.blockTags.show(ev.x, ev.y + BLOCK_TAG_DY);
+    }
+  }
+
+  /** 치유병이 회복: 치유병 둘레 초록 고리(묶음에 한 번 — 소리도) + 대상마다 날아가는 빛방울·더하기·'+N'·연두 번쩍임 */
+  private onHeal(ev: Extract<CombatEvent, { type: 'heal' }>): void {
+    if (this.batchOnce(this.healSrc, this.healSrcN, ev.sourceId)) {
+      if (this.healSrcN < BATCH_IDS) this.healSrc[this.healSrcN++] = ev.sourceId;
+      this.fx.healPulse(ev.fromX, ev.fromY, this.healRadius(ev.sourceId));
+      sfx.playAt('heal_pulse', panAt(ev.fromX));
+    }
+    this.fx.healTarget(ev.x, ev.y, ev.fromX, ev.fromY);
+    this.fx.healNumber(ev.x, ev.y, ev.amount);
+    this.enemies.onHeal(ev.enemyId);
+  }
+
+  /** 치유병의 회복 반경 (EnemyDef.heal.radius — 고리 크기). 모르면 한 칸 반 */
+  private healRadius(enemyId: number): number {
+    const list = this.sim.enemies;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].id !== enemyId) continue;
+      return this.data.enemies[list[i].defId]?.heal?.radius ?? CELL * 1.5;
+    }
+    return CELL * 1.5;
+  }
+
+  /** 이번 묶음에서 처음 보는 id인가 (arr[0..n)) */
+  private batchOnce(arr: Int32Array, n: number, id: number): boolean {
+    for (let i = 0; i < n; i++) if (arr[i] === id) return false;
+    return true;
+  }
+
+  /**
+   * 'skill' 발동 연출 (소리는 tryActivateSkill의 SKILL_SFX): 화면 번쩍임(종류 색) + 흔들림 +
+   * 빙하기 = 서리 파도(뒤따르는 'freeze'들이 파도가 닿는 순간 얼어붙음) / 온천 = 따뜻한 고리·김·'+N'(기운 원은 SkillFx) /
+   * 폭풍 = 휘몰아치는 털 구름(소용돌이는 SkillFx, 털뭉치는 'fire' weaponUid -1)
+   */
+  private onSkillCast(ev: Extract<CombatEvent, { type: 'skill' }>): void {
+    this.addTrauma(TRAUMA_SKILL);
+    switch (ev.kind) {
+      case 'freeze':
+        this.screenFlash(FREEZE_FLASH_COLOR, FREEZE_FLASH_ALPHA, FREEZE_FLASH_TIME);
+        this.fx.frostWave(ev.x, ev.y - 20);
+        break;
+      case 'spring': {
+        this.screenFlash(SPRING_FLASH_COLOR, SPRING_FLASH_ALPHA, SPRING_FLASH_TIME);
+        const def = this.skillBtn?.def;
+        this.fx.springBurst(ev.x, ev.y, def && def.kind === 'spring' ? def.spring.radius : CELL * 1.6);
+        if (ev.heal && ev.heal > 0) this.fx.healNumber(ev.x, ev.y - 30, ev.heal, 1.25);
+        break;
+      }
+      case 'storm':
+        this.screenFlash(STORM_FLASH_COLOR, STORM_FLASH_ALPHA, STORM_FLASH_TIME);
+        this.fx.stormBurst(ev.x, ev.y - 12);
+        break;
+    }
+  }
+
+  /** 화면 번쩍임 (배너 아래, 전체): color로 time초 동안 alpha에서 0으로 */
+  private screenFlash(color: number, alpha: number, time: number): void {
+    this.flash.tint = color;
+    this.flashT = time;
+    this.flashDur = time;
+    this.flashMax = alpha;
   }
 
   /** (dx, dy) 쪽으로 밀기 (정규화, 0이면 위로) */
@@ -1041,15 +1419,20 @@ export class CombatScene extends Scene {
     if (ev.boss) {
       this.bossBar?.hide();
       this.bossFx?.onBossDead();
-      if (this.bossDef) this.flashT = PHASE_FLASH_TIME;
+      if (this.bossDef) this.screenFlash(0xffffff, PHASE_FLASH_ALPHA, PHASE_FLASH_TIME);
     } else if (this.bossDef) this.minionKills++;
+
+    // 경험치 (보스 테스트도 — 졸개로 오른다). sim은 적마다 'kill'을 정확히 한 번 낸다 (연쇄 처치도 중복 없음)
+    grantKillXp(this.data, this.run, ev.defId);
+    this.xpDirty = true;
 
     // 보스 테스트: 골드·드롭 없음 (런은 저장도 안 하고 버린다)
     if (this.bossTest) {
       this.kills++;
       return;
     }
-    const reward = rewardKill(this.data, this.run, ev.defId);
+    // 뒤통수 동전: 백어택으로 처치하면 골드 + (rewardKill의 back)
+    const reward = rewardKill(this.data, this.run, ev.defId, ev.back === true);
     this.kills++;
     this.goldEarned += reward.gold;
     const sx = FIELD_X + x;
@@ -1089,7 +1472,20 @@ export class CombatScene extends Scene {
     const celebrate = CELEBRATE_TIME + (this.bossTest ? BOSS_TEST_CELEBRATE_EXTRA : 0);
     this.showBanner('clear', this.bossTest ? T.combat.bossDefeated : T.combat.cleared, null, celebrate + 0.6);
     for (let i = 0; i < 5; i++) this.fx.confetti(FIELD_W * (0.15 + i * 0.175), FIELD_H * (0.3 + (i % 2) * 0.12));
-    this.after(celebrate, () => (this.bossTest ? this.finishBossTest(true) : this.finishStage()));
+    this.after(celebrate, () => (this.bossTest ? this.finishBossTest(true) : this.finishStageAfterLevelUps()));
+  }
+
+  /**
+   * 스테이지 끝: 마지막 처치들로 오른 레벨업이 남아 있으면 클리어 화면 전에 여기서 고른다(레벨업 창 → 다 고르면 finishStage).
+   * 보스 테스트는 끝나면 런을 버리므로 고르지 않는다. 측정 도구가 레벨업을 보류 중이면 런에 남긴 채로 넘어간다(다음 전투에서 뜬다)
+   */
+  private finishStageAfterLevelUps(): void {
+    if (this.leaving || this.exited) return;
+    if (!game.debugHoldLevelUps && pendingLevelUps(this.run) > 0 && !this.levelUp) {
+      this.openLevelUp(() => this.after(LEVEL_UP_END_HOLD, () => this.finishStage()));
+      return;
+    }
+    this.finishStage();
   }
 
   private finishStage(): void {
@@ -1133,6 +1529,7 @@ export class CombatScene extends Scene {
       minionKills: this.minionKills,
       phase: (bs?.phase ?? 0) + 1,
       phases: bs?.phases ?? 1,
+      level: runLevel(this.run),
     });
   }
 
@@ -1156,7 +1553,7 @@ export class CombatScene extends Scene {
     }
     // 페이즈 전환: 화면 번쩍 + 크게 흔들림 + 배너(보스 몸 위 — 아래쪽 탄을 가리지 않게)
     this.addTrauma(TRAUMA_ROAR);
-    this.flashT = PHASE_FLASH_TIME;
+    this.screenFlash(0xffffff, PHASE_FLASH_ALPHA, PHASE_FLASH_TIME);
     this.bossBar?.flash();
     this.showBanner('phase', T.combat.phase(phase + 1), phaseSub(phase), PHASE_BANNER_TIME, PHASE_BANNER_Y);
   }
@@ -1263,7 +1660,15 @@ export class CombatScene extends Scene {
       this.bossBar.update(dt);
     }
     this.bossFx?.update(dt, this.sim.boss, this.boss, this.sim.hazards);
+    // 콤보 글자는 보스 입 둘레(행동 예고 빛·탄이 나오는 곳)를 피한다
+    if (boss && boss.alive && boss.y + boss.h > 0) {
+      const cx = boss.x + boss.w / 2;
+      const by = boss.y + boss.h;
+      this.combo.setAvoid(cx - COMBO_AVOID_HALF_W, by - COMBO_AVOID_UP, cx + COMBO_AVOID_HALF_W, by + COMBO_AVOID_DOWN);
+    } else this.combo.clearAvoid();
     this.combo.update(dt);
+    this.blockTags.update(dt);
+    this.skillFx?.update(dt, pl.x, pl.y, sim.skill);
   }
 
   private drawVignette(vp: Viewport): void {
@@ -1290,7 +1695,7 @@ export class CombatScene extends Scene {
     }
     this.flashT = Math.max(0, this.flashT - dt);
     this.flash.visible = true;
-    this.flash.alpha = PHASE_FLASH_ALPHA * (this.flashT / PHASE_FLASH_TIME);
+    this.flash.alpha = this.flashMax * (this.flashT / Math.max(1e-3, this.flashDur));
   }
 
   private updateVignette(dt: number): void {
@@ -1495,6 +1900,26 @@ export class CombatScene extends Scene {
     this.dropPointer(e.pointerId);
   };
 
+  /** 스킬 버튼 누름: 바탕과 같은 포인터 추적 (움직이면 이동 드래그·두 번째 손가락 조준이 된다) */
+  private readonly onSkillDown = (e: FederatedPointerEvent): void => {
+    this.onPointerDown(e);
+  };
+
+  /** 스킬 버튼에서 뗌: 제자리 탭(드래그가 되지 않은 포인터)이고 버튼 위에서 뗐으면 스킬 발동. 포인터 정리는 바탕과 같다 */
+  private readonly onSkillUp = (e: FederatedPointerEvent): void => {
+    const t = this.pointers.get(e.pointerId);
+    let tap = false;
+    if (t && t.mode === 'pending' && e.type === 'pointerup') {
+      const p = e.getLocalPosition(this, this.tmp);
+      const dx = p.x - t.downX;
+      const dy = p.y - t.downY;
+      tap = dx * dx + dy * dy <= TAP_SLOP * TAP_SLOP;
+    }
+    if (e.type === 'pointerup') this.onPointerUp(e);
+    else this.onPointerAbort(e);
+    if (tap) this.tryActivateSkill();
+  };
+
   /** PixiJS는 네이티브 pointercancel을 넘겨주지 않는다 — 시스템 제스처 등으로 끊긴 포인터, 창 포커스 잃음 */
   private readonly onNativeCancel = (e: Event): void => {
     if (typeof PointerEvent !== 'undefined' && e instanceof PointerEvent) this.dropPointer(e.pointerId);
@@ -1519,7 +1944,7 @@ export class CombatScene extends Scene {
   // ── 가방 ────────────────────────────────────────────────────
 
   private toggleBag(): void {
-    if (!this.ready || this.ended || this.leaving) return;
+    if (!this.ready || this.ended || this.leaving || this.levelUp) return;
     // 드래그 중의 Esc/B/Tab은 BagView가 드래그 취소로 처리한다 — 오버레이까지 닫지 않는다
     if (this.overlay?.busy) return;
     if (this.overlay) this.pendingClose = true;
@@ -1557,15 +1982,172 @@ export class CombatScene extends Scene {
     sfx.play('bag_close');
     // context: true — 가방을 열고 닫을 때마다 Graphics 컨텍스트가 렌더러 GC 때까지 남지 않게 (destroy 참고)
     o.destroy({ children: true, context: true });
+    this.applyRunToSim();
+    this.acc = 0;
+  }
+
+  /** 런의 가방·보너스가 바뀐 것을 전투에 반영 (가방 닫기·레벨업 고르기): sim.setLoadout + 무기 바·발사음·조준 가이드·HUD */
+  private applyRunToSim(): void {
     const loadout = runLoadout(this.data, this.run);
     this.sim.setLoadout(loadout, runPlayerStats(this.data, this.run));
     this.weaponBar.rebuild(loadout, this.data.items);
     this.rebuildFireSfx(loadout);
+    this.rebuildProjStyles(loadout);
     this.guideRadius = guideRadius(loadout);
     this.hud.setStash(this.run.bag.stash.length);
     this.hud.setHp(this.sim.player.hp, this.sim.player.maxHp);
     this.updateBagAlert();
+  }
+
+  // ── 레벨업 (docs/DESIGN.md '레벨업') ────────────────────────
+
+  /** 대기 레벨업이 있고 전투 중이면 창을 띄워야 한다 (측정 도구 보류 중이면 아니다) */
+  private levelUpWanted(): boolean {
+    return !game.debugHoldLevelUps && pendingLevelUps(this.run) > 0;
+  }
+
+  /** 전투 중(인트로·승패·가방 밖)에 대기 레벨업이 생기면 창을 연다 — 전투는 창이 닫힐 때까지 멈춘다 */
+  private maybeOpenLevelUp(): void {
+    if (this.levelUp || this.overlay || this.ended || this.leaving || this.phase !== 'fight') return;
+    if (!this.levelUpWanted()) return;
+    this.openLevelUp(null);
+  }
+
+  private openLevelUp(onDone: (() => void) | null): void {
+    if (this.levelUp) return;
+    this.cancelPointers();
+    this.levelUpDone = onDone;
+    // 클리어·페이즈 배너가 카드를 가리지 않게
+    this.banner.hide();
+    // '레벨 업!' 딩 + 카드 세 장이 차례로 들어오는 소리
+    sfx.play('level_up');
+    this.cardFlipSfx(CARD_FLIP_START);
+    const o = new LevelUpOverlay({
+      data: this.data,
+      run: this.run,
+      onPicked: (result, gx, gy) => this.onLevelUpPicked(result, gx, gy),
+      onDone: () => this.closeLevelUp(),
+    });
+    this.levelUp = o;
+    this.overlayLayer.addChild(o);
+    if (this.vp) o.layout(this.vp, this.fieldY);
+    this.xpDirty = true;
+  }
+
+  /** 레벨업 창 닫기 (다 골랐거나, 디버그 승패로 고르지 않고). 이어서 할 일(스테이지 끝)이 있으면 부른다 */
+  private closeLevelUp(): void {
+    const o = this.levelUp;
+    if (!o) return;
+    this.levelUp = null;
+    o.destroy({ children: true, context: true });
     this.acc = 0;
+    this.xpDirty = true;
+    const done = this.levelUpDone;
+    this.levelUpDone = null;
+    done?.();
+  }
+
+  /** 레벨업 카드가 들어오는 소리 (장마다 조금씩 높게) — start초 뒤부터 CARD_FLIP_STAGGER 간격 */
+  private cardFlipSfx(start: number): void {
+    for (let i = 0; i < 3; i++) this.after(start + i * CARD_FLIP_STAGGER, () => sfx.play('card_flip', { rate: 1 + i * 0.05 }));
+  }
+
+  /** 카드 하나를 골라 런에 적용한 직후: 전투 반영 + 아이템은 가방 버튼으로 날아감 + 결과 알림(화면 아래쪽, 바로) */
+  private onLevelUpPicked(result: LevelUpResult, gx: number, gy: number): void {
+    // 대기 레벨업이 남았으면 고른 카드 연출 뒤 다음 카드들이 들어온다
+    if (pendingLevelUps(this.run) > 0) this.cardFlipSfx(LEVEL_UP_NEXT_DEAL);
+    const hpBefore = this.sim.player.hp;
+    this.applyRunToSim();
+    // 꿀잠 베개('바로 HP 회복'): setLoadout은 최대 HP가 이번 전투 최고치를 넘은 만큼만 회복한다(냄비 뚜껑 빼고 넣기 회복 방지) —
+    // 전투 중 최대 HP 장비를 뺐었다면 그 몫이 0이 되어 약속한 회복이 사라졌다. 모자란 만큼 채우고, 알림은 sim에서 실제로 오른 HP로
+    let healed = 0;
+    if (result.kind === 'boon') {
+      const heal = this.data.boons[result.boon]?.effect.heal ?? 0;
+      if (heal > 0) {
+        const got = this.sim.player.hp - hpBefore;
+        if (got < heal) this.sim.healPlayer(heal - got);
+        healed = Math.max(0, Math.round(this.sim.player.hp - hpBefore));
+        this.hud.setHp(this.sim.player.hp, this.sim.player.maxHp);
+      }
+    }
+    this.xpDirty = true;
+    const from = this.toLocal({ x: gx, y: gy });
+    const L = T.combat.levelUp;
+    const y = (this.vp ? this.vp.height - this.vp.safeBottom : this.fieldY + FIELD_H) - LEVEL_UP_TOAST_BOTTOM;
+    let n = 0;
+    // 같은 프레임에 둘을 띄우면 Toast 쌓기 트윈이 겹쳐 서로 가린다 — 두 번째부터는 조금 늦게
+    const note = (text: string, color: number): void => {
+      const show = (): void => Toast.show(this.toastLayer, text, { y, color });
+      if (n++ === 0) show();
+      else this.after((n - 1) * LEVEL_UP_TOAST_GAP, show);
+    };
+    switch (result.kind) {
+      case 'item': {
+        const def = this.data.items[result.defId];
+        const name = def?.name ?? result.defId;
+        if (result.where === 'gold') {
+          const gold = this.hud.goldTarget();
+          this.flyers.coin(from.x, from.y, gold.x, this.hudY + gold.y, result.gold);
+          note(T.combat.dropConverted(result.gold), 0x6b4a12);
+        } else {
+          const bag = this.hud.bagTarget();
+          this.flyers.item(def?.icon ?? 'ui_bag', from.x, from.y, bag.x, this.hudY + bag.y);
+          note(result.where === 'bag' ? L.toBag(name, result.x + 1, result.y + 1) : L.toStash(name), UI_COLORS.accent);
+        }
+        sfx.play('ui_purchase');
+        break;
+      }
+      case 'upgrade': {
+        const def = this.data.items[result.defId];
+        note(L.tierUp(def?.name ?? result.defId, result.tier), 0xc98a10);
+        sfx.play('merge_tier');
+        break;
+      }
+      case 'boon': {
+        const def = this.data.boons[result.boon];
+        note(L.boonGot(def?.name ?? result.boon, result.stacks, def?.maxStacks ?? result.stacks), 0x2f8a4a);
+        if (healed > 0) note(L.healed(healed), 0xb03050);
+        sfx.play(healed > 0 ? 'heal' : 'ui_purchase');
+        break;
+      }
+    }
+  }
+
+  private refreshXp(): void {
+    this.xpDirty = false;
+    if (!this.xpBar || !this.ready) return;
+    const level = runLevel(this.run);
+    this.xpBar.set(level, runXp(this.run), xpToNext(level), pendingLevelUps(this.run));
+  }
+
+  // ── 액티브 스킬 (docs/DESIGN.md '액티브 스킬') ──────────────
+
+  /** 스킬 버튼을 지금 누를 수 있나: 전투 중(인트로·가방·레벨업 창·승패 밖) + 게이지 가득 + 이전 효과 끝 */
+  private skillUsable(): boolean {
+    const s = this.ready ? this.sim.skill : null;
+    return (
+      !!s &&
+      s.ready &&
+      this.phase === 'fight' &&
+      !this.overlay &&
+      !this.levelUp &&
+      !this.ended &&
+      !this.leaving &&
+      this.sim.status === 'running'
+    );
+  }
+
+  /** 스킬 버튼 탭·Space: 쓸 수 있으면 sim.activateSkill → 이벤트('skill'·'freeze' …)는 바로 연출로, 아니면 버튼이 떤다 */
+  private tryActivateSkill(): void {
+    if (!this.ready || !this.skillBtn) return;
+    if (!this.skillUsable() || !this.sim.activateSkill()) {
+      // 인트로·오버레이 중에는 조용히, 전투 중인데 아직 안 찼으면 떨림
+      if (this.phase === 'fight' && !this.overlay && !this.levelUp && !this.ended) this.skillBtn.deny();
+      return;
+    }
+    this.handleEvents(this.sim.drainEvents());
+    this.skillBtn.burst();
+    sfx.play(SKILL_SFX[this.skillBtn.def.kind]);
   }
 
   private updateBagAlert(): void {
@@ -1590,6 +2172,14 @@ export class CombatScene extends Scene {
   private rebuildFireSfx(loadout: readonly WeaponLoadout[]): void {
     this.fireSfx.clear();
     for (const l of loadout) this.fireSfx.set(l.uid, weaponFireSfx(l.defId));
+  }
+
+  /** 투사체 꼬리 모양: 유도 리본이 맞닿은 무기 = 분홍 리본, 털뭉치 폭풍(스킬) 공 = 연보라 */
+  private rebuildProjStyles(loadout: readonly WeaponLoadout[]): void {
+    const p = this.projectiles;
+    p.clearStyles();
+    for (const l of loadout) if (l.homing !== undefined && l.homing > 0) p.setStyle(l.uid, PROJ_STYLE_HOMING);
+    p.setStyle(SKILL_WEAPON_UID, PROJ_STYLE_SKILL);
   }
 
   /** 적 공격 탄 그림에 맞는 발사음. 보스 행동 탄은 이벤트의 sprite로 (보스는 EnemyDef.attack이 없다) */
@@ -1656,6 +2246,15 @@ export class CombatScene extends Scene {
     }
   }
 }
+
+/**
+ * 방패 '막음!' 꼬리표: 스타일 캐시 키·글자 크기·색, 막은 자리에서 아래로 띄우고 더 아래로 흐른다(튕겨 나간 공처럼 — 떠오르면 방패의 HP 숫자를 덮었다)
+ */
+const BLOCK_TAG_KEY = 'blocked';
+const BLOCK_TAG_FONT = 30;
+const BLOCK_TAG_COLOR = 0xe6f3ff;
+const BLOCK_TAG_DY = 30;
+const BLOCK_TAG_DRIFT = -18;
 
 /** 페이즈 배너 부제 (페이즈 인덱스 1..), 문구가 모자라면 마지막 것 */
 function phaseSub(phase: number): string | null {

@@ -13,10 +13,11 @@ import { T } from '../i18n/ko';
 import { newBossTestRun, newRun, runPlayerStats } from '../logic/run';
 import { tex } from '../render/assets';
 import { shade } from '../render/color';
-import type { BossTestPreset, CharacterDef, GameData, Tier } from '../types';
+import type { BossTestPreset, CharacterDef, GameData, SkillDef, Tier } from '../types';
 import { Button, OUTLINE_COLOR, Panel, ProgressBar, textStyle } from '../ui';
-import { ItemView } from './bag/itemSprite';
+import { fitSprite, ItemView } from './bag/itemSprite';
 import { centeredButton, coverSprite, itemChip } from './menuFx';
+import { SKILL_COLORS, skillLine } from './skillText';
 
 const CARD_W = 204;
 const CARD_H = 264;
@@ -44,6 +45,11 @@ const BOSS_START_COLOR = 0xd9534f;
 const BOSS_HEADER_COLOR = 0xffb3c1;
 const PRESET_CELL = 46;
 const PRESET_GAP = 22;
+/** 짧은 화면에서 카드 줄을 이만큼까지 줄인다 (상세 패널이 버튼을 덮지 않게) */
+const CARD_ROW_MIN_SCALE = 0.7;
+/** 스킬 줄: 딱지 색 / 아이콘 크기 */
+const SKILL_CHIP_COLOR = 0x2f8fd8;
+const SKILL_ICON = 46;
 
 export type CharacterSelectMode = 'normal' | 'bossTest';
 
@@ -218,8 +224,11 @@ export class CharacterSelectScene extends Scene {
     const contentBottom = btnY - BTN_H / 2 - 26;
     const avail = contentBottom - contentTop;
 
-    const cardsH = CARD_H * CARD_SELECTED_SCALE;
     const detailsMin = Math.max(...this.details.map((d) => this.detailsMinHeight(d)));
+    // 짧은 화면(360×640 = 논리 높이 1280)에서 상세(스킬 줄·프리셋 가방)가 길면 카드 줄을 조금 줄인다
+    const fullCardsH = CARD_H * CARD_SELECTED_SCALE;
+    const cardScale = Math.max(CARD_ROW_MIN_SCALE, Math.min(1, (avail - detailsMin - 24) / fullCardsH));
+    const cardsH = fullCardsH * cardScale;
     const extra = Math.max(0, avail - cardsH - detailsMin - 24);
     // 남는 공간: 카드 위·아래 여백에 조금, 나머지는 패널 안 섹션 간격으로 (상한 이상은 패널을 키우지 않음)
     const gapAbove = Math.min(40, extra * 0.15);
@@ -234,7 +243,9 @@ export class CharacterSelectScene extends Scene {
     this.subHeader?.position.set(w / 2, top + offset * 0.4 + this.header.height + 2);
     const cardsCenterY = contentTop + offset + gapAbove + cardsH / 2;
     const rowW = this.cards.length * CARD_W + (this.cards.length - 1) * CARD_GAP;
-    this.cards.forEach((c, i) => c.holder.position.set((w - rowW) / 2 + i * (CARD_W + CARD_GAP) + CARD_W / 2, cardsCenterY));
+    this.cardRow.position.set(w / 2, cardsCenterY);
+    this.cardRow.scale.set(cardScale);
+    this.cards.forEach((c, i) => c.holder.position.set(-rowW / 2 + i * (CARD_W + CARD_GAP) + CARD_W / 2, 0));
 
     this.panel.resize(PANEL_W, this.panelH);
     this.panel.position.set((w - PANEL_W) / 2, cardsCenterY + cardsH / 2 + gapBelow);
@@ -346,6 +357,10 @@ export class CharacterSelectScene extends Scene {
     passive.addChild(chip, chipText, passiveText);
     sections.push(passive);
 
+    // 2b) 액티브 스킬: 딱지 + 아이콘 + 이름 + 한 줄 효과 (수치는 SkillDef)
+    const skill = game.data.skills[c.id];
+    if (skill) sections.push(this.buildSkillSection(skill, innerW));
+
     // 3) 스탯 막대
     const statBlock = new Container();
     const rows: { icon: string; label: string; value: number; max: number; color: number }[] = [
@@ -439,6 +454,44 @@ export class CharacterSelectScene extends Scene {
     root.addChild(...sections);
     const heights = sections.map((s) => s.getLocalBounds().maxY);
     return { root, sections, heights, bars };
+  }
+
+  /** 스킬 줄: [스킬] 딱지 + 아이콘 + 이름, 같은 줄에 효과 (모자라면 다음 줄) */
+  private buildSkillSection(skill: SkillDef, innerW: number): Container {
+    const box = new Container();
+    const chipText = new Text({ text: T.menu.skill, style: textStyle('small', { fontSize: 24, fill: UI_COLORS.text }) });
+    const chipW = chipText.width + 30;
+    const chipH = 42;
+    const chip = new Graphics()
+      .roundRect(0, 0, chipW, chipH, chipH / 2)
+      .fill(SKILL_CHIP_COLOR)
+      .stroke({ width: 3, color: shade(SKILL_CHIP_COLOR, 0.55) });
+    chipText.anchor.set(0.5);
+    chipText.position.set(chipW / 2, chipH / 2);
+    const icon = fitSprite(skill.icon, SKILL_ICON, SKILL_ICON);
+    icon.position.set(chipW + 12 + SKILL_ICON / 2, chipH / 2);
+    const name = new Text({
+      text: skill.name,
+      style: textStyle('heading', { fontSize: 34, fill: SKILL_COLORS[skill.kind], stroke: { color: OUTLINE_COLOR, width: 6, join: 'round' } }),
+    });
+    name.anchor.set(0, 0.5);
+    const nameX = chipW + 12 + SKILL_ICON + 10;
+    name.position.set(nameX, chipH / 2);
+    const effectX = nameX + name.width + 14;
+    const effect = new Text({
+      text: skillLine(skill),
+      style: textStyle('body', { fontSize: 24, lineHeight: 32, fill: UI_COLORS.text, wordWrap: true, breakWords: true, wordWrapWidth: innerW }),
+    });
+    effect.anchor.set(0, 0.5);
+    if (effect.width <= innerW - effectX) {
+      effect.position.set(effectX, chipH / 2);
+    } else {
+      effect.anchor.set(0, 0);
+      effect.position.set(chipW + 12, chipH + 6);
+      if (effect.width > innerW - (chipW + 12)) effect.style.wordWrapWidth = innerW - (chipW + 12);
+    }
+    box.addChild(chip, chipText, icon, name, effect);
+    return box;
   }
 
   /** 프리셋 가방: 왼쪽에 실제 배치 그대로의 작은 가방 격자, 오른쪽에 요약(무기·강화석·장비 수, 진화 무기, 가방 안내) */

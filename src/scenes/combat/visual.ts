@@ -242,6 +242,13 @@ export const COMBO_REFRESH = 0.09;
  */
 export const COMBO_COLOR = 0xff9ad5;
 export const COMBO_HOT_COLOR = 0xff5cb8;
+/**
+ * 보스전: 콤보 글자가 피하는 보스 입 둘레 (입 = 보스 아래 가운데, 행동 예고 빛 BOSS_GLOW_MAX 지름 210 + 탄이 나오는 자리) —
+ * 가로 반폭, 입 위로, 입 아래로 (px). 보스 바로 아래 졸개를 백어택하면 글자가 입 위를 덮어 예고 색을 가렸다
+ */
+export const COMBO_AVOID_HALF_W = 150;
+export const COMBO_AVOID_UP = 150;
+export const COMBO_AVOID_DOWN = 80;
 
 // ── 보스전 연출 (BossFx — 장난감 상자 대마왕) ─────────────────
 /** 행동 예비 동작 때 입에서 피어나는 빛 색 (행동 종류별 — 무엇이 올지 미리 읽히게) */
@@ -293,6 +300,64 @@ export const PHASE_FLASH_ALPHA = 0.55;
 /** 페이즈 배너 표시 시간, 필드 위 y(보스 몸 위 — 아래쪽 탄을 가리지 않게) */
 export const PHASE_BANNER_TIME = 1.5;
 export const PHASE_BANNER_Y = 230;
+
+// ── 재미 기능 연출 (백어택·행동하는 적·시너지 아이템·액티브 스킬) ──────
+/**
+ * 백어택 피해 숫자: 진분홍 + 크게 + 노란 별 딱지. 불 숫자(주황 ELEMENT_COLORS.fire)·골드·콤보 글자(연분홍 COMBO_COLOR)와 다른 색 —
+ * 속성 공의 백어택도 이 색 (속성은 타격 연출이 보여 준다)
+ */
+export const BACK_DAMAGE_COLOR = 0xff5fae;
+export const BACK_NUMBER_SCALE = 1.28;
+/** 장갑에 막혀 줄어든 피해 숫자: 쇳빛 회색, 조금 작게 ('깡' 소리와 함께) */
+export const ARMOR_DAMAGE_COLOR = 0xb9c3cf;
+export const ARMOR_NUMBER_SCALE = 0.86;
+/** 회복 숫자 '+N'·치유 연출 색 */
+export const HEAL_COLOR = 0x5ee07a;
+/** 회복받은 적의 번쩍임 (흰 실루엣에 곱하는 연두) / 길이 */
+export const HEAL_FLASH_TINT = 0x9cff9c;
+export const HEAL_FLASH_TIME = 0.3;
+/** 방패 '막음!' 글자: 같은 방패에서 다시 띄우는 최소 간격(초), 동시에 떠 있는 글자 수 */
+export const BLOCK_TAG_COOLDOWN = 0.7;
+export const MAX_FLOAT_TAGS = 6;
+/** 폭탄병 심지 불꽃 간격(초) */
+export const FUSE_EMIT_INTERVAL = 0.11;
+/** 폭탄병 연쇄: 같은 묶음에서 터지는 폭발을 이 간격(초)씩 늦게 그린다 (한꺼번에 덮이지 않고 '펑-펑-펑') — 판정은 이미 끝났다 */
+export const BOMB_CHAIN_STAGGER = 0.08;
+/** 폭탄병 폭발 흔들림: 첫 폭발 / 연쇄로 더 터질 때마다 */
+export const TRAUMA_BOMB = 0.3;
+export const TRAUMA_BOMB_CHAIN = 0.1;
+/** 증기 주전자 폭발 흔들림 */
+export const TRAUMA_STEAM = 0.12;
+/** RC카 미끄러짐: 뒤로 젖히는 기울기(라디안), 바퀴 먼지 간격(초), 멈춘 뒤 기울기가 돌아오는 시간 */
+export const SLIDE_LEAN = 0.16;
+export const SLIDE_DUST_INTERVAL = 0.06;
+export const SLIDE_SETTLE_TIME = 0.14;
+/** 유도 리본 공의 꼬리: 분홍 리본 (속성 색과 섞음), 길이 배수 */
+export const RIBBON_COLOR = 0xff7fd0;
+export const RIBBON_TRAIL_LEN_MUL = 1.45;
+/** 털뭉치 폭풍(스킬) 공의 꼬리 색 (속성이 없을 때) */
+export const STORM_TRAIL_COLOR = 0xc8a8ff;
+/** 트램펄린 튕김 색 */
+export const TRAMPOLINE_COLOR = 0x5fb8ff;
+/** 스킬 발동 화면 번쩍임: 색 / 최대 알파 / 시간 */
+export const FREEZE_FLASH_COLOR = 0xbfeaff;
+export const FREEZE_FLASH_ALPHA = 0.55;
+export const FREEZE_FLASH_TIME = 0.5;
+export const SPRING_FLASH_COLOR = 0xffd9a0;
+export const SPRING_FLASH_ALPHA = 0.32;
+export const SPRING_FLASH_TIME = 0.4;
+export const STORM_FLASH_COLOR = 0xd9c4ff;
+export const STORM_FLASH_ALPHA = 0.26;
+export const STORM_FLASH_TIME = 0.3;
+export const TRAUMA_SKILL = 0.32;
+/** 빙하기 서리 파도가 퍼지는 속도(px/s) — 얼어붙는 적의 연출은 플레이어와의 거리만큼 늦게 (파도가 닿는 순간) */
+export const FROST_WAVE_SPEED = 1900;
+/** 얼림(빙하기) 덮개 알파 — 냉기(FROST_OVERLAY_ALPHA)보다 진하게 / 그 위 얼음 상자 알파 */
+export const FROZEN_OVERLAY_ALPHA = 0.95;
+export const ICE_BLOCK_ALPHA = 0.9;
+/** 온천 기운 원 색 / 김 피어오르는 간격(초) */
+export const SPRING_AURA_COLOR = 0xffc98a;
+export const AURA_WISP_INTERVAL = 0.06;
 
 // ── 흐름 ─────────────────────────────────────────────────────
 export const INTRO_TIME = 1.2;

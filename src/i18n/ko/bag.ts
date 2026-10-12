@@ -61,12 +61,34 @@ export const bag = {
   stoneBuffing: (names: string): string => `적용 중: ${names}`,
   stoneNoTarget: '아직 맞닿은 무기가 없어요',
 
+  // 시너지 돌 효과 (★ 반영된 값 — docs/DESIGN.md '시너지 아이템')
+  stoneBounce: (mul: number, cap: number): string => `튕길 때마다 데미지 ${signedPct(mul)} (최대 ${signedPct(cap)})`,
+  stoneBackAttack: (mul: number): string => `백어택 데미지 ${signedPct(mul)}`,
+  stoneSeed: (count: number, mul: number): string => `첫 적중에 ${count}개로 분열 (각 ${Math.round(mul * 100)}%)`,
+  stoneChainTargets: (n: number): string => `연쇄 대상 +${n}`,
+  stoneChainDamage: (mul: number): string => `연쇄 데미지 ${signedPct(mul)}`,
+  stoneChainHop: '연쇄가 한 번 더 튐',
+  stoneRadius: (mul: number): string => `공 크기 ${signedPct(mul)}`,
+  stoneSpeed: (mul: number): string => `공 속도 ${signedPct(mul)}`,
+  /** 반경을 칸 수로 (예: '1.2') */
+  stoneBurnSpread: (cells: string): string => `불 전염 (반경 ${cells}칸)`,
+  stoneHoming: (deg: number): string => `적 쪽으로 휨 (초당 ${Math.round(deg)}°)`,
+
   // 장비 효과 (★ 반영된 값)
   gearMaxHp: (n: number): string => `최대 HP +${Math.round(n)}`,
   gearMoveSpeed: (mul: number): string => `이동 속도 ${signedPct(mul)}`,
   gearRegen: (n: number): string => `초당 HP ${Number.isInteger(n) ? n : n.toFixed(1)} 회복`,
   gearGold: (mul: number): string => `골드 획득 ${signedPct(mul)}`,
   gearDamage: (mul: number): string => `모든 무기 공격력 ${signedPct(mul)}`,
+  gearSteam: (mul: number): string => `불↔얼음 증기 폭발 ${Math.round(mul * 100)}%`,
+  gearKillBurst: (mul: number): string => `처치하면 폭발 (최대 HP ${Math.round(mul * 100)}%)`,
+  gearTrampoline: '모든 공이 바닥에서 한 번 튕김',
+  /** n은 ★ 배수로 소수일 수 있다 (표시는 호출 쪽에서 다듬은 문자열) */
+  gearBackKillGold: (n: string): string => `백어택 처치 골드 +${n}`,
+
+  // 무기 툴팁: 백어택 보너스 칩 (뒤통수 망치 + 런 보너스 합)
+  statBackAttack: '백어택',
+  backAttackValue: (mul: number): string => signedPct(mul),
 
   // 맞닿은 강화석 목록 (무기 툴팁)
   buffedByTitle: '강화',

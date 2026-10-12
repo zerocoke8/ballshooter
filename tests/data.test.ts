@@ -139,6 +139,11 @@ describe('아이템', () => {
       expect(entries.length, `${d.id} 효과`).toBeGreaterThan(0);
       for (const [k, v] of entries) {
         if (k === 'element') continue;
+        // boolean 효과(번개 코일 chainHop, 트램펄린)는 켜는 것만 의미가 있다
+        if (typeof v === 'boolean') {
+          expect(v, `${d.id}.${k}`).toBe(true);
+          continue;
+        }
         expect(Number.isFinite(v) && v !== 0, `${d.id}.${k}`).toBe(true);
       }
     }
@@ -225,6 +230,42 @@ describe('적', () => {
       expect(a.spreadDeg >= 0, `${k}.attack.spreadDeg`).toBe(true);
       expect(isPos(a.radius), `${k}.attack.radius`).toBe(true);
       if (a.kind === 'spread') expect(a.count > 1 && a.spreadDeg > 0, `${k} spread`).toBe(true);
+    }
+  });
+
+  it('행동하는 적의 수치가 유효하다 (방패·장갑·치유·폭탄·분열·옆걸음)', () => {
+    for (const [k, e] of Object.entries(enemies)) {
+      if (e.shield !== undefined) expect(e.shield, `${k}.shield`).toBe(true);
+      if (e.armor !== undefined) expect(e.armor > 0 && e.armor < 1, `${k}.armor`).toBe(true);
+      if (e.heal) {
+        const h = e.heal;
+        expect(isPos(h.interval) && h.jitter >= 0 && isPos(h.radius), `${k}.heal`).toBe(true);
+        expect(h.frac > 0 && h.frac <= 1, `${k}.heal.frac`).toBe(true);
+        // 적어도 맞닿은 칸(중심 거리 1칸)에는 닿고, 두 칸 밖(2칸)까지는 안 닿는다
+        expect(h.radius >= CELL && h.radius < 2 * CELL, `${k}.heal.radius`).toBe(true);
+      }
+      if (e.deathBlast) {
+        expect(isPos(e.deathBlast.radius) && isPos(e.deathBlast.damage), `${k}.deathBlast`).toBe(true);
+        expect(e.deathBlast.radius, `${k}.deathBlast.radius`).toBeGreaterThanOrEqual(CELL);
+      }
+      if (e.splitOnDeath) {
+        const s = e.splitOnDeath;
+        const into = enemies[s.into];
+        expect(into, `${k}.splitOnDeath.into`).toBeDefined();
+        expect(isPosInt(s.count) && s.count <= 4, `${k}.splitOnDeath.count`).toBe(true);
+        // 꼬마는 1×1, 다시 갈라지지 않고 보스가 아니다 (sim이 미리 세는 수가 한 단계)
+        expect(into.w === 1 && into.h === 1 && !into.boss && !into.splitOnDeath, `${k} → ${s.into}`).toBe(true);
+        expect(e.w === 1 && e.h === 1, `${k} 크기`).toBe(true);
+      }
+      if (e.shift) {
+        expect(isPos(e.shift.interval) && e.shift.jitter >= 0 && isPos(e.shift.speed), `${k}.shift`).toBe(true);
+        // 한 칸을 1초 안에 (부드럽지만 늘어지지 않게), 1×1만 (옆 칸 예약이 한 칸 단위)
+        expect(CELL / e.shift.speed, `${k} 한 칸 시간`).toBeLessThanOrEqual(1);
+        expect(e.w === 1 && e.h === 1, `${k} 크기`).toBe(true);
+      }
+      // 행동은 일반 적에게만, 하나씩 (조합은 아직 규칙을 정하지 않았다)
+      const n = [e.shield, e.armor !== undefined, e.heal, e.deathBlast, e.splitOnDeath, e.shift].filter(Boolean).length;
+      if (n > 0) expect(!e.boss && n === 1 && e.w * e.h === 1, `${k} 행동 ${n}개`).toBe(true);
     }
   });
 });
@@ -393,7 +434,7 @@ function intactWave(stage: StageDef, [front, back]: [number, number]): EnemyEnti
       es.push({
         id: es.length + 1, defId: d.id, x: c * CELL + ENEMY_INSET, y: top + ENEMY_INSET,
         w: d.w * CELL - 2 * ENEMY_INSET, h: d.h * CELL - 2 * ENEMY_INSET, hp: 1, maxHp: 1, alive: true,
-        boss: !!d.boss, burnDps: 0, burnTime: 0, chillTime: 0, attackTimer: 0, flash: 0,
+        boss: !!d.boss, burnDps: 0, burnTime: 0, chillTime: 0, attackTimer: 0, flash: 0, frozen: 0,
       });
     });
   }
@@ -506,6 +547,42 @@ describe('레벨 디자인 (벽돌깨기 대형)', () => {
     const attackers = placed(stage).filter((p) => isAttacker(p.def));
     const backRow = attackers.filter((p) => waves.some(([, b]) => p.row === b)).length;
     expect(backRow, `${backRow}/${attackers.length}`).toBeLessThanOrEqual(attackers.length / 2);
+  });
+
+  it('행동하는 적은 st2부터 조금씩: st1에는 없고, st2는 방패·폭탄·젤리만, 장갑·치유는 st3부터, RC카는 st4부터 — 비율 상한 st2 12% → st5 30%', () => {
+    const kind = (e: EnemyDef): string | null =>
+      e.shield ? 'shield' : e.armor !== undefined ? 'armor' : e.heal ? 'heal' : e.deathBlast ? 'blast' : e.splitOnDeath ? 'split' : e.shift ? 'shift' : null;
+    const firstStage: Record<string, number> = { shield: 1, blast: 1, split: 1, armor: 2, heal: 2, shift: 3 };
+    const seen = new Set<string>();
+    stages.forEach((s, i) => {
+      const all = placed(s);
+      const special = all.filter((p) => kind(p.def) !== null);
+      for (const p of special) {
+        const k = kind(p.def)!;
+        seen.add(k);
+        expect(i, `${s.id} ${p.def.id}: ${k}는 ${firstStage[k] + 1}스테이지부터`).toBeGreaterThanOrEqual(firstStage[k]);
+      }
+      expect(special.length / all.length, `${s.id} 행동하는 적 비율`).toBeLessThanOrEqual(0.06 * (i + 1) + 1e-9);
+      if (i === 0) expect(special, 'st1').toEqual([]);
+      else expect(special.length, `${s.id} 행동하는 적`).toBeGreaterThan(0);
+    });
+    expect([...seen].sort()).toEqual(Object.keys(firstStage).sort());
+  });
+
+  it('보스 졸개 풀: 행동하는 적은 두 번째 페이즈부터, 쏘는 졸개는 페이즈마다 30% 이하', () => {
+    for (const b of Object.values(GAME_DATA.bosses)) {
+      b.phases.forEach((ph, i) => {
+        const total = ph.minions.reduce((s, m) => s + m.weight, 0);
+        const shooters = ph.minions.filter((m) => enemies[m.enemy].attack).reduce((s, m) => s + m.weight, 0);
+        expect(shooters / total, `${b.id} phase ${i} 쏘는 졸개`).toBeLessThanOrEqual(0.3);
+        const special = ph.minions.filter((m) => {
+          const e = enemies[m.enemy];
+          return e.shield || e.armor !== undefined || e.heal || e.deathBlast || e.splitOnDeath || e.shift;
+        });
+        if (i === 0) expect(special.map((m) => m.enemy), `${b.id} phase 0`).toEqual([]);
+      });
+      expect(b.phases.some((ph) => ph.minions.some((m) => enemies[m.enemy].heal)), `${b.id} 치유병`).toBe(true);
+    }
   });
 
   it('엘리트(곰인형 등 여러 칸, 보스 아님)는 세 번째 스테이지부터', () => {
